@@ -1,0 +1,13 @@
+Point { x: 3, y: 4 }
+25
+15
+Point { x: 13, y: 5 }
+Line { a: Point { x: 13, y: 5 }, b: Point { x: -1, y: 7 }, tag: "seg", w: 1.5 }
+13
+seg
+1.5
+6
+[Point { x: 1, y: 2 }, Point { x: 3, y: 4 }]
+[Point { x: 100, y: 2 }, Point { x: 3, y: 14 }]
+114
+[[1, 9], [13, 4]]

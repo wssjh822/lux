@@ -1,0 +1,5 @@
+fn main() {
+    const a: int[] = [1, 2];
+    a.push(3);
+    println(a);
+}

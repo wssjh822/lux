@@ -1,0 +1,33 @@
+// ============================================================
+//  guess.lux —— 猜数字小游戏，演示 input() 交互式输入
+//  运行: luxc guess.lux --run
+//  管道测试: printf '50\n30\n42\n' | ./guess
+// ============================================================
+
+const SECRET: int = 42;
+
+fn main() {
+    println("我心里有个 1..100 的数字，来猜猜看（输入 q 退出）");
+
+    let rounds = 0;
+    loop {
+        let line = input("你的猜测: ");
+        rounds = rounds + 1;
+
+        if line == "q" {
+            println("下次见！");
+            break;
+        }
+
+        let n = int(line);
+        if n < SECRET {
+            println("太小了");
+        } else if n > SECRET {
+            println("太大了");
+        } else {
+            println("恭喜，猜对了！");
+            println("一共猜了 " + string(rounds) + " 次");
+            break;
+        }
+    }
+}

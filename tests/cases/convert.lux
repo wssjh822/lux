@@ -1,0 +1,15 @@
+// 类型转换与内置函数
+fn main() {
+    println(int(2.7));
+    println(int("1024"));
+    println(float("0.5"));
+    println(float(5));
+    println(string(1) + string(2) + string(3));
+    println(len(string(12345)));
+    println(abs(-42));
+    println(abs(-3.5));
+    println(sqrt(16.0));
+    assert(1 < 2);
+    assert(1 < 2, "一加一大于一");
+    println("断言全部通过");
+}

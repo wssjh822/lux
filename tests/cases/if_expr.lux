@@ -1,0 +1,18 @@
+// 0.7：if 表达式
+fn pick(n: int) -> int {
+    return if n > 0 { n } else { -n };
+}
+fn main() {
+    let x = if 3 > 2 { "big" } else { "small" };
+    println(x);
+    let y = if false { 1 } else { 2 };
+    println(y);
+    println(pick(-7));
+    println(pick(7));
+    // int / float 混合分支提升为 float
+    let z = if true { 1 } else { 2.5 };
+    println(z);
+    // 嵌套
+    let w = if y == 2 { if false { 1 } else { 42 } } else { 0 };
+    println(w);
+}

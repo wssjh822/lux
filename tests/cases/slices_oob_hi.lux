@@ -1,0 +1,6 @@
+// 切片上界越界：hi > len 必须 panic
+fn main() {
+    let a = [1, 2, 3];
+    println("before");
+    println(a[0..5]);
+}

@@ -1,0 +1,5 @@
+const MOD_TAG: string = "mod";
+
+fn triple(x: int) -> int {
+    return x * 3;
+}

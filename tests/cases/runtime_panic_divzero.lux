@@ -1,0 +1,5 @@
+// 除零 panic：整数除法与取模都带运行时检查
+fn main() {
+    println("before");
+    println(10 / 0);
+}

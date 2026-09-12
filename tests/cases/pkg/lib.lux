@@ -1,0 +1,8 @@
+// 包的入口文件：也 import 包内的另一个文件（传递 import）
+import "util.lux";
+
+const VERSION = "1.2.3";
+
+fn greeting(name: string) -> string {
+    return "hi, " + name;
+}

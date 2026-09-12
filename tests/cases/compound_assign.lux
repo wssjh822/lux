@@ -1,0 +1,24 @@
+// 0.7：复合赋值（变量 / 数组元素 / struct 成员 / 字符串）
+struct Counter {
+    let n: int;
+    let f: float;
+    let s: string;
+}
+fn main() {
+    let a = [1, 2, 3];
+    a[0] += 10;
+    a[1] -= 1;
+    a[2] *= 3;
+    println(a);
+
+    let g = [[1, 2], [3, 4]];
+    g[0][1] += 5;
+    println(g);
+
+    let c = Counter { n: 1, f: 1.5, s: "x" };
+    c.n += 4;
+    c.f *= 2.0;
+    c.s += "y";
+    println(c);
+    println(c.n + len(c.s));
+}

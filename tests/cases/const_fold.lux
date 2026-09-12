@@ -1,0 +1,13 @@
+const KB: int = 2 * 1024;
+const MB: int = KB * 1024;
+const HALF: float = 7 / 2.0;
+const GREETING: string = "hello" + " " + "world";
+const MASK: int = (1 << 16) | 0xFF;
+
+fn main() {
+    println(KB);
+    println(MB);
+    println(HALF);
+    println(GREETING);
+    println(MASK);
+}

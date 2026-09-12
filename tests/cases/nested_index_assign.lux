@@ -1,0 +1,7 @@
+fn main() {
+    let grid = [[1, 2], [3, 4]];
+    grid[0][1] = 5;
+    grid[1][0] += 10;
+    println(grid[0][1]);
+    println(grid);
+}

@@ -1,0 +1,8 @@
+// import 标准库模块 system
+import "system";
+
+fn main() {
+    println(system("true"));
+    println(system("false"));
+    println("[" + env("LUX_DEFINITELY_UNSET_VAR_XYZ") + "]");
+}

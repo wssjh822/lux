@@ -1,0 +1,9 @@
+// import C 库（-lm）并 extern 声明其中的函数
+import "c:m";
+
+extern fn cbrt(x: float) -> float;
+
+fn main() {
+    println(cbrt(27.0));
+    println(cbrt(2.0));
+}

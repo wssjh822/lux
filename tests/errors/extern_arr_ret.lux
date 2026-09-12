@@ -1,0 +1,2 @@
+extern fn g() -> int[];
+fn main() {}

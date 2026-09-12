@@ -1,0 +1,32 @@
+// ============================================================
+//  hello.lux —— Lux 的第一个程序
+//  编译: luxc hello.lux --run
+// ============================================================
+
+fn main() {
+    println("你好，Lux！");
+    println("Hello from Lux — 一门编译到机器码的静态类型语言。");
+
+    // 变量声明：显式类型 与 类型推断
+    let count: int = 3;
+    let ratio = 0.5;          // 推断为 float
+    let ok = true;            // 推断为 bool
+    let name = "Lux";         // 推断为 string
+
+    print("count = ");
+    println(count);
+    print("ratio = ");
+    println(ratio);
+    print("ok    = ");
+    println(ok);
+    print("name  = ");
+    println(name);
+
+    // 字符串拼接
+    let greeting = "你好, " + name + "!";
+    println(greeting);
+
+    // 表达式直接求值
+    println(count * 2 + 1);
+    println(ratio * 100.0);
+}

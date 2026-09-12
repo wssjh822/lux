@@ -1,0 +1,10 @@
+import "string";
+
+fn main() {
+    println(format("{} + {} = {}", 1, 2, 3));
+    println(format("value: {}", 2.5));
+    println(format("bool: {}", true));
+    println(format("{}!", "hi"));
+    println(format("no placeholders"));
+    println(format("x={} y={} s={}", 7, 2.5, "ok"));
+}

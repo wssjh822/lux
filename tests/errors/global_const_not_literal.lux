@@ -1,0 +1,3 @@
+fn f(x: int) -> int { return x; }
+const X = f(1);
+fn main() {}

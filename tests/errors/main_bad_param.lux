@@ -1,0 +1,1 @@
+fn main(args: int) { println(args); }

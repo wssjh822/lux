@@ -1,0 +1,9 @@
+// INT64_MIN / -1 溢出 panic（lx_idiv 的溢出检查）
+// 注意：INT64_MIN 用运行时变量构造（0 - max - 1）。
+// 若写成字面量运算，Sema 常量折叠会得到 9223372036854775808——
+// 超出 INT64_MAX 的十进制常量会让 gcc 发出 unsigned 警告，污染编译输出。
+fn main() {
+    let max = 9223372036854775807;
+    let min = 0 - max - 1;
+    println(min / -1);
+}

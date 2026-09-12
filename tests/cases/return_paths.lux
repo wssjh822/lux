@@ -1,0 +1,38 @@
+// 0.5 返回路径分析：if-else 双分支 / while(true) / loop 均视为覆盖
+fn sign(n: int) -> string {
+    if n > 0 {
+        return "pos";
+    } else if n < 0 {
+        return "neg";
+    } else {
+        return "zero";
+    }
+}
+
+fn busywait(n: int) -> int {
+    let i = 0;
+    while true {
+        if i >= n {
+            return i;
+        }
+        i += 1;
+    }
+}
+
+fn findIt(xs: int[], target: int) -> int {
+    for i in 0..len(xs) {
+        if xs[i] == target {
+            return i;
+        }
+    }
+    return -1;
+}
+
+fn main() {
+    println(sign(5));
+    println(sign(-5));
+    println(sign(0));
+    println(busywait(3));
+    println(findIt([10, 20, 30], 20));
+    println(findIt([10, 20, 30], 99));
+}

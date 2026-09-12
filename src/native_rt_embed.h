@@ -1,0 +1,1859 @@
+// 自动生成：make 由 src/native_rt.lux 嵌入，勿手改
+namespace lux { inline const char* kRuntimeLuxSrc = R"LUXRT(// =============================================================================
+//  native_rt.lux : Lux 原生后端运行时库（0.6）
+//  用 Lux 语言自身编写，经 __ 系特权内建直接操作内存与系统调用，
+//  编译期嵌入 native_rt_embed.h，由同一发射器生成机器码随程序发布。
+//  不依赖 C 编译器 / libc —— 纯 ELF 直出。
+//
+//  约定：
+//   * luxrt_ 前缀保留（用户程序重定义同名函数会编译报错）；
+//   * float 参数在调用约定层面按 IEEE 位模式走栈槽，类型层就是 float；
+//   * string 布局 [i64 len][bytes...][NUL]；数组对象布局 [len][cap][data][ek]；
+//   * 运行时无可变全局变量 —— 状态放 bss 固定地址槽，用 __peek64/__poke64；
+//   * 内部传递数组指针一律用 int（__sptr 转入 / __sval 仅供 string）。
+//
+//  bss 固定槽布局（kMinMemSz=8MiB，文件尾零页）：
+//   0x600000 setenv 列表（string[] 数组指针，0=未创建）
+//   0x600008 xorshift64 随机状态（codegen 内联 __rand_next 用）
+//   0x600010/18 堆 cur/end（codegen 内联 __bump_alloc 用）
+//   0x600020/28 nanosleep 的 timespec；0x600030/38 剩余时间 rem
+//   0x600040 wait4 的 status
+//   0x600048 合并后的 envp 指针数组缓存（0=未构建）
+//   0x600050 /proc/self/environ blob 缓存（0=未加载，-1=读取失败）
+//   0x601000 起 1MiB read_line 行缓冲
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+//  系统调用号 / 常量
+// ---------------------------------------------------------------------------
+const kSysRead = 0;
+const kSysWrite = 1;
+const kSysOpen = 2;
+const kSysClose = 3;
+const kSysFstat = 5;
+const kSysLseek = 8;
+const kSysNanosleep = 35;
+const kSysFork = 57;
+const kSysExecve = 59;
+const kSysWait4 = 61;
+const kSysUnlink = 87;
+const kSysRename = 82;
+const kSysClockGettime = 228;
+const kSysExitGroup = 231;
+
+const kO_RDONLY = 0;
+const kO_WRONLY_TRUNC = 577;    // O_WRONLY | O_CREAT | O_TRUNC
+const kO_WRONLY_APPEND = 1089;  // O_WRONLY | O_CREAT | O_APPEND
+const kClockRealtime = 0;
+const kClockMonotonic = 1;
+const kEintr = -4;
+
+const kSlotEnvList = 0x600000;
+const kSlotTs = 0x600020;
+const kSlotRem = 0x600030;
+const kSlotStatus = 0x600040;
+const kSlotEnvpCache = 0x600048;
+const kSlotEnvBlob = 0x600050;
+const kSlotInitStack = 0x600058;   // _start 快照的初始 rsp
+const kLineBuf = 0x601000;
+const kLineBufMax = 1048576;
+
+// 数组元素种类（与 native_body.inc 的 EK_* 一致）
+const kEkInt = 0;
+const kEkFloat = 1;
+const kEkBool = 2;
+const kEkStr = 3;
+const kEkArr = 4;
+
+const kInt64Min = -9223372036854775807 - 1;
+
+// ---------------------------------------------------------------------------
+//  基础：panic / 输出
+// ---------------------------------------------------------------------------
+
+// 两行错误文本 + exit(1)（与 C 后端 lx_panic 文本逐字一致）
+fn luxrt_panic_msg(msg: string) {
+    luxrt_write_str(2, "lux: 运行时错误: ");
+    luxrt_write_str(2, msg);
+    luxrt_write_str(2, "\n");
+    luxrt_write_str(2, "lux: （如果是递归函数，也可能是调用层数过深导致栈溢出）\n");
+    __syscall(kSysExitGroup, 1);
+}
+
+// 越界统一文案："%s越界：下标 N，但长度只有 M（下标从 0 开始）"
+fn luxrt_bounds_fail(what: string, i: int, n: int) {
+    luxrt_panic_msg(what + "越界：下标 " + luxrt_i64_to_str(i) +
+                    "，但长度只有 " + luxrt_i64_to_str(n) +
+                    "（下标从 0 开始）");
+}
+
+// p0 = i（先压），p1 = 数组指针（类型层 int[]，机器层即指针槽）
+fn luxrt_panic_arr_oob(i: int, a: int[]) {
+    luxrt_bounds_fail("数组下标", i, __peek64(a, 0));
+}
+
+// p0 = 字符串指针，p1 = i
+fn luxrt_panic_str_oob(s: string, i: int) {
+    luxrt_bounds_fail("字符串下标", i, __peek64(s, 0));
+}
+
+fn luxrt_write(fd: int, p: int, n: int) {
+    __syscall(kSysWrite, fd, p, n);
+}
+
+fn luxrt_write_str(fd: int, s: string) {
+    luxrt_write(fd, __sptr(s) + 8, __peek64(s, 0));
+}
+
+fn luxrt_print_nl() {
+    luxrt_write_str(1, "\n");
+}
+
+fn luxrt_print_str(s: string) {
+    luxrt_write_str(1, s);
+}
+
+fn luxrt_print_i64(v: int) {
+    luxrt_write_str(1, luxrt_i64_to_str(v));
+}
+
+fn luxrt_print_f64(v: float) {
+    luxrt_write_str(1, luxrt_f64_to_str(v));
+}
+
+fn luxrt_print_bool(v: bool) {
+    if v { luxrt_write_str(1, "true"); }
+    else { luxrt_write_str(1, "false"); }
+}
+
+// ---------------------------------------------------------------------------
+//  断言
+// ---------------------------------------------------------------------------
+fn luxrt_assert_at(cond: bool, msg: string, line: int) {
+    if cond { return; }
+    luxrt_write_str(2, "lux: 断言失败 (第 " + luxrt_i64_to_str(line) +
+                       " 行): " + msg + "\n");
+    __syscall(kSysExitGroup, 1);
+}
+
+// ---------------------------------------------------------------------------
+//  无符号 64 位运算辅助
+// ---------------------------------------------------------------------------
+
+// 无符号 64 位右移（u 为“负”位模式时修正算术移位补入的符号位）
+// sh ∈ [1, 63]
+fn luxrt_usr(u: int, sh: int) -> int {
+    if u >= 0 { return u >> sh; }
+    // 算术右移把高 sh 位补成 1，需要减掉 2^64 - 2^(64-sh)
+    // 拆成两次 +INT64_MIN（补码回绕）再 +2^(64-sh)
+    let r = (u >> sh) + kInt64Min + kInt64Min + (1 << (64 - sh));
+    return r;
+}
+
+// 无符号 64 位除以 10（移位减法长除法；位模式即无符号值）
+fn luxrt_udiv10(u: int) -> int {
+    let rem = 0;
+    let q = 0;
+    for i in 0..64 {
+        let bit = luxrt_usr(u, 63 - i) & 1;
+        rem = (rem << 1) | bit;
+        q = q << 1;
+        if rem >= 10 {
+            rem = rem - 10;
+            q = q | 1;
+        }
+    }
+    return q;
+}
+
+fn luxrt_urem10(u: int) -> int {
+    return u - luxrt_udiv10(u) * 10;
+}
+
+// ---------------------------------------------------------------------------
+//  i64 → string / bool → string
+// ---------------------------------------------------------------------------
+fn luxrt_i64_to_str(v: int) -> string {
+    let u = v;
+    if v < 0 { u = 0 - v; }  // 补码取负 = 位模式的无符号值（含 INT64_MIN）
+    let raw = __bump_alloc(33);  // len 头 8 + 最多 20 字符 + NUL
+    let w = 32;
+    __poke8(raw, w, 0);
+    loop {
+        w = w - 1;
+        __poke8(raw, w, 48 + luxrt_urem10(u));
+        u = luxrt_udiv10(u);
+        if u == 0 { break; }
+    }
+    if v < 0 {
+        w = w - 1;
+        __poke8(raw, w, 45);  // '-'
+    }
+    let n = 32 - w;
+    __poke64(raw, 0, n);
+    __mem_copy(raw, 8, raw, w, n);
+    __poke8(raw, 8 + n, 0);
+    return __sval(raw);
+}
+
+fn luxrt_bool_to_str(v: bool) -> string {
+    if v { return "true"; }
+    return "false";
+}
+
+// ---------------------------------------------------------------------------
+//  字符串构造与操作
+// ---------------------------------------------------------------------------
+
+// 从裸指针拷 n 字节为新字符串
+fn luxrt_str_from_ptr(p: int, n: int) -> string {
+    let r = __bump_alloc(8 + n + 1);
+    __poke64(r, 0, n);
+    __mem_copy(r, 8, p, 0, n);
+    __poke8(r, 8 + n, 0);
+    return __sval(r);
+}
+
+// Lux 串的 [off, off+n) 切片拷贝
+fn luxrt_str_from_bytes(s: string, off: int, n: int) -> string {
+    return luxrt_str_from_ptr(__sptr(s) + 8 + off, n);
+}
+
+fn luxrt_str_concat(a: string, b: string) -> string {
+    let la = __peek64(a, 0);
+    let lb = __peek64(b, 0);
+    let r = __bump_alloc(8 + la + lb + 1);
+    __poke64(r, 0, la + lb);
+    __mem_copy(r, 8, a, 8, la);
+    __mem_copy(r, 8 + la, b, 8, lb);
+    __poke8(r, 8 + la + lb, 0);
+    return __sval(r);
+}
+
+// 单字节字符 → 1 字符字符串
+fn luxrt_str_chr(b: int) -> string {
+    let r = __bump_alloc(10);
+    __poke64(r, 0, 1);
+    __poke8(r, 8, b);
+    __poke8(r, 9, 0);
+    return __sval(r);
+}
+
+fn luxrt_str_char_at(s: string, i: int) -> string {
+    let n = __peek64(s, 0);
+    if i < 0 || i >= n { luxrt_panic_str_oob(s, i); }
+    return luxrt_str_chr(__peek8u(s, 8 + i));
+}
+
+fn luxrt_str_eq(a: string, b: string) -> bool {
+    let la = __peek64(a, 0);
+    if la != __peek64(b, 0) { return false; }
+    for i in 0..la {
+        if __peek8u(a, 8 + i) != __peek8u(b, 8 + i) { return false; }
+    }
+    return true;
+}
+
+// 字典序（unsigned char 语义，同 C strcmp）：负 / 0 / 正
+fn luxrt_str_cmp(a: string, b: string) -> int {
+    let la = __peek64(a, 0);
+    let lb = __peek64(b, 0);
+    let n = la;
+    if lb < n { n = lb; }
+    for i in 0..n {
+        let ca = __peek8u(a, 8 + i);
+        let cb = __peek8u(b, 8 + i);
+        if ca != cb {
+            if ca < cb { return -1; }
+            return 1;
+        }
+    }
+    if la < lb { return -1; }
+    if la > lb { return 1; }
+    return 0;
+}
+
+// 从 from 开始找 sub（朴素匹配），找不到返回 -1
+fn luxrt_str_find_from(s: string, from: int, sub: string) -> int {
+    let ls = __peek64(s, 0);
+    let lf = __peek64(sub, 0);
+    if lf > ls { return -1; }
+    let last = ls - lf;
+    let i = from;
+    while i <= last {
+        let ok = true;
+        for j in 0..lf {
+            if __peek8u(s, 8 + i + j) != __peek8u(sub, 8 + j) {
+                ok = false;
+                break;
+            }
+        }
+        if ok { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn luxrt_str_find(s: string, sub: string) -> int {
+    return luxrt_str_find_from(s, 0, sub);
+}
+
+fn luxrt_str_contains(s: string, sub: string) -> bool {
+    return luxrt_str_find(s, sub) >= 0;
+}
+
+fn luxrt_str_startswith(s: string, pre: string) -> bool {
+    let lp = __peek64(pre, 0);
+    if lp > __peek64(s, 0) { return false; }
+    for i in 0..lp {
+        if __peek8u(s, 8 + i) != __peek8u(pre, 8 + i) { return false; }
+    }
+    return true;
+}
+
+fn luxrt_str_endswith(s: string, suf: string) -> bool {
+    let ls = __peek64(s, 0);
+    let lf = __peek64(suf, 0);
+    if lf > ls { return false; }
+    for i in 0..lf {
+        if __peek8u(s, 8 + ls - lf + i) != __peek8u(suf, 8 + i) { return false; }
+    }
+    return true;
+}
+
+fn luxrt_isspace(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13;
+}
+
+fn luxrt_str_trim(s: string) -> string {
+    let n = __peek64(s, 0);
+    let start = 0;
+    while start < n && luxrt_isspace(__peek8u(s, 8 + start)) {
+        start = start + 1;
+    }
+    let stop = n;
+    while stop > start && luxrt_isspace(__peek8u(s, 8 + stop - 1)) {
+        stop = stop - 1;
+    }
+    return luxrt_str_from_bytes(s, start, stop - start);
+}
+
+fn luxrt_str_upper(s: string) -> string {
+    let n = __peek64(s, 0);
+    let r = __bump_alloc(8 + n + 1);
+    __poke64(r, 0, n);
+    for i in 0..n {
+        let c = __peek8u(s, 8 + i);
+        if c >= 97 && c <= 122 { c = c - 32; }
+        __poke8(r, 8 + i, c);
+    }
+    __poke8(r, 8 + n, 0);
+    return __sval(r);
+}
+
+fn luxrt_str_lower(s: string) -> string {
+    let n = __peek64(s, 0);
+    let r = __bump_alloc(8 + n + 1);
+    __poke64(r, 0, n);
+    for i in 0..n {
+        let c = __peek8u(s, 8 + i);
+        if c >= 65 && c <= 90 { c = c + 32; }
+        __poke8(r, 8 + i, c);
+    }
+    __poke8(r, 8 + n, 0);
+    return __sval(r);
+}
+
+fn luxrt_str_substr(s: string, start: int, ln: int) -> string {
+    let n = __peek64(s, 0);
+    if start < 0 { start = 0; }
+    if start > n { start = n; }
+    if ln < 0 { ln = 0; }
+    if ln > n - start { ln = n - start; }
+    return luxrt_str_from_bytes(s, start, ln);
+}
+
+fn luxrt_str_replace(s: string, old: string, nw: string) -> string {
+    let lo = __peek64(old, 0);
+    if lo == 0 { return s; }
+    let ls = __peek64(s, 0);
+    let ln = __peek64(nw, 0);
+    // 先数出现次数，一次算好总长
+    let cnt = 0;
+    let p = 0;
+    loop {
+        let q = luxrt_str_find_from(s, p, old);
+        if q < 0 { break; }
+        cnt = cnt + 1;
+        p = q + lo;
+    }
+    let total = ls + (ln - lo) * cnt;
+    if total < 0 { total = 0; }
+    let r = __bump_alloc(8 + total + 1);
+    __poke64(r, 0, total);
+    let w = 0;
+    p = 0;
+    while p < ls {
+        let q = luxrt_str_find_from(s, p, old);
+        if q < 0 {
+            __mem_copy(r, 8 + w, s, 8 + p, ls - p);
+            w = w + ls - p;
+            break;
+        }
+        __mem_copy(r, 8 + w, s, 8 + p, q - p);
+        w = w + q - p;
+        __mem_copy(r, 8 + w, nw, 8, ln);
+        w = w + ln;
+        p = q + lo;
+    }
+    __poke8(r, 8 + total, 0);
+    return __sval(r);
+}
+
+fn luxrt_str_split(s: string, sep: string) -> int[] {
+    if __peek64(sep, 0) == 0 {
+        luxrt_panic_msg("split() 的分隔符不能是空字符串");
+    }
+    let a = luxrt_arr_new(kEkStr);
+    let ls = __peek64(s, 0);
+    let lf = __peek64(sep, 0);
+    let p = 0;
+    while p <= ls {
+        let q = luxrt_str_find_from(s, p, sep);
+        if q < 0 {
+            luxrt_arr_push(a, __sptr(luxrt_str_from_bytes(s, p, ls - p)));
+            break;
+        }
+        luxrt_arr_push(a, __sptr(luxrt_str_from_bytes(s, p, q - p)));
+        p = q + lf;
+    }
+    return a;
+}
+
+fn luxrt_str_chars(s: string) -> int[] {
+    let a = luxrt_arr_new(kEkStr);
+    let n = __peek64(s, 0);
+    for i in 0..n {
+        luxrt_arr_push(a, __sptr(luxrt_str_chr(__peek8u(s, 8 + i))));
+    }
+    return a;
+}
+
+fn luxrt_str_join(arr: int[], sep: string) -> string {
+    let n = len(arr);
+    let acc = "";
+    for i in 0..n {
+        if i > 0 { acc = luxrt_str_concat(acc, sep); }
+        acc = luxrt_str_concat(acc, __sval(arr[i]));
+    }
+    return acc;
+}
+
+// ---------------------------------------------------------------------------
+//  str → 数值（strtoll / strtod 语义）
+// ---------------------------------------------------------------------------
+
+// 十进制 strtoll：跳过空白、可选符号；溢出饱和到 i64 极限；无数字返回 0
+fn luxrt_str_to_i64(s: string) -> int {
+    let n = __peek64(s, 0);
+    let i = 0;
+    while i < n && luxrt_isspace(__peek8u(s, 8 + i)) {
+        i = i + 1;
+    }
+    let neg = false;
+    if i < n && __peek8u(s, 8 + i) == 43 {  // '+'
+        i = i + 1;
+    } else if i < n && __peek8u(s, 8 + i) == 45 {  // '-'
+        neg = true;
+        i = i + 1;
+    }
+    // 累积上限：负方向 2^63 = 9223372036854775808，正方向 2^63-1
+    let hiLim = 922337203685477580;
+    let hiLast = 8;
+    if !neg { hiLast = 7; }
+    let acc = 0;
+    let sat = false;
+    let digits = 0;
+    while i < n {
+        let c = __peek8u(s, 8 + i);
+        if c < 48 || c > 57 { break; }
+        let d = c - 48;
+        if !sat {
+            if acc > hiLim || (acc == hiLim && d > hiLast) {
+                sat = true;
+            } else {
+                acc = acc * 10 + d;
+            }
+        }
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 { return 0; }
+    if sat {
+        if neg { return kInt64Min; }
+        return 9223372036854775807;
+    }
+    if neg { return 0 - acc; }
+    return acc;
+}
+
+// 10^k → float（0..22 精确，直接字面量）
+fn luxrt_pow10(k: int) -> float {
+    if k == 0 { return 1.0; }
+    if k == 1 { return 10.0; }
+    if k == 2 { return 100.0; }
+    if k == 3 { return 1000.0; }
+    if k == 4 { return 10000.0; }
+    if k == 5 { return 100000.0; }
+    if k == 6 { return 1000000.0; }
+    if k == 7 { return 10000000.0; }
+    if k == 8 { return 100000000.0; }
+    if k == 9 { return 1000000000.0; }
+    if k == 10 { return 1e10; }
+    if k == 11 { return 1e11; }
+    if k == 12 { return 1e12; }
+    if k == 13 { return 1e13; }
+    if k == 14 { return 1e14; }
+    if k == 15 { return 1e15; }
+    if k == 16 { return 1e16; }
+    if k == 17 { return 1e17; }
+    if k == 18 { return 1e18; }
+    if k == 19 { return 1e19; }
+    if k == 20 { return 1e20; }
+    if k == 21 { return 1e21; }
+    return 1e22;
+}
+
+// strtod 十进制 + 科学计数（正确舍入的近似：前 17 位有效数字 × 10^k）；
+// inf / infinity / nan 大小写不敏感
+fn luxrt_str_to_f64(sv: string) -> float {
+    let n = __peek64(sv, 0);
+    let i = 0;
+    while i < n && luxrt_isspace(__peek8u(sv, 8 + i)) {
+        i = i + 1;
+    }
+    let neg = false;
+    if i < n && __peek8u(sv, 8 + i) == 43 {  // '+'
+        i = i + 1;
+    } else if i < n && __peek8u(sv, 8 + i) == 45 {  // '-'
+        neg = true;
+        i = i + 1;
+    }
+    // inf / infinity / nan（大小写不敏感）
+    let lower = luxrt_str_lower(luxrt_str_substr(sv, i, n - i));
+    if luxrt_str_startswith(lower, "nan") {
+        if neg { return 0.0 - __f_from(9221120237041090560); }  // -nan
+        return __f_from(9221120237041090560);                   // 0x7FF8...
+    }
+    if luxrt_str_startswith(lower, "inf") {
+        if neg { return 0.0 - __f_from(9218868437227405312); }  // -inf
+        return __f_from(9218868437227405312);                   // 0x7FF0...
+    }
+    // 收集有效数字（前 17 位累积，其余只贡献数量级）
+    let mant = 0;
+    let mdigits = 0;
+    let exp10 = 0;
+    let seen = false;
+    while i < n {
+        let c = __peek8u(sv, 8 + i);
+        if c < 48 || c > 57 { break; }
+        seen = true;
+        if mdigits < 17 {
+            mant = mant * 10 + (c - 48);
+            mdigits = mdigits + 1;
+        } else {
+            exp10 = exp10 + 1;
+        }
+        i = i + 1;
+    }
+    if i < n && __peek8u(sv, 8 + i) == 46 {  // '.'
+        i = i + 1;
+        while i < n {
+            let c = __peek8u(sv, 8 + i);
+            if c < 48 || c > 57 { break; }
+            seen = true;
+            if mdigits < 17 {
+                mant = mant * 10 + (c - 48);
+                mdigits = mdigits + 1;
+                exp10 = exp10 - 1;
+            }
+            i = i + 1;
+        }
+    }
+    if !seen { return 0.0; }
+    if i < n && (__peek8u(sv, 8 + i) == 101 || __peek8u(sv, 8 + i) == 69) {  // e/E
+        let save = i;
+        i = i + 1;
+        let eneg = false;
+        if i < n && __peek8u(sv, 8 + i) == 43 {
+            i = i + 1;
+        } else if i < n && __peek8u(sv, 8 + i) == 45 {
+            eneg = true;
+            i = i + 1;
+        }
+        let ev = 0;
+        let ed = 0;
+        while i < n {
+            let c = __peek8u(sv, 8 + i);
+            if c < 48 || c > 57 { break; }
+            if ev < 100000 { ev = ev * 10 + (c - 48); }
+            ed = ed + 1;
+            i = i + 1;
+        }
+        if ed > 0 {
+            if eneg { exp10 = exp10 - ev; }
+            else { exp10 = exp10 + ev; }
+        } else {
+            i = save;  // 'e' 后没有数字：不算指数
+        }
+    }
+    // mant × 10^exp10
+    let v = __i_to_f(mant);
+    while exp10 >= 22 {
+        v = v * luxrt_pow10(22);
+        exp10 = exp10 - 22;
+    }
+    while exp10 <= -22 {
+        v = v / luxrt_pow10(22);
+        exp10 = exp10 + 22;
+    }
+    if exp10 > 0 { v = v * luxrt_pow10(exp10); }
+    if exp10 < 0 { v = v / luxrt_pow10(0 - exp10); }
+    if neg { v = 0.0 - v; }
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+//  数组核心（对象布局 [len][cap][data][ek]，元素一律 8 字节槽）
+// ---------------------------------------------------------------------------
+
+// 用 8 元素字面量拿到真 Lux 数组对象，再改造成空数组（cap 8 起倍增）
+fn luxrt_arr_new(ek: int) -> int[] {
+    // 注意：这里绝不能用数组字面量（字面量编译为 luxrt_arr_new 调用，
+    // 会无限递归耗尽栈），只能用裸 bump + poke 手工构造数组对象。
+    let r = __bump_alloc(32);   // [len][cap][data][ek]
+    let d = __bump_alloc(64);   // 8 元素容量起步
+    __poke64(r, 0, 0);          // len = 0
+    __poke64(r, 8, 8);          // cap = 8
+    __poke64(r, 16, d);         // data
+    __poke64(r, 24, ek);        // 元素种类
+    return __sval_a(r);
+}
+
+// 容量不够就翻倍搬迁（bump 分配不回收旧块）
+fn luxrt_arr_reserve(a: int[], need: int) {
+    let cap = __peek64(a, 8);
+    if need <= cap { return; }
+    let nc = cap * 2;
+    while nc < need { nc = nc * 2; }
+    let nd = __bump_alloc(nc * 8);
+    __mem_copy(nd, 0, __peek64(a, 16), 0, __peek64(a, 0) * 8);
+    __poke64(a, 8, nc);
+    __poke64(a, 16, nd);
+}
+
+fn luxrt_arr_push(a: int[], v: int) {
+    let lenv = __peek64(a, 0);
+    luxrt_arr_reserve(a, lenv + 1);
+    __poke64(__peek64(a, 16), lenv * 8, v);
+    __poke64(a, 0, lenv + 1);
+}
+
+// struct 字段对象（0.7）：n 字节零初始化，返回裸指针（int）
+fn luxrt_struct_new(n: int) -> int {
+    let p = __bump_alloc(n);
+    for i in 0..n { __poke8(p, i, 0); }
+    return p;
+}
+
+// argc/argv → 字符串数组（main(argv: string[])，取 _start 快照，argv[0]=程序名）
+// 返回类型在类型层写作 int[]（运行时数组统一按 int[] 传递），元素种类为 kEkStr。
+fn luxrt_argv() -> int[] {
+    let sp = __peek64(kSlotInitStack, 0);
+    let a = luxrt_arr_new(kEkStr);
+    if sp == 0 { return a; }
+    let argc = __peek64(sp, 0);
+    for i in 0..argc {
+        let p = __peek64(sp + 8 + i * 8, 0);
+        let n = 0;
+        while __peek8u(p, n) != 0 { n = n + 1; }
+        let r = __bump_alloc(8 + n + 1);
+        __poke64(r, 0, n);
+        __mem_copy(r, 8, p, 0, n);
+        __poke8(r, 8 + n, 0);
+        luxrt_arr_push(a, __sptr(__sval(r)));
+    }
+    return a;
+}
+
+fn luxrt_arr_pop(a: int[]) -> int {
+    let lenv = __peek64(a, 0);
+    if lenv == 0 { luxrt_panic_msg("对空数组调用 pop()"); }
+    let v = __peek64(__peek64(a, 16), (lenv - 1) * 8);
+    __poke64(a, 0, lenv - 1);
+    return v;
+}
+
+// a[lo..hi)：复制语义切片（0.6 新增），返回元素种类相同的新数组。
+// hi 为排他上界；lo<0 / hi>len / lo>hi 一律 panic（与下标访问同风格）。
+fn luxrt_arr_slice(a: int[], lo: int, hi: int) -> int[] {
+    let n = __peek64(a, 0);
+    if lo < 0 || hi > n || lo > hi { luxrt_panic_msg("切片范围越界"); }
+    let cnt = hi - lo;
+    let r = luxrt_arr_new(__peek64(a, 24));
+    if cnt > 0 {
+        luxrt_arr_reserve(r, cnt);
+        __mem_copy(__peek64(r, 16), 0, __peek64(a, 16), lo * 8, cnt * 8);
+        __poke64(r, 0, cnt);
+    }
+    return r;
+}
+
+// s[lo..hi)：复制语义字符串切片（0.6 新增），边界规则与数组一致。
+fn luxrt_str_slice(s: string, lo: int, hi: int) -> string {
+    let n = __peek64(s, 0);
+    if lo < 0 || hi > n || lo > hi { luxrt_panic_msg("切片范围越界"); }
+    return luxrt_str_from_bytes(s, lo, hi - lo);
+}
+
+fn luxrt_arr_insert(a: int[], i: int, v: int) {
+    let lenv = __peek64(a, 0);
+    if i < 0 || i > lenv { luxrt_panic_arr_oob(i, a); }
+    luxrt_arr_reserve(a, lenv + 1);
+    let data = __peek64(a, 16);
+    __mem_copy(data, (i + 1) * 8, data, i * 8, (lenv - i) * 8);
+    __poke64(data, i * 8, v);
+    __poke64(a, 0, lenv + 1);
+}
+
+fn luxrt_arr_remove(a: int[], i: int) -> int {
+    let lenv = __peek64(a, 0);
+    if i < 0 || i >= lenv { luxrt_panic_arr_oob(i, a); }
+    let data = __peek64(a, 16);
+    let v = __peek64(data, i * 8);
+    __mem_copy(data, i * 8, data, (i + 1) * 8, (lenv - i - 1) * 8);
+    __poke64(a, 0, lenv - 1);
+    return v;
+}
+
+fn luxrt_arr_set(a: int[], i: int, v: int) {
+    let lenv = __peek64(a, 0);
+    if i < 0 || i >= lenv { luxrt_panic_arr_oob(i, a); }
+    __poke64(__peek64(a, 16), i * 8, v);
+}
+
+// 读元素（复合赋值 a[i] += v 用；与内联读的越界行为一致）
+fn luxrt_arr_get(a: int[], i: int) -> int {
+    let lenv = __peek64(a, 0);
+    if i < 0 || i >= lenv { luxrt_panic_arr_oob(i, a); }
+    return __peek64(__peek64(a, 16), i * 8);
+}
+
+fn luxrt_arr_clear(a: int[]) {
+    __poke64(a, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+//  数组打印 / 转字符串（[e1, e2, ...]，字符串元素带引号转义）
+//  内部以 int 冒充数组指针递归，避免 int→int[] 的类型转换需求
+// ---------------------------------------------------------------------------
+
+// 数组打印用的字符串转义：仅 " 与 \ 前加反斜杠（与 C 后端 lx_pe_str 一致）
+fn luxrt_escape(s: string) -> string {
+    let n = __peek64(s, 0);
+    let acc = "";
+    for i in 0..n {
+        let c = __peek8u(s, 8 + i);
+        if c == 34 || c == 92 {
+            acc = luxrt_str_concat(acc, "\\");
+        }
+        acc = luxrt_str_concat(acc, luxrt_str_chr(c));
+    }
+    return acc;
+}
+
+// 带引号的字符串（struct 字段打印用，与 C 后端 lx_pe_str 一致）
+fn luxrt_quote(s: string) -> string {
+    return luxrt_str_concat("\"", luxrt_str_concat(luxrt_escape(s), "\""));
+}
+
+// a 为裸数组指针
+fn luxrt_arr_elem_str(a: int, i: int) -> string {
+    let ek = __peek64(a, 24);
+    let data = __peek64(a, 16);
+    let v = __peek64(data, i * 8);
+    if ek == kEkInt { return luxrt_i64_to_str(v); }
+    if ek == kEkFloat { return luxrt_f64_to_str(__f_from(v)); }
+    if ek == kEkBool { return luxrt_bool_to_str(v != 0); }
+    if ek == kEkStr {
+        return "\"" + luxrt_escape(__sval(v)) + "\"";
+    }
+    return luxrt_arr_to_str_i(v);  // 嵌套数组：递归
+}
+
+fn luxrt_arr_to_str_i(a: int) -> string {
+    let n = __peek64(a, 0);
+    let acc = "[";
+    for i in 0..n {
+        if i > 0 { acc = luxrt_str_concat(acc, ", "); }
+        acc = luxrt_str_concat(acc, luxrt_arr_elem_str(a, i));
+    }
+    return luxrt_str_concat(acc, "]");
+}
+
+fn luxrt_arr_to_str(a: int[]) -> string {
+    return luxrt_arr_to_str_i(__sptr(a));
+}
+
+fn luxrt_arr_print(a: int[]) {
+    luxrt_write_str(1, luxrt_arr_to_str_i(__sptr(a)));
+}
+
+// ---------------------------------------------------------------------------
+//  bignum（十进制精确运算，打印 float 最短往返用）
+//  limb 32 位存 int[]，高位 limb 在前
+// ---------------------------------------------------------------------------
+
+// i64（非负路径）→ bignum
+fn luxrt_big_from(v: int) -> int[] {
+    let u = v;
+    if v < 0 { u = 0 - v; }
+    let tmp = luxrt_arr_new(kEkInt);
+    loop {
+        luxrt_arr_push(tmp, u & 4294967295);
+        u = luxrt_usr(u, 32);
+        if u == 0 { break; }
+    }
+    let b = luxrt_arr_new(kEkInt);  // 高位 limb 在前
+    let n = len(tmp);
+    for i in 0..n {
+        luxrt_arr_push(b, tmp[n - 1 - i]);
+    }
+    return b;
+}
+
+// bignum × small（small < 2^32：16 位半字分解避免有符号 64 位溢出）
+fn luxrt_big_mul_small(a: int[], m: int) -> int[] {
+    let n = len(a);
+    let m0 = m & 65535;
+    let m1 = luxrt_usr(m, 16) & 65535;
+    let carry = 0;
+    for idx in 0..n {
+        let i = n - 1 - idx;  // 从低位 limb（数组尾部）开始
+        let limb = a[i];
+        let c0 = limb & 65535;
+        let c1 = luxrt_usr(limb, 16) & 65535;
+        let p0 = c0 * m0 + carry;
+        let p1 = c1 * m0 + c0 * m1 + luxrt_usr(p0, 16);
+        let p2 = c1 * m1 + luxrt_usr(p1, 16);
+        luxrt_arr_set(a, i, (p0 & 65535) | ((p1 & 65535) << 16));
+        carry = p2;
+    }
+    while carry > 0 {
+        luxrt_arr_insert(a, 0, carry & 4294967295);
+        carry = luxrt_usr(carry, 32);
+    }
+    luxrt_big_strip(a);
+    return a;
+}
+
+// 去掉前导零 limb（保留至少 1 个）
+fn luxrt_big_strip(a: int[]) {
+    while len(a) > 1 && a[0] == 0 {
+        let n = len(a);
+        __mem_copy(__peek64(a, 16), 0, __peek64(a, 16), 8, (n - 1) * 8);
+        __poke64(a, 0, n - 1);
+    }
+}
+
+// 比较：a>b → 1，a<b → -1，相等 → 0
+fn luxrt_big_cmp(a: int[], b: int[]) -> int {
+    let la = len(a);
+    let lb = len(b);
+    if la != lb {
+        if la > lb { return 1; }
+        return -1;
+    }
+    for i in 0..la {
+        if a[i] != b[i] {
+            if a[i] > b[i] { return 1; }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// a -= b（要求 a ≥ b）
+fn luxrt_big_sub(a: int[], b: int[]) {
+    let la = len(a);
+    let lb = len(b);
+    let borrow = 0;
+    for idx in 0..la {
+        let i = la - 1 - idx;
+        let vb = 0;
+        if i >= la - lb { vb = b[i - (la - lb)]; }
+        let d = a[i] - vb - borrow;
+        if d < 0 {
+            d = d + 4294967296;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        luxrt_arr_set(a, i, d);
+    }
+    luxrt_big_strip(a);
+}
+
+// a = a × 2^k（2^30 分块）
+fn luxrt_big_shl(a: int[], k: int) -> int[] {
+    let rest = k;
+    while rest >= 30 {
+        luxrt_big_mul_small(a, 1073741824);  // 2^30
+        rest = rest - 30;
+    }
+    if rest > 0 { luxrt_big_mul_small(a, 1 << rest); }
+    return a;
+}
+
+// bignum × 10^k（10^9 分块：< 2^32，mul_small 只支持 32 位乘数）
+fn luxrt_big_mul_10pow(a: int[], k: int) -> int[] {
+    let rest = k;
+    while rest >= 9 {
+        luxrt_big_mul_small(a, 1000000000);
+        rest = rest - 9;
+    }
+    if rest > 0 {
+        let p = 1;
+        for i in 0..rest { p = p * 10; }
+        luxrt_big_mul_small(a, p);
+    }
+    return a;
+}
+
+// src /= 1000000000，返回余数（rem×2^32+limb < 2^63 保证有符号除法安全）
+fn luxrt_big_divmod_1e9(src: int[]) -> int {
+    let n = len(src);
+    let rem = 0;
+    for i in 0..n {
+        let cur = rem * 4294967296 + src[i];
+        luxrt_arr_set(src, i, cur / 1000000000);
+        rem = cur % 1000000000;
+    }
+    luxrt_big_strip(src);
+    return rem;
+}
+
+// 十进制数字展开：digits 高位在前（divmod 1e9 提取）
+fn luxrt_big_digits(a: int[]) -> int[] {
+    let src = luxrt_arr_new(kEkInt);
+    for i in 0..len(a) { luxrt_arr_push(src, a[i]); }
+    let chunks = luxrt_arr_new(kEkInt);  // 9 位十进制块，低位在前
+    while !(len(src) == 1 && src[0] == 0) {
+        luxrt_arr_push(chunks, luxrt_big_divmod_1e9(src));
+    }
+    let out = luxrt_arr_new(kEkInt);
+    let nc = len(chunks);
+    if nc == 0 {
+        luxrt_arr_push(out, 0);
+        return out;
+    }
+    // 最高块去前导零后逐位展开
+    let top = chunks[nc - 1];
+    let started = false;
+    let div = 1000000000;
+    while div > 0 {
+        let d = top / div % 10;
+        if d != 0 || started {
+            luxrt_arr_push(out, d);
+            started = true;
+        }
+        div = div / 10;
+    }
+    if !started { luxrt_arr_push(out, 0); }
+    // 其余块固定 9 位
+    for idx in 0..nc - 1 {
+        let c = chunks[nc - 2 - idx];
+        let div2 = 100000000;
+        while div2 > 0 {
+            luxrt_arr_push(out, c / div2 % 10);
+            div2 = div2 / 10;
+        }
+    }
+    return out;
+}
+
+// i64（非负）→ 十进制数字数组（高位在前）
+fn luxrt_digits_i64(v: int) -> int[] {
+    let out = luxrt_arr_new(kEkInt);
+    let u = v;
+    if u == 0 {
+        luxrt_arr_push(out, 0);
+        return out;
+    }
+    let tmp = luxrt_arr_new(kEkInt);
+    while u > 0 {
+        luxrt_arr_push(tmp, luxrt_urem10(u));
+        u = luxrt_udiv10(u);
+    }
+    let n = len(tmp);
+    for i in 0..n {
+        luxrt_arr_push(out, tmp[n - 1 - i]);
+    }
+    return out;
+}
+
+// 判定 r × 10^k 是否是 M × 2^E 的 ≤half-ULP 表示（|D − r×10^k| < 2^(E−1)）
+// 全整数化 bignum 比较：
+//  E ≥ 0：|M×2^E×10^max(0,−k) − r×10^max(0,k)| × 2 < 2^E × 10^max(0,−k)
+//  E < 0：|2M×10^max(0,−k) − r×10^max(0,k)×2^(1+|E|)| < 10^max(0,−k)
+fn luxrt_roundtrips(m: int, bigE: int, r: int, k: int) -> bool {
+    let kneg = 0;
+    if k < 0 { kneg = 0 - k; }
+    let rBig = luxrt_big_from(r);
+    if k > 0 { luxrt_big_mul_10pow(rBig, k); }
+    if bigE >= 0 {
+        let lhs = luxrt_big_from(m);
+        luxrt_big_shl(lhs, bigE);
+        if kneg > 0 { luxrt_big_mul_10pow(lhs, kneg); }
+        let rhs = luxrt_big_from(1);
+        luxrt_big_shl(rhs, bigE);
+        luxrt_big_mul_10pow(rhs, kneg);
+        let c = luxrt_big_cmp(lhs, rBig);
+        if c == 0 { return true; }
+        if c > 0 { luxrt_big_sub(lhs, rBig); }
+        else { luxrt_big_sub(rBig, lhs); }
+        luxrt_big_shl(lhs, 1);  // ×2
+        return luxrt_big_cmp(lhs, rhs) < 0;
+    }
+    let lhs2 = luxrt_big_from(m);
+    luxrt_big_shl(lhs2, 1);  // 2M
+    if kneg > 0 { luxrt_big_mul_10pow(lhs2, kneg); }
+    luxrt_big_shl(rBig, 1 - bigE);  // × 2^(1+|E|)
+    let rhs2 = luxrt_big_from(1);
+    luxrt_big_mul_10pow(rhs2, kneg);
+    let c2 = luxrt_big_cmp(lhs2, rBig);
+    if c2 == 0 { return true; }
+    if c2 > 0 { luxrt_big_sub(lhs2, rBig); }
+    else { luxrt_big_sub(rBig, lhs2); }
+    return luxrt_big_cmp(lhs2, rhs2) < 0;
+}
+
+// ---------------------------------------------------------------------------
+//  f64 → string：最短往返（%.15g~%.17g 等价算法）
+//  值 = M × 2^E（M 为 53 位整数）；bignum 精确十进制后逐档试探
+// ---------------------------------------------------------------------------
+fn luxrt_f64_to_str(v: float) -> string {
+    let bits = __f_to_bits(v);
+    if bits == 0 { return "0"; }
+    if bits == kInt64Min { return "-0"; }
+    let neg = false;
+    if bits < 0 {
+        neg = true;
+        bits = bits & 9223372036854775807;  // 清符号位
+    }
+    // NaN / Inf（bits 已非负）
+    if bits >= 9218868437227405312 {  // 指数全 1（0x7FF0...）
+        let frac = bits & 4503599627370495;  // 2^52 − 1
+        if frac == 0 {
+            if neg { return "-inf"; }
+            return "inf";
+        }
+        if neg { return "-nan"; }
+        return "nan";
+    }
+    let e = luxrt_usr(bits, 52) & 2047;
+    let m = bits & 4503599627370495;
+    let bigE = 0;
+    if e == 0 {
+        bigE = -1074;  // 次正规
+    } else {
+        m = m + 4503599627370496;  // + 2^52
+        bigE = e - 1075;
+    }
+    // 精确十进制：N = M × 2^max(E,0) × 5^max(0,−E)；值 = N × 10^min(E,0)
+    if bigE >= 0 {
+        let bn = luxrt_big_from(m);
+        luxrt_big_shl(bn, bigE);
+        let digits = luxrt_big_digits(bn);
+        let nd = len(digits);
+        return luxrt_fmt_g(neg, digits, nd + bigE, bigE, m);
+    }
+    // bigE < 0：N = M × 5^|E|，值 = N / 10^|E|
+    let e2 = 0 - bigE;
+    let bn2 = luxrt_big_from(m);
+    let rest = e2;
+    while rest > 0 {
+        let step = rest;
+        if step > 12 { step = 12; }
+        let p5 = 1;
+        for i in 0..step { p5 = p5 * 5; }
+        luxrt_big_mul_small(bn2, p5);
+        rest = rest - step;
+    }
+    let digits2 = luxrt_big_digits(bn2);
+    let nd2 = len(digits2);
+    return luxrt_fmt_g(neg, digits2, nd2 - e2, bigE, m);
+}
+
+// %.Pg 格式（digits：精确值十进制数字高位在前；xp：小数点位置；
+// bigE/m：值 = m×2^bigE 供 roundtrips），p 从 15 试到 17 取最短
+fn luxrt_fmt_g(neg: bool, digits: int[], xp: int, bigE: int, m: int) -> string {
+    let nd = len(digits);
+    let bestP = 17;
+    let bestR = 0;
+    let bestXe = 0;
+    let p = 15;
+    while p <= 17 {
+        // 取 p 位有效数字（四舍五入）
+        let r = 0;
+        let xeP = xp;
+        if nd >= p {
+            for i in 0..p {
+                r = r * 10 + digits[i];
+            }
+            if nd > p && digits[p] >= 5 { r = r + 1; }
+        } else {
+            // 数字不足 p 位：值精确，尾零补齐
+            for i in 0..nd {
+                r = r * 10 + digits[i];
+            }
+            for i in 0..p - nd {
+                r = r * 10;
+            }
+        }
+        // 舍入进位可能使位数变 p+1（如 999…9 → 10…0）
+        let rd = luxrt_digits_i64(r);
+        if len(rd) > p {
+            xeP = xp + (len(rd) - p);
+            r = rd[0];
+        }
+        let xe2 = xeP - p;  // 舍入值 = r × 10^xe2
+        bestP = p;
+        bestR = r;
+        bestXe = xe2;
+        if luxrt_roundtrips(m, bigE, r, xe2) { break; }
+        p = p + 1;
+    }
+    return luxrt_render_g(neg, bestR, bestXe, bestP);
+}
+
+// 按 %g 排版：r（有效数字整数）× 10^xe，p 为已选精度
+fn luxrt_render_g(neg: bool, r: int, xe: int, p: int) -> string {
+    let rd = luxrt_digits_i64(r);
+    let nr = len(rd);
+    let x = xe + nr - 1;  // 十进制指数：值 ≈ d.ddd × 10^x
+    let body = "";
+    if x < -4 || x >= p {
+        // 科学计数：d.ddd（去尾零）e±XX
+        body = luxrt_str_chr(48 + rd[0]);
+        for i in 1..nr {
+            if i == 1 { body = luxrt_str_concat(body, "."); }
+            body = luxrt_str_concat(body, luxrt_str_chr(48 + rd[i]));
+        }
+        body = luxrt_strip_frac_zeros(body);
+        let mag = x;
+        let sign = "+";
+        if x < 0 {
+            mag = 0 - x;
+            sign = "-";
+        }
+        let es = luxrt_i64_to_str(mag);
+        if __peek64(es, 0) < 2 { es = "0" + es; }
+        body = luxrt_str_concat(body, "e" + sign + es);
+    } else if x >= 0 {
+        // 定点：整数位 = 前 x+1 位（不足补零），小数位去尾零
+        let intLen = x + 1;
+        let di = 0;
+        while di < intLen {
+            if di < nr {
+                body = luxrt_str_concat(body, luxrt_str_chr(48 + rd[di]));
+            } else {
+                body = luxrt_str_concat(body, "0");
+            }
+            di = di + 1;
+        }
+        if nr > intLen {
+            body = luxrt_str_concat(body, ".");
+            for i in intLen..nr {
+                body = luxrt_str_concat(body, luxrt_str_chr(48 + rd[i]));
+            }
+            body = luxrt_strip_frac_zeros(body);
+        }
+    } else {
+        // 0.000ddd
+        body = "0.";
+        let zeros = 0 - x - 1;
+        for i in 0..zeros {
+            body = luxrt_str_concat(body, "0");
+        }
+        for i in 0..nr {
+            body = luxrt_str_concat(body, luxrt_str_chr(48 + rd[i]));
+        }
+        body = luxrt_strip_frac_zeros(body);
+    }
+    if neg { return "-" + body; }
+    return body;
+}
+
+// 去小数部分尾随零（"1.2300"→"1.23"；无小数点原样返回）
+fn luxrt_strip_frac_zeros(s: string) -> string {
+    let n = __peek64(s, 0);
+    let end = n;
+    while end > 0 && __peek8u(s, 8 + end - 1) == 48 {  // '0'
+        end = end - 1;
+    }
+    if end > 0 && __peek8u(s, 8 + end - 1) == 46 {  // '.'
+        end = end - 1;
+    }
+    return luxrt_str_from_bytes(s, 0, end);
+}
+
+// ---------------------------------------------------------------------------
+//  math：round（half away from zero）/ min / max / random / seed
+// ---------------------------------------------------------------------------
+fn luxrt_round(v: float) -> float {
+    let bits = __f_to_bits(v);
+    if bits == 0 || bits == kInt64Min { return v; }  // ±0
+    let neg = false;
+    if bits < 0 {
+        neg = true;
+        bits = bits & 9223372036854775807;
+    }
+    let e = luxrt_usr(bits, 52) & 2047;
+    if e >= 1075 { return v; }  // |v| ≥ 2^52 已是整数
+    if e == 0 {
+        // 次正规（|v| < 1）：round 后只有 0 或 ±1
+        if bits >= 4503599627370496 {  // ≥ 0.5（位模式 2^52）
+            let one = 4607182418800017408;  // 1.0 位模式
+            if neg { return __f_from(one + kInt64Min); }
+            return __f_from(one);
+        }
+        return __f_from(0);
+    }
+    let s = 1075 - e;
+    let intBits = luxrt_usr(bits, s) << s;  // floor(|v|)：清掉低 s 位
+    let halfBit = 1 << (s - 1);
+    let frac = bits - intBits;
+    if frac >= halfBit {
+        intBits = intBits + (1 << s);  // 远离零进位
+    }
+    if neg { intBits = intBits + kInt64Min; }  // 置符号位
+    return __f_from(intBits);
+}
+
+// fmin / fmax（NaN 让位）
+fn luxrt_min_f(a: float, b: float) -> float {
+    if a != a { return b; }
+    if b != b { return a; }
+    if a < b { return a; }
+    return b;
+}
+
+fn luxrt_max_f(a: float, b: float) -> float {
+    if a != a { return b; }
+    if b != b { return a; }
+    if a > b { return a; }
+    return b;
+}
+
+fn luxrt_random() -> float {
+    let x = __rand_next();
+    // 取高 53 位（掩码修正算术移位的符号扩展）
+    let r53 = (x >> 11) & 9007199254740991;
+    return __i_to_f(r53) / __i_to_f(9007199254740992);
+}
+
+fn luxrt_seed(s: int) {
+    // LCG 混合（自洽即可，不追求与 glibc srandom 一致）
+    let x = s * 6364136223846793005 + 1442695040888963407;
+    let y = (x ^ luxrt_usr(x, 31)) * 6364136223846793005;
+    __seed_set(y ^ luxrt_usr(y, 29));
+}
+
+// ---------------------------------------------------------------------------
+//  输入
+// ---------------------------------------------------------------------------
+fn luxrt_read_line() -> string {
+    let lenv = 0;
+    loop {
+        let r = __syscall(kSysRead, 0, kLineBuf + lenv, 1);
+        if r == 0 { break; }   // EOF
+        if r < 0 { break; }    // 读错误按 EOF 处理
+        let c = __peek8u(kLineBuf, lenv);
+        if c == 10 { break; }  // '\n'
+        lenv = lenv + 1;
+        if lenv >= kLineBufMax - 1 {
+            luxrt_panic_msg("输入行过长（超过 1 MiB 上限）");
+        }
+    }
+    let r2 = __bump_alloc(8 + lenv + 1);
+    __poke64(r2, 0, lenv);
+    __mem_copy(r2, 8, kLineBuf, 0, lenv);
+    __poke8(r2, 8 + lenv, 0);
+    return __sval(r2);
+}
+
+fn luxrt_read_line_prompt(p: string) -> string {
+    luxrt_write_str(1, p);
+    return luxrt_read_line();
+}
+
+// ---------------------------------------------------------------------------
+//  time / sleep
+// ---------------------------------------------------------------------------
+fn luxrt_time_now() -> float {
+    __syscall(kSysClockGettime, kClockRealtime, kSlotTs);
+    return __i_to_f(__peek64(kSlotTs, 0)) +
+           __i_to_f(__peek64(kSlotTs, 8)) / 1000000000.0;
+}
+
+fn luxrt_time_mono() -> float {
+    __syscall(kSysClockGettime, kClockMonotonic, kSlotTs);
+    return __i_to_f(__peek64(kSlotTs, 0)) +
+           __i_to_f(__peek64(kSlotTs, 8)) / 1000000000.0;
+}
+
+fn luxrt_sleep(sec: float) {
+    if sec < 0.0 { luxrt_panic_msg("sleep() 的秒数不能是负数"); }
+    let s = __f_to_i(sec);
+    let ns = __f_to_i((sec - __i_to_f(s)) * 1000000000.0);
+    __poke64(kSlotTs, 0, s);
+    __poke64(kSlotTs, 8, ns);
+    loop {
+        let r = __syscall(kSysNanosleep, kSlotTs, kSlotRem);
+        if r != kEintr { break; }
+        // 剩余时间在 rem，搬回 ts 继续睡
+        __poke64(kSlotTs, 0, __peek64(kSlotRem, 0));
+        __poke64(kSlotTs, 8, __peek64(kSlotRem, 8));
+    }
+}
+
+fn luxrt_sleep_ms(ms: int) {
+    if ms < 0 { luxrt_panic_msg("sleep_ms() 的毫秒数不能是负数"); }
+    __poke64(kSlotTs, 0, ms / 1000);
+    __poke64(kSlotTs, 8, ms % 1000 * 1000000);
+    loop {
+        let r = __syscall(kSysNanosleep, kSlotTs, kSlotRem);
+        if r != kEintr { break; }
+        __poke64(kSlotTs, 0, __peek64(kSlotRem, 0));
+        __poke64(kSlotTs, 8, __peek64(kSlotRem, 8));
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  环境：getenv / setenv / environ 合并
+// ---------------------------------------------------------------------------
+
+// 加载环境变量到 bump blob（'k=v' 以 NUL 分隔、双 NUL 收尾）。
+// 优先从 _start 快照的初始栈取 envp（SysV：[sp]=argc, argv…, NULL, envp…），
+// 不依赖 /proc；qemu 等环境 /proc/self/environ 可能不可用，故作回退。
+fn luxrt_load_env_blob() -> int {
+    let cached = __peek64(kSlotEnvBlob, 0);
+    if cached != 0 { return cached; }
+
+    // 1) 启动栈快照
+    let sp = __peek64(kSlotInitStack, 0);
+    if sp != 0 {
+        let argc = __peek64(sp, 0);
+        let p = sp + 16 + argc * 8;   // 跳过 argc 与 argv[]（含收尾 NULL）
+        let sz = 4096;
+        loop {
+            let buf = __bump_alloc(sz);
+            let used = 0;
+            let cnt = 0;
+            let fit = true;
+            loop {
+                let v = __peek64(p, cnt * 8);
+                if v == 0 { break; }
+                let ln = 0;
+                loop {
+                    if __peek8u(v, ln) == 0 { break; }
+                    ln = ln + 1;
+                }
+                if used + ln + 1 >= sz { fit = false; break; }
+                __mem_copy(buf, used, v, 0, ln + 1);   // 连 NUL 一起拷
+                used = used + ln + 1;
+                cnt = cnt + 1;
+            }
+            if fit {
+                __poke8(buf, used, 0);   // 双 NUL 收尾
+                __poke64(kSlotEnvBlob, 0, buf);
+                return buf;
+            }
+            sz = sz * 2;
+        }
+    }
+
+    // 2) 回退：读 /proc/self/environ
+    let fd = __sys_open(__sptr("/proc/self/environ"), kO_RDONLY);
+    if fd < 0 {
+        __poke64(kSlotEnvBlob, 0, -1);  // 标记读取失败，避免反复重试
+        return -1;
+    }
+    let sz = 65536;
+    let buf = 0;
+    let total = 0;
+    loop {
+        buf = __bump_alloc(sz);
+        total = 0;
+        __syscall(kSysLseek, fd, 0, 0);  // 回到文件头重读
+        loop {
+            let r = __syscall(kSysRead, fd, buf + total, sz - total);
+            if r <= 0 { break; }
+            total = total + r;
+            if total >= sz { break; }
+        }
+        if total < sz { break; }
+        sz = sz * 2;
+    }
+    __syscall(kSysClose, fd);
+    __poke8(buf, total, 0);  // 保险收尾
+    __poke64(kSlotEnvBlob, 0, buf);
+    return buf;
+}
+
+// blob 段 [bp, bp+blen) 的 key（'=' 前）与列表项 "k=v" 的 key 相同？
+fn luxrt_env_same_key(blob: int, bp: int, blen: int, item: string) -> bool {
+    let eq1 = 0;
+    while eq1 < blen && __peek8u(blob, bp + eq1) != 61 {
+        eq1 = eq1 + 1;
+    }
+    let ln = __peek64(item, 0);
+    let eq2 = 0;
+    while eq2 < ln && __peek8u(item, 8 + eq2) != 61 {
+        eq2 = eq2 + 1;
+    }
+    if eq1 != eq2 { return false; }
+    for i in 0..eq1 {
+        if __peek8u(blob, bp + i) != __peek8u(item, 8 + i) { return false; }
+    }
+    return true;
+}
+
+// blob 从 at 起找 "name=" 项，命中返回值串（堆串），否则 ""
+fn luxrt_env_lookup_blob(blob: int, at: int, name: string) -> string {
+    let ln = __peek64(name, 0);
+    let p = at;
+    loop {
+        let seg = 0;
+        while __peek8u(blob, p + seg) != 0 {
+            seg = seg + 1;
+        }
+        if seg == 0 { return ""; }
+        let ok = seg > ln;
+        if ok {
+            for i in 0..ln {
+                if __peek8u(blob, p + i) != __peek8u(name, 8 + i) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && __peek8u(blob, p + ln) != 61 { ok = false; }  // '='
+        }
+        if ok {
+            return luxrt_str_from_ptr(blob + p + ln + 1, seg - ln - 1);
+        }
+        p = p + seg + 1;
+    }
+    return "";
+}
+
+fn luxrt_getenv(name: string) -> string {
+    // setenv 列表优先
+    let list = __peek64(kSlotEnvList, 0);
+    if list != 0 {
+        let n = __peek64(list, 0);
+        let data = __peek64(list, 16);
+        let nameEq = name + "=";
+        let leq = __peek64(nameEq, 0);
+        for i in 0..n {
+            let item = __sval(__peek64(data, i * 8));
+            if luxrt_str_find(item, nameEq) == 0 {
+                return luxrt_str_substr(item, leq, __peek64(item, 0) - leq);
+            }
+        }
+    }
+    let blob = __peek64(kSlotEnvBlob, 0);
+    if blob == 0 { blob = luxrt_load_env_blob(); }
+    if blob < 0 { return ""; }
+    return luxrt_env_lookup_blob(blob, 0, name);
+}
+
+fn luxrt_setenv(name: string, val: string) -> bool {
+    let nv = name + "=" + val;
+    let list = __sval_a(__peek64(kSlotEnvList, 0));
+    if __peek64(kSlotEnvList, 0) == 0 {
+        let fresh = luxrt_arr_new(kEkStr);
+        __poke64(kSlotEnvList, 0, __sptr(fresh));
+        luxrt_arr_push(fresh, __sptr(nv));
+        __poke64(kSlotEnvpCache, 0, 0);  // 失效 envp 缓存
+        return true;
+    }
+    let n = __peek64(list, 0);
+    let data = __peek64(list, 16);
+    let nameEq = name + "=";
+    for i in 0..n {
+        let item = __sval(__peek64(data, i * 8));
+        if luxrt_str_find(item, nameEq) == 0 {
+            luxrt_arr_set(list, i, __sptr(nv));
+            __poke64(kSlotEnvpCache, 0, 0);
+            return true;
+        }
+    }
+    luxrt_arr_push(list, __sptr(nv));
+    __poke64(kSlotEnvpCache, 0, 0);
+    return true;
+}
+
+// 构建 execve 用的 envp 指针数组（blob 项 + 列表覆盖/追加，NULL 结尾）
+fn luxrt_build_envp() -> int {
+    let cached = __peek64(kSlotEnvpCache, 0);
+    if cached != 0 { return cached; }
+    let blob = __peek64(kSlotEnvBlob, 0);
+    if blob == 0 { blob = luxrt_load_env_blob(); }
+    let list = __peek64(kSlotEnvList, 0);
+    let nl = 0;
+    if list != 0 { nl = __peek64(list, 0); }
+    let capArr = __bump_alloc(8 * (4096 + nl + 1));
+    let w = 0;
+    // 1) blob 项：被列表覆盖的跳过
+    if blob > 0 {
+        let p = 0;
+        loop {
+            let seg = 0;
+            while __peek8u(blob, p + seg) != 0 { seg = seg + 1; }
+            if seg == 0 { break; }
+            let covered = false;
+            if list != 0 {
+                let n = __peek64(list, 0);
+                let data = __peek64(list, 16);
+                for i in 0..n {
+                    if luxrt_env_same_key(blob, p, seg,
+                                          __sval(__peek64(data, i * 8))) {
+                        covered = true;
+                        break;
+                    }
+                }
+            }
+            if !covered {
+                __poke64(capArr, w * 8, blob + p);
+                w = w + 1;
+            }
+            p = p + seg + 1;
+        }
+    }
+    // 2) 列表项：Lux 串数据区自带 NUL 收尾，直接把字节区指针给 execve
+    if list != 0 {
+        let n2 = __peek64(list, 0);
+        let data2 = __peek64(list, 16);
+        for i in 0..n2 {
+            __poke64(capArr, w * 8, __peek64(data2, i * 8) + 8);
+            w = w + 1;
+        }
+    }
+    __poke64(capArr, w * 8, 0);
+    __poke64(kSlotEnvpCache, 0, capArr);
+    return capArr;
+}
+
+fn luxrt_system(cmd: string) -> int {
+    let pid = __sys_fork();
+    if pid < 0 { return -1; }
+    if pid == 0 {
+        // 子进程：execve("/bin/sh", ["/bin/sh","-c",cmd,NULL], envp)
+        // __sptr 返回串对象指针（[len][bytes]），C 字符串要 +8 跳过 len 头
+        let argv = __bump_alloc(32);
+        __poke64(argv, 0, __sptr("/bin/sh") + 8);
+        __poke64(argv, 8, __sptr("-c") + 8);
+        __poke64(argv, 16, __sptr(cmd) + 8);
+        __poke64(argv, 24, 0);
+        let envp = luxrt_build_envp();   // 裸 bump 块＝C 指针数组（NULL 结尾）
+        __syscall(kSysExecve, __sptr("/bin/sh") + 8, argv, envp);
+        __syscall(kSysExitGroup, 127);  // exec 失败
+    }
+    __syscall(kSysWait4, pid, kSlotStatus, 0, 0);
+    let st = __peek64(kSlotStatus, 0);
+    return (st >> 8) & 255;
+}
+
+// ---------------------------------------------------------------------------
+//  file 模块
+// ---------------------------------------------------------------------------
+fn luxrt_file_fail(op: string, path: string) {
+    luxrt_write_str(2, "lux: 运行时错误: 无法" + op + "文件 '" + path + "'\n");
+    __syscall(kSysExitGroup, 1);
+}
+
+fn luxrt_file_read(path: string) -> string {
+    let fd = __sys_open(__sptr(path), kO_RDONLY);
+    if fd < 0 { luxrt_file_fail("读取", path); }
+    let sb = __bump_alloc(256);
+    if __syscall(kSysFstat, fd, sb) < 0 { luxrt_file_fail("读取", path); }
+    let sz = __peek64(sb, 48);  // st_size 偏移 48
+    let buf = __bump_alloc(8 + sz + 1);
+    let got = 0;
+    loop {
+        let r = __syscall(kSysRead, fd, buf + 8 + got, sz - got);
+        if r <= 0 { break; }
+        got = got + r;
+        if got >= sz { break; }
+    }
+    __syscall(kSysClose, fd);
+    __poke8(buf, 8 + got, 0);
+    __poke64(buf, 0, got);
+    return __sval(buf);
+}
+
+fn luxrt_file_exists(path: string) -> bool {
+    let fd = __sys_open(__sptr(path), kO_RDONLY);
+    if fd < 0 { return false; }
+    __syscall(kSysClose, fd);
+    return true;
+}
+
+fn luxrt_file_write(path: string, data: string) -> bool {
+    let fd = __sys_open(__sptr(path), kO_WRONLY_TRUNC);
+    if fd < 0 { return false; }
+    let n = __peek64(data, 0);
+    let w = 0;
+    loop {
+        let r = __syscall(kSysWrite, fd, __sptr(data) + 8 + w, n - w);
+        if r <= 0 { break; }
+        w = w + r;
+        if w >= n { break; }
+    }
+    let ok = w == n;
+    if __syscall(kSysClose, fd) != 0 { ok = false; }
+    return ok;
+}
+
+fn luxrt_file_append(path: string, data: string) -> bool {
+    let fd = __sys_open(__sptr(path), kO_WRONLY_APPEND);
+    if fd < 0 { return false; }
+    let n = __peek64(data, 0);
+    let w = 0;
+    loop {
+        let r = __syscall(kSysWrite, fd, __sptr(data) + 8 + w, n - w);
+        if r <= 0 { break; }
+        w = w + r;
+        if w >= n { break; }
+    }
+    let ok = w == n;
+    if __syscall(kSysClose, fd) != 0 { ok = false; }
+    return ok;
+}
+
+fn luxrt_file_remove(path: string) -> bool {
+    return __sys_unlink(__sptr(path)) == 0;
+}
+
+fn luxrt_file_rename(from: string, to: string) -> bool {
+    return __sys_rename(__sptr(from), __sptr(to)) == 0;
+}
+
+// ---------------------------------------------------------------------------
+//  math：超越函数（aarch64 原生后端没有 x87，这里用纯 Lux 实现）
+//  只有 aarch64 代码生成器会调用 luxrt_math_*；x86 后端走 x87 内联，这些
+//  函数在那边是死代码。算法为经典分解 + 多项式/级数，精度足以通过双后端
+//  对拍（log2 / log10 / exp 在常见输入上与 libc 逐位一致）。
+// ---------------------------------------------------------------------------
+const kLn2 = 0.6931471805599453;
+const kLog2E = 1.4426950408889634;
+const kLog10_2 = 0.3010299956639812;
+const kPi = 3.141592653589793;
+const kPiOver2 = 1.5707963267948966;
+const kPiOver4 = 0.7853981633974483;
+
+// 向零截断
+fn luxrt_math_truncf(x: float) -> float {
+    return __i_to_f(__f_to_i(x));
+}
+
+// 向下取整
+fn luxrt_math_floorf(x: float) -> float {
+    let t = luxrt_math_truncf(x);
+    if x < 0.0 && t != x { return t - 1.0; }
+    return t;
+}
+
+// 2^k（k 为整数，|k| < 1023）
+fn luxrt_math_pow2i(k: int) -> float {
+    return __f_from((k + 1023) << 52);
+}
+
+// log2(x)：x = m·2^e，m∈[√2/2,√2)，log2(x)=e+ln(m)/ln2；
+// ln(m) 用 atanh 级数 ln((1+t)/(1-t)) = 2(t + t³/3 + t⁵/5 + …)，t=f/(2+f)
+fn luxrt_math_log2(x: float) -> float {
+    if x != x { return x; }
+    if x <= 0.0 {
+        if x == 0.0 { return 0.0 - 1.0 / 0.0; }
+        return 0.0 / 0.0;
+    }
+    if x == 1.0 / 0.0 { return x; }
+    let bits = __f_to_bits(x);
+    let e = ((bits >> 52) & 2047) - 1023;
+    let m = __f_from((bits & 4503599627370495) | (1023 << 52));
+    if m > 1.4142135623730951 {
+        m = m * 0.5;
+        e = e + 1;
+    }
+    let f = m - 1.0;
+    let t = f / (2.0 + f);
+    let t2 = t * t;
+    let s = 0.0;
+    let tp = t;
+    for n in 0..13 {
+        s = s + tp / __i_to_f(2 * n + 1);
+        tp = tp * t2;
+    }
+    return __i_to_f(e) + (2.0 * s) / kLn2;
+}
+
+fn luxrt_math_log(x: float) -> float {
+    return luxrt_math_log2(x) * kLn2;
+}
+
+fn luxrt_math_log10(x: float) -> float {
+    return luxrt_math_log2(x) * kLog10_2;
+}
+
+// 2^f，f∈[-0.5,0.5]：15 项 Taylor 多项式（Horner）
+fn luxrt_math_exp2frac(f: float) -> float {
+    let s = 6.778697234106004e-14;
+    s = s * f + 1.3691488853904123e-12;
+    s = s * f + 2.5678435993488197e-11;
+    s = s * f + 4.445538271870822e-10;
+    s = s * f + 7.054911620801123e-09;
+    s = s * f + 1.0178086009239699e-07;
+    s = s * f + 1.3215486790144309e-06;
+    s = s * f + 1.525273380405984e-05;
+    s = s * f + 0.00015403530393381608;
+    s = s * f + 0.0013333558146428443;
+    s = s * f + 0.009618129107628477;
+    s = s * f + 0.05550410866482158;
+    s = s * f + 0.2402265069591007;
+    s = s * f + kLn2;
+    s = s * f + 1.0;
+    return s;
+}
+
+fn luxrt_math_exp(x: float) -> float {
+    if x != x { return x; }
+    if x == 1.0 / 0.0 { return x; }
+    if x == 0.0 - 1.0 / 0.0 { return 0.0; }
+    let y = x * kLog2E;
+    let n = __f_to_i(luxrt_round(y));
+    let f = y - __i_to_f(n);
+    return luxrt_math_exp2frac(f) * luxrt_math_pow2i(n);
+}
+
+// 整数指数走平方取幂（精确）；否则 a^b = exp(b·ln a)
+fn luxrt_math_pow(x: float, y: float) -> float {
+    if y == luxrt_math_truncf(y) && y >= -1024.0 && y <= 1024.0 {
+        let e = __f_to_i(y);
+        let neg = false;
+        if e < 0 { neg = true; e = 0 - e; }
+        let r = 1.0;
+        let b = x;
+        loop {
+            if e == 0 { break; }
+            if (e & 1) == 1 { r = r * b; }
+            b = b * b;
+            e = e >> 1;
+        }
+        if neg { return 1.0 / r; }
+        return r;
+    }
+    return luxrt_math_exp(y * luxrt_math_log(x));
+}
+
+// atan 在 [0, tan(π/8)] 上的交错级数
+fn luxrt_math_atan_series(r: float) -> float {
+    let r2 = r * r;
+    let s = 0.0;
+    let tp = r;
+    let k = 0;
+    while k < 16 {
+        let d = 2 * k + 1;
+        if (k & 1) == 0 { s = s + tp / __i_to_f(d); }
+        else { s = s - tp / __i_to_f(d); }
+        tp = tp * r2;
+        k = k + 1;
+    }
+    return s;
+}
+
+fn luxrt_math_atan(x: float) -> float {
+    if x != x { return x; }
+    if x < 0.0 { return 0.0 - luxrt_math_atan(0.0 - x); }
+    if x > 1.0 { return kPiOver2 - luxrt_math_atan(1.0 / x); }
+    if x > 0.4142135623730951 {
+        return kPiOver4 + luxrt_math_atan_series((x - 1.0) / (x + 1.0));
+    }
+    return luxrt_math_atan_series(x);
+}
+
+fn luxrt_math_atan2(y: float, x: float) -> float {
+    if x > 0.0 { return luxrt_math_atan(y / x); }
+    if x < 0.0 {
+        if y >= 0.0 { return luxrt_math_atan(y / x) + kPi; }
+        return luxrt_math_atan(y / x) - kPi;
+    }
+    if y > 0.0 { return kPiOver2; }
+    if y < 0.0 { return 0.0 - kPiOver2; }
+    return 0.0;
+}
+
+fn luxrt_math_asin(x: float) -> float {
+    return luxrt_math_atan2(x, sqrt(1.0 - x * x));
+}
+
+fn luxrt_math_acos(x: float) -> float {
+    return luxrt_math_atan2(sqrt(1.0 - x * x), x);
+}
+
+fn luxrt_math_sin(x: float) -> float {
+    if x != x { return x; }
+    let two_pi = 6.283185307179586;
+    let z = x - two_pi * luxrt_math_floorf(x / two_pi + 0.5);
+    let z2 = z * z;
+    let term = z;
+    let s = z;
+    let k = 1;
+    while k < 20 {
+        term = 0.0 - term * z2 / (__i_to_f(2 * k) * __i_to_f(2 * k + 1));
+        s = s + term;
+        k = k + 1;
+    }
+    return s;
+}
+
+fn luxrt_math_cos(x: float) -> float {
+    if x != x { return x; }
+    let two_pi = 6.283185307179586;
+    let z = x - two_pi * luxrt_math_floorf(x / two_pi + 0.5);
+    let z2 = z * z;
+    let term = 1.0;
+    let s = 1.0;
+    let k = 1;
+    while k < 20 {
+        term = 0.0 - term * z2 / (__i_to_f(2 * k - 1) * __i_to_f(2 * k));
+        s = s + term;
+        k = k + 1;
+    }
+    return s;
+}
+
+fn luxrt_math_tan(x: float) -> float {
+    return luxrt_math_sin(x) / luxrt_math_cos(x);
+}
+
+fn luxrt_math_fmod(a: float, b: float) -> float {
+    if b == 0.0 || a != a || b != b { return 0.0 / 0.0; }
+    return a - luxrt_math_truncf(a / b) * b;
+}
+
+fn luxrt_math_hypot(a: float, b: float) -> float {
+    return sqrt(a * a + b * b);
+}
+)LUXRT"; }

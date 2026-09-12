@@ -1,0 +1,12 @@
+import "file";
+
+fn main() {
+    println(write("__lux_rm_test.txt", "abc"));
+    println(exists("__lux_rm_test.txt"));
+    println(rename("__lux_rm_test.txt", "__lux_rm_test2.txt"));
+    println(exists("__lux_rm_test.txt"));
+    println(exists("__lux_rm_test2.txt"));
+    println(read("__lux_rm_test2.txt"));
+    println(remove("__lux_rm_test2.txt"));
+    println(exists("__lux_rm_test2.txt"));
+}

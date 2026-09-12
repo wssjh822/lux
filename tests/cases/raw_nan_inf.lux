@@ -1,0 +1,19 @@
+import "math";
+// 0.7：原始字符串 r"..." 与 nan / inf 字面量
+fn main() {
+    let a = r"no\escape\there";
+    println(a);
+    let b = r"back\slash and \\ double";
+    println(b);
+    println(a + b);
+    println(nan);
+    println(inf);
+    println(-inf);
+    println(0.0 / 0.0);
+    println(1.0 / 0.0);
+    println(nan == nan);
+    println(nan != nan);
+    println(isnan(nan));
+    println(isinf(inf));
+    println(inf + 1.0);
+}

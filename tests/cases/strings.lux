@@ -1,0 +1,14 @@
+// 字符串：拼接 / 比较 / 转义 / len / 下标
+fn main() {
+    let s = "hello" + " " + "lux";
+    println(s);
+    println(s == "hello lux");
+    println(s != "hello lux");
+    println("abc" < "abd");
+    println(len("hi"));
+    println("tab\there");
+    println("quote\"inside\"");
+    println("hex:\x41");
+    println(s[0]);
+    println(s[6]);
+}

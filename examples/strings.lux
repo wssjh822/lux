@@ -1,0 +1,70 @@
+// ============================================================
+//  strings.lux —— 字符串的拼接、比较与转换
+// ============================================================
+
+const GREETING: string = "你好";
+const NAME: string = "Lux";
+
+fn shout(s: string) -> string {
+    return s + "!!!";
+}
+
+fn repeat_str(s: string, times: int) -> string {
+    let out = "";
+    let i = 0;
+    while i < times {
+        out = out + s;
+        i = i + 1;
+    }
+    return out;
+}
+
+// 右侧补空格，把字符串凑到指定宽度（用于对齐输出）
+fn pad_right(s: string, width: int) -> string {
+    let out = s;
+    let i = len(s);
+    while i < width {
+        out = out + " ";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() {
+    // 拼接
+    let msg = GREETING + ", " + NAME + "!";
+    println(msg);
+    println(shout(NAME));
+    println(repeat_str("一二三 ", 3));
+
+    // 长度
+    println(len("hello"));
+    println(len(GREETING));  // 一个汉字 3 个 UTF-8 字节
+
+    // 比较
+    println("abc" == "abc");
+    println("abc" != "abd");
+    println("apple" < "banana");     // 字典序
+    println("Zoo" < "apple");        // 大写字母排在小写前面
+
+    // 与数值互转
+    let n = 42;
+    println("答案 = " + string(n));
+    println("圆周率 ≈ " + string(3.14159));
+    println("开关 = " + string(true));
+
+    let parsed = int("1000") + 23;
+    println(parsed);
+    println(float("2.5") * 4.0);
+
+    // 转义字符
+    println("第一行\n第二行");
+    println("制表符:\t对齐");
+    println("引号: \" 反斜杠: \\ ");
+    println("Unicode: \u4f60\u597d");
+
+    // 用 pad_right 做对齐输出
+    println(pad_right("名字", 10) + "分数");
+    println(pad_right("小明", 10) + string(95));
+    println(pad_right("Lux", 10) + string(100));
+}

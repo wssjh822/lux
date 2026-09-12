@@ -1,0 +1,9 @@
+// time 模块：单调时钟（输出只有可判定的比较结果，时间值本身不可预测）
+import "time";
+fn main() {
+    let a = monotonic();
+    let b = monotonic();
+    println(b >= a);
+    sleep_ms(5);
+    println(monotonic() > a);
+}

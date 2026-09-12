@@ -1,0 +1,17 @@
+// 0.5 string 标准库：split / chars / join
+import "string";
+fn main() {
+    let parts = split("a,b,c", ",");
+    println(parts);
+    println(len(parts));
+    println(join(parts, "-"));
+    println(join(["x"], ","));
+    println(join(chars("xyz"), ""));
+    let cs = chars("hi");
+    println(cs);
+    println(cs[0]);
+    println(len(cs));
+    // split + join 组合
+    println(join(split("2026-09-06", "-"), "/"));
+    // 空分隔符
+}

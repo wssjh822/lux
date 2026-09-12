@@ -1,0 +1,94 @@
+// ============================================================
+//  control.lux —— 分支与循环的全部写法
+// ============================================================
+
+fn classify(score: int) -> string {
+    if score >= 90 {
+        return "优秀";
+    } else if score >= 75 {
+        return "良好";
+    } else if score >= 60 {
+        return "及格";
+    }
+    return "不及格";
+}
+
+fn main() {
+    // ---- if / else if / else ----
+    let score = 85;
+    print("85 分 -> ");
+    println(classify(score));
+    print("55 分 -> ");
+    println(classify(55));
+
+    // if 作为分支语句使用
+    let big = 100;
+    if big > 10 && big < 1000 {
+        println("在合理区间内");
+    }
+
+    // ---- while ----
+    print("while: ");
+    let n = 0;
+    while n < 5 {
+        print(n);
+        print(" ");
+        n = n + 1;
+    }
+    println("");
+
+    // ---- for 左闭右开区间 0..5 ----
+    print("0..5 : ");
+    for i in 0..5 {
+        print(i);
+        print(" ");
+    }
+    println("");
+
+    // ---- for 闭区间 1..=5 ----
+    print("1..=5: ");
+    for i in 1..=5 {
+        print(i);
+        print(" ");
+    }
+    println("");
+
+    // ---- 区间端点可以是任意表达式 ----
+    let lo = 3;
+    let hi = lo * 2;
+    print("3..6 : ");
+    for i in lo..hi {
+        print(i);
+        print(" ");
+    }
+    println("");
+
+    // ---- loop + break + continue ----
+    print("奇数 : ");
+    let k = 0;
+    loop {
+        k = k + 1;
+        if k % 2 == 0 {
+            continue;
+        }
+        if k > 9 {
+            break;
+        }
+        print(k);
+        print(" ");
+    }
+    println("");
+
+    // ---- 嵌套循环：九九乘法表 ----
+    for i in 1..=9 {
+        for j in 1..=i {
+            print(j);
+            print("×");
+            print(i);
+            print("=");
+            print(i * j);
+            print("\t");
+        }
+        println("");
+    }
+}

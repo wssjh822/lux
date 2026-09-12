@@ -1,0 +1,10 @@
+// import 标准库模块 time（输出确定，避免时间依赖）
+import "time";
+
+fn main() {
+    sleep_ms(1);
+    println("slept");
+    let t = now();
+    println(t >= 0.0);
+    println(now() >= t);
+}

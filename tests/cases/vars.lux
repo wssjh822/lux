@@ -1,0 +1,25 @@
+// 变量：类型推断 / 作用域遮蔽 / 默认零值
+fn main() {
+    let i = 42;
+    let f = 3.5;
+    let b = true;
+    let s = "str";
+    println(i);
+    println(f);
+    println(b);
+    println(s);
+    let z1: int;
+    let z2: float;
+    let z3: bool;
+    println(z1);
+    println(z2);
+    println(z3);
+    let outer = 1;
+    {
+        let outer = 2;
+        println(outer);
+    }
+    println(outer);
+    const K = 100;
+    println(K);
+}

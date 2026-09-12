@@ -1,0 +1,35 @@
+// 0.5 数组：字面量 / 下标 / 方法 / 嵌套 / 引用语义
+fn main() {
+    let a: int[] = [10, 20, 30];
+    println(a[0]);
+    println(a[2]);
+    println(len(a));
+    a[1] = 99;
+    println(a);
+    let b: int[] = [];
+    println(b);
+    println(len(b));
+    let names: string[] = ["alice", "bob"];
+    println(names);
+    println(names[1]);
+    let xs: float[] = [1.5, 2, 3];
+    println(xs);
+    println(a.pop());
+    println(a);
+    a.insert(1, 7);
+    println(a);
+    a.remove(0);
+    println(a);
+    let nested = [[1, 2], [3, 4]];
+    println(nested);
+    println(nested[1][0]);
+    // 引用语义：函数内 push 对调用方可见
+    let c: int[] = [1];
+    grow(c);
+    println(len(c));
+}
+
+fn grow(xs: int[]) {
+    xs.push(2);
+    xs.push(3);
+}

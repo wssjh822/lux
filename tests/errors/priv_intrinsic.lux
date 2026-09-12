@@ -1,0 +1,5 @@
+// 用户程序直接调用 __ 系特权内建：应给出 W1006 警告
+fn main() {
+    let p = __bump_alloc(8);
+    println(p);
+}

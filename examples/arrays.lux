@@ -1,0 +1,66 @@
+// ============================================================
+//  arrays.lux —— 0.5 的数组：字面量 / 下标 / 方法 / for-in / 引用语义
+// ============================================================
+
+import "string";
+
+// 数组作为参数与返回值（引用语义：函数内 push 对调用方可见）
+fn sum(xs: int[]) -> int {
+    let total = 0;
+    for x in xs {
+        total += x;
+    }
+    return total;
+}
+
+fn evens(n: int) -> int[] {
+    let out: int[] = [];       // 空数组从标注推断元素类型
+    for i in 0..n {
+        if i % 2 == 0 {
+            out.push(i);
+        }
+    }
+    return out;
+}
+
+fn main() {
+    // ---- 字面量、下标、len ----
+    let a: int[] = [10, 20, 30];
+    println(a);                // [10, 20, 30] —— 数组可以直接打印
+    println(a[0]);             // 10
+    a[2] = 99;                 // 下标赋值
+    println(a);                // [10, 20, 99]
+    println(len(a));           // 3
+
+    // ---- 方法：push / pop / insert / remove / clear ----
+    a.push(40);
+    println(a.pop());          // 40
+    a.insert(1, 15);           // [10, 15, 20, 99]
+    println(a.remove(0));      // 10
+    println(a);                // [15, 20, 99]
+
+    // ---- 元素类型可以是任何类型 ----
+    let names: string[] = ["lux", "数组", "ok"];
+    println(names);            // 字符串数组打印带引号
+    let grid = [[1, 2], [3, 4]];
+    println(grid);             // [[1, 2], [3, 4]] —— 嵌套数组递归打印
+    println(grid[1][0]);       // 3
+
+    // ---- for-in 迭代 ----
+    println(sum([1, 2, 3, 4]));   // 10
+    println(sum(evens(10)));      // 20
+    for c in "lux" {              // 字符串逐字节单字符
+        print("[" + c + "]");
+    }
+    println("");
+
+    // ---- 引用语义：b 和 a 是同一个数组 ----
+    let b = a;
+    b.push(1000);
+    println(len(a));           // 4 —— 通过 b push，a 也看得见
+
+    // ---- string 模块：split / join ----
+    let csv = split("10,20,30", ",");
+    println(csv);              // ["10", "20", "30"]
+    println(join(csv, "|"));   // 10|20|30
+}

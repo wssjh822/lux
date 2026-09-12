@@ -1,0 +1,32 @@
+// ============================================================
+//  stdlib.lux —— 标准库演示：math / time / system / file
+// ============================================================
+
+import "math";
+import "time";
+import "system";
+import "file";
+
+fn main() {
+    // math：常量与函数
+    println("pi = " + string(pi));
+    println("2^10 = " + string(pow(2.0, 10.0)));
+    println("sqrt(2) = " + string(sqrt(2.0)));
+    println("max(3, 7) = " + string(max(3, 7)));
+
+    // time：计时
+    let t = now();
+    sleep_ms(10);
+    println("10ms 实际耗时 " + string((now() - t) * 1000.0) + " ms");
+
+    // system：执行命令、读环境变量
+    println("system(true) 退出码 = " + string(system("true")));
+    println("HOME = " + env("HOME"));
+
+    // file：读写文件
+    let path = "/tmp/lux_stdlib_demo.txt";
+    println("写入成功: " + string(write(path, "hello, lux")));
+    println("追加成功: " + string(append(path, "!")));
+    println("文件内容: " + read(path));
+    println("文件存在: " + string(exists(path)));
+}

@@ -1,0 +1,24 @@
+# 编译产物
+build/
+*.o
+*.out
+
+# luxc 生成的中间 C 文件与可执行文件（都在工作目录里）
+/*.c
+/hello
+/primes
+/fib
+/types
+/control
+/strings
+/fizzbuzz
+/guess
+
+# bench 里的 C 对照实现是手写的，要保留
+!bench/primes_hand.c
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+*.swp

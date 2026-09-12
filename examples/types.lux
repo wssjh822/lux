@@ -1,0 +1,78 @@
+// ============================================================
+//  types.lux —— 基础类型、字面量、运算符与类型转换
+// ============================================================
+
+const VERSION: string = "0.1";
+const MAX: int = 100;
+
+fn main() {
+    println("Lux " + VERSION);
+
+    // ---- 整数字面量：十进制 / 十六进制 / 二进制 / 八进制 / 下划线分隔 ----
+    let million = 1_000_000;
+    let hex = 0xFF;
+    let bin = 0b1010_1010;
+    let oct = 0o777;
+    print("字面量: ");
+    print(million); print(" ");
+    print(hex); print(" ");
+    print(bin); print(" ");
+    println(oct);
+
+    // ---- 浮点 ----
+    let pi = 3.14159265358979;
+    let sci = 1.5e3;
+    println(pi);
+    println(sci);
+
+    // ---- 整数除法 vs 浮点除法 ----
+    println(7 / 2);         // 3，整除
+    println(7.0 / 2.0);     // 3.5
+    println(7 % 2);         // 1
+    println(7 / 2.0);       // 3.5，int 自动提升为 float
+
+    // ---- 位运算 ----
+    let x = 0b1100;
+    print("位运算: ");
+    print(x & 0b1010); print(" ");
+    print(x | 0b0011); print(" ");
+    print(x ^ 0b1111); print(" ");
+    print(~x); print(" ");
+    print(1 << 10); print(" ");
+    println(1024 >> 3);
+
+    // ---- 布尔运算（&& || ! 或 and or not 都行）----
+    let t = true;
+    let f = false;
+    println(t && f);
+    println(t || f);
+    println(!f);
+    println(t and not f);
+
+    // ---- 比较 ----
+    println(1 < 2);
+    println(2 <= 2);
+    println("abc" < "abd");   // 字符串按字典序比较
+    println("a" == "a");
+    println(1 == 1.0);        // int 与 float 之间可以比较
+
+    // ---- 类型转换 ----
+    println(int(3.99));                 // 3，向零截断
+    println(int(-3.99));                // -3
+    println(float(3) / 2.0);            // 1.5
+    println(string(42) + " 是答案");
+    println(int("123") + 1);            // 124
+    println(float("3.5") * 2.0);        // 7
+    println(string(true) + " / " + string(false));
+
+    // ---- 常量 ----
+    println(MAX);
+    let ratio: float = MAX;             // int 赋给 float 会自动提升
+    println(ratio / 4.0);
+
+    // ---- 表达式优先级 ----
+    println(2 + 3 * 4);                 // 14
+    println((2 + 3) * 4);               // 20
+    println(1 + 2 == 3);                // true
+    println(-3 - -3);                   // 0
+}

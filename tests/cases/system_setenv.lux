@@ -1,0 +1,11 @@
+// system 模块：setenv / env（环境变量读写）
+import "system";
+fn main() {
+    setenv("LUX_TEST_VAR", "hello");
+    println(env("LUX_TEST_VAR") == "hello");
+    setenv("LUX_TEST_VAR", "world");
+    println(env("LUX_TEST_VAR") == "world");
+    setenv("LUX_TEST_VAR", "");
+    println(env("LUX_TEST_VAR") == "");
+    println(env("LUX_NO_SUCH_VAR_XYZ") == "");
+}

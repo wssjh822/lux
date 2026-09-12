@@ -1,0 +1,52 @@
+// ============================================================
+//  fib.lux —— 函数、递归、循环
+// ============================================================
+
+// 递归版斐波那契
+fn fib_rec(n: int) -> int {
+    if n < 2 {
+        return n;
+    }
+    return fib_rec(n - 1) + fib_rec(n - 2);
+}
+
+// 迭代版斐波那契（不会栈溢出，可算到很大的 n）
+fn fib_iter(n: int) -> int {
+    let a = 0;
+    let b = 1;
+    let i = 0;
+    while i < n {
+        let t = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    return a;
+}
+
+// 带默认返回值的路径：末尾没有 return 时返回类型零值
+fn sign(n: int) -> int {
+    if n > 0 {
+        return 1;
+    }
+    if n < 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn main() {
+    println("递归 fib(30) = " + string(fib_rec(30)));
+    println("迭代 fib(90) = " + string(fib_iter(90)));
+
+    print("前 15 项: ");
+    for i in 0..15 {
+        print(fib_iter(i));
+        print(" ");
+    }
+    println("");
+
+    println("sign(-7) = " + string(sign(-7)));
+    println("sign(0)  = " + string(sign(0)));
+    println("sign(9)  = " + string(sign(9)));
+}

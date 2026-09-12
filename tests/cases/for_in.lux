@@ -1,0 +1,35 @@
+// 0.5 for-in：数组 / 字符串 / 与 range 混用
+fn main() {
+    println(sum([5, 5]));
+    let total = 0;
+    for x in [1, 2, 3, 4] {
+        total += x;
+    }
+    println(total);
+    for c in "lux" {
+        print("[" + c + "]");
+    }
+    println("");
+    let words: string[] = ["ann", "bo"];
+    for w in words {
+        println(w + ":" + string(len(w)));
+    }
+    for _ in 0..3 {
+        for s in ["a", "b"] {
+            print(s);
+        }
+    }
+    println("");
+    for i in 0..=3 {
+        print(string(i));
+    }
+    println("");
+}
+
+fn sum(xs: int[]) -> int {
+    let t = 0;
+    for x in xs {
+        t += x;
+    }
+    return t;
+}

@@ -1,0 +1,7 @@
+fn main() {
+    let a: int[] = [1, 2];
+    let b: int[] = [1, 2];
+    if a == b {
+        println("same");
+    }
+}

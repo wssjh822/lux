@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lux —— 编译到机器码的静态类型语言</title>
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#121722; --panel2:#161c28; --line:#232c3d;
+    --fg:#d7dce5; --dim:#8b95a7; --faint:#5c6773;
+    --gold:#f5b544; --gold2:#ffd07a; --cyan:#5ecfd6; --green:#a8e6a1;
+    --pink:#ff7b9c; --purple:#c39bf5;
+    --mono:"SF Mono",Menlo,Consolas,"Liberation Mono","Courier New",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    line-height:1.75; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  a{color:var(--cyan);text-decoration:none}
+
+  /* ---------- Hero ---------- */
+  .hero{padding:96px 0 64px;text-align:center;position:relative;overflow:hidden}
+  .hero::before{
+    content:"";position:absolute;top:-240px;left:50%;transform:translateX(-50%);
+    width:760px;height:480px;border-radius:50%;
+    background:radial-gradient(ellipse at center,rgba(245,181,68,.16),transparent 62%);
+    pointer-events:none;
+  }
+  .logo{
+    font-size:82px;font-weight:800;letter-spacing:-3px;line-height:1;
+    background:linear-gradient(180deg,#fff9ec,var(--gold));
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .tagline{color:var(--dim);font-size:19px;margin-top:20px}
+  .tagline b{color:var(--gold2);font-weight:600}
+  .cmd{
+    display:inline-block;margin-top:30px;padding:11px 22px;border-radius:9px;
+    background:var(--panel);border:1px solid var(--line);
+    font-family:var(--mono);font-size:14px;color:var(--green);
+  }
+  .cmd span{color:var(--faint);user-select:none}
+  .badges{margin-top:26px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+  .badge{
+    font-size:12.5px;padding:5px 13px;border-radius:20px;
+    background:rgba(245,181,68,.09);border:1px solid rgba(245,181,68,.28);color:var(--gold2);
+  }
+
+  /* ---------- 通用区块 ---------- */
+  section{padding:60px 0;border-top:1px solid var(--line)}
+  h2{font-size:27px;font-weight:700;letter-spacing:-.4px;margin-bottom:8px}
+  h2 .num{color:var(--gold);font-family:var(--mono);font-size:19px;margin-right:12px}
+  .sub{color:var(--dim);margin-bottom:32px;font-size:15px}
+
+  /* ---------- 代码 ---------- */
+  pre{
+    background:var(--panel2);border:1px solid var(--line);border-radius:11px;
+    padding:20px 22px;overflow-x:auto;font-family:var(--mono);
+    font-size:13.5px;line-height:1.72;
+  }
+  code{font-family:var(--mono)}
+  .k{color:var(--pink);font-weight:600}
+  .t{color:var(--cyan)}
+  .s{color:var(--green)}
+  .n{color:var(--gold)}
+  .c{color:var(--faint);font-style:italic}
+  .f{color:var(--purple)}
+  .op{color:var(--fg)}
+
+  /* ---------- 双栏 ---------- */
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+  @media(max-width:840px){.cols{grid-template-columns:1fr}}
+
+  /* ---------- 流水线 ---------- */
+  .pipeline{
+    display:flex;align-items:stretch;gap:0;flex-wrap:wrap;
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;
+  }
+  .stage{
+    flex:1;min-width:118px;text-align:center;padding:8px 6px;position:relative;
+  }
+  .stage .box{
+    background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    padding:11px 8px;font-family:var(--mono);font-size:13px;color:var(--gold2);font-weight:600;
+  }
+  .stage .io{margin-top:7px;font-size:11.5px;color:var(--faint)}
+  .arrow{
+    flex:0 0 30px;display:flex;align-items:center;justify-content:center;
+    color:var(--faint);font-size:17px;
+  }
+  @media(max-width:840px){.arrow{flex-basis:100%;height:20px;transform:rotate(90deg)}}
+
+  /* ---------- 特性卡 ---------- */
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media(max-width:840px){.grid{grid-template-columns:1fr}}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:20px;
+  }
+  .card h3{font-size:15.5px;margin-bottom:9px;color:var(--gold2)}
+  .card p{font-size:13.8px;color:var(--dim);line-height:1.7}
+  .card .ic{font-size:21px;margin-bottom:10px;display:block}
+
+  /* ---------- 表格 ---------- */
+  table{width:100%;border-collapse:collapse;font-size:14px;margin-top:6px}
+  th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line)}
+  th{color:var(--gold2);font-weight:600;font-size:13px;letter-spacing:.3px}
+  td:first-child{font-family:var(--mono);color:var(--cyan);white-space:nowrap}
+  tbody tr:hover{background:rgba(255,255,255,.02)}
+  .tbl-wrap{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:6px 0;overflow-x:auto}
+
+  /* ---------- 性能条 ---------- */
+  .bench{margin-top:8px}
+  .bar-row{display:flex;align-items:center;gap:14px;margin-bottom:14px}
+  .bar-label{width:150px;font-size:14px;flex:0 0 150px}
+  .bar-label em{display:block;font-style:normal;font-size:11.5px;color:var(--faint)}
+  .bar-track{flex:1;height:30px;background:var(--panel);border-radius:6px;overflow:hidden}
+  .bar-fill{
+    height:100%;border-radius:6px;display:flex;align-items:center;
+    padding-left:11px;font-family:var(--mono);font-size:13px;color:#0b0e14;font-weight:700;
+    min-width:56px;
+  }
+  .bar-fill.fast{background:linear-gradient(90deg,var(--gold),var(--gold2))}
+  .bar-fill.slow{background:linear-gradient(90deg,#4a6b8a,#6b8fae);color:#e8eef5}
+
+  /* ---------- 路线图 ---------- */
+  .road{display:grid;grid-template-columns:1fr 1fr;gap:26px}
+  @media(max-width:840px){.road{grid-template-columns:1fr}}
+  ul.li{list-style:none;font-size:14px}
+  ul.li li{padding:7px 0 7px 24px;position:relative;color:var(--dim)}
+  ul.li li::before{
+    content:"";position:absolute;left:4px;top:16px;width:6px;height:6px;
+    border-radius:50%;background:var(--gold);
+  }
+  ul.li li.done::before{background:var(--green)}
+  ul.li li.done b{color:var(--green)}
+  ul.li li.warn::before{background:#e0794f}
+  ul.li li b{color:var(--fg);font-weight:600}
+
+  /* ---------- 文件树 ---------- */
+  .tree{
+    background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:20px 22px;
+    font-family:var(--mono);font-size:13px;line-height:1.95;color:var(--dim);
+  }
+  .tree .d{color:var(--gold2)}
+  .tree .cm{color:var(--faint)}
+
+  footer{
+    border-top:1px solid var(--line);padding:38px 0;text-align:center;
+    color:var(--faint);font-size:13.5px;
+  }
+  footer .lx{color:var(--gold);font-weight:700}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <!-- ================= Hero ================= -->
+  <header class="hero">
+    <img src="logo.svg" alt="Lux 图标" width="96" height="96" style="margin-bottom:14px;border-radius:22px">
+    <div class="logo">Lux</div>
+    <p class="tagline">
+      一门用 C++ 写成的静态类型编程语言，<b>编译为原生可执行文件</b><br>
+      语法现代，<b>运行速度与手写 C 同速</b>；也可用 <b>原生后端</b> 零依赖直出 ELF
+    </p>
+    <div class="cmd"><span>$ </span>luxc hello.lux --run</div>
+    <div class="badges">
+      <span class="badge">v0.7.0</span>
+      <span class="badge">静态类型</span>
+      <span class="badge">C 后端（C17）</span>
+      <span class="badge">原生后端（--native）</span>
+      <span class="badge">struct 结构体</span>
+      <span class="badge">数组 + 切片</span>
+      <span class="badge">模块系统 + 标准库</span>
+      <span class="badge">REPL</span>
+      <span class="badge">MIT</span>
+    </div>
+  </header>
+
+  <!-- ================= Hello World ================= -->
+  <section>
+    <h2><span class="num">01</span>它长什么样</h2>
+    <p class="sub">现代静态风格：<code>fn</code> 定义函数、<code>let</code> 声明变量、类型写在名字后面。</p>
+    <div class="cols">
+      <pre><code><span class="c">// hello.lux</span>
+<span class="k">fn</span> <span class="f">fib</span>(n: <span class="t">int</span>) -&gt; <span class="t">int</span> {
+    <span class="k">if</span> n &lt; <span class="n">2</span> {
+        <span class="k">return</span> n;
+    }
+    <span class="k">return</span> <span class="f">fib</span>(n - <span class="n">1</span>) + <span class="f">fib</span>(n - <span class="n">2</span>);
+}
+
+<span class="k">fn</span> <span class="f">main</span>() {
+    <span class="k">let</span> name = <span class="s">"Lux"</span>;          <span class="c">// 类型推断 → string</span>
+    <span class="k">println</span>(<span class="s">"你好, "</span> + name + <span class="s">"!"</span>);
+
+    <span class="k">for</span> i <span class="k">in</span> <span class="n">0</span>..<span class="n">10</span> {
+        <span class="k">print</span>(<span class="f">fib</span>(i));
+        <span class="k">print</span>(<span class="s">" "</span>);
+    }
+    <span class="k">println</span>(<span class="s">""</span>);
+}</code></pre>
+      <pre><code><span class="c"># 编译成可执行文件</span>
+$ luxc hello.lux
+$ ./hello
+
+<span class="c"># 或者直接编译 + 运行</span>
+$ luxc hello.lux --run
+<span class="s">你好, Lux!</span>
+<span class="s">0 1 1 2 3 5 8 13 21 34</span>
+
+<span class="c"># 交互式 REPL（TAB 补全 / 方向键历史）</span>
+$ luxc repl
+lux&gt; 2 + 3
+<span class="s">5</span>
+lux&gt; <span class="k">let</span> x = 40;
+lux&gt; x + 2
+<span class="s">42</span>
+
+<span class="c"># 想看看生成的 C 代码？</span>
+$ luxc hello.lux --emit-c
+
+<span class="c"># 报错长这样（带错误码 + 源码上下文）</span>
+<span class="k">error</span>[<span class="n">E0003</span>]: <span class="s">变量 'x' 的初始值类型不匹配：</span>
+<span class="s">      这里是 'string' 类型，但需要 'int' 类型</span>
+  <span class="op">--&gt;</span> t.lux:2:18
+   <span class="op">|</span>
+<span class="op">2 |</span>     let x: <span class="t">int</span> = <span class="s">"hello"</span>;
+   <span class="op">|</span>                  <span class="op">^</span></code></pre>
+    </div>
+  </section>
+
+  <!-- ================= 流水线 ================= -->
+  <section>
+    <h2><span class="num">02</span>编译流水线</h2>
+    <p class="sub">同一份前端，两条后端：C 后端借 cc/clang 优化到机器码；原生后端由 Lux 自身实现运行时，零依赖直出 ELF。</p>
+    <div class="pipeline">
+      <div class="stage"><div class="box">Lexer</div><div class="io">源码 → Token</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="box">Parser</div><div class="io">Token → AST</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="box">Loader</div><div class="io">import 展开</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="box">Sema</div><div class="io">类型检查</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="box">Codegen (C)</div><div class="io">AST → C17</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="box">cc / clang</div><div class="io">C → 机器码</div></div>
+    </div>
+    <div class="pipeline" style="margin-top:14px">
+      <div class="stage"><div class="box">Sema</div><div class="io">同一份类型检查</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="box">NativeGen</div><div class="io">x86-64 / aarch64 发射</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="box">Lux 运行时</div><div class="io">native_rt.lux（Lux 自身实现）</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="box">ELF</div><div class="io">不依赖 C 编译器 / libc</div></div>
+    </div>
+    <div class="tree" style="margin-top:22px">
+<span class="d">src/</span>
+  lexer.cpp    <span class="cm">词法分析：字符流 → Token 流（错误恢复，一次报全）</span>
+  parser.cpp   <span class="cm">递归下降 + 优先级爬升 → AST（语句级错误恢复 + 嵌套深度限制）</span>
+  loader.cpp   <span class="cm">模块加载：import 展开、模块归属、别名注册</span>
+  sema.cpp     <span class="cm">作用域栈、类型检查与推断、struct 字段解析、常量折叠</span>
+  ty.cpp       <span class="cm">类型表：结构等价类型 intern 化（数组 / struct 的地基）</span>
+  codegen.cpp  <span class="cm">C 后端：AST → 自包含 C17 源码（内联运行时 + struct typedef）</span>
+  native.cpp / native_body.inc / native_emit*.hpp
+               <span class="cm">原生后端：x86-64 与 aarch64 机器码发射、ELF 布局</span>
+  native_rt.lux <span class="cm">原生运行时库（Lux 自身编写，约 100 个 luxrt_* 函数）</span>
+  repl.cpp     <span class="cm">交互式 REPL：行编辑、历史、TAB 补全、struct 支持</span>
+  pkgs.cpp     <span class="cm">包管理：luxc add / list / delete</span>
+  util.cpp     <span class="cm">诊断渲染（rustc 风格 + 错误码）、文件读写、字符串转义</span>
+  main.cpp     <span class="cm">luxc 驱动：串起流水线并调用 C 编译器 / 原生后端</span>
+<span class="d">tests/</span>       <span class="cm">143 项回归测试：行为 / 诊断 / 双后端差分 / 包管理 / REPL</span>
+<span class="d">bench/</span>       <span class="cm">与 C、Python 的性能对照实现</span>
+<span class="d">docs/</span>        <span class="cm">grammar.md / design.md / stability.md（1.0 冻结）/ arc.md</span>
+    </div>
+  </section>
+
+  <!-- ================= 特性 ================= -->
+  <section>
+    <h2><span class="num">03</span>设计取舍</h2>
+    <p class="sub">每一条都指向同一个目标：既要写起来舒服，又不能为舒服付出运行时的代价。</p>
+    <div class="grid">
+      <div class="card">
+        <span class="ic">◎</span>
+        <h3>零成本抽象</h3>
+        <p><code>int</code> 就是 <code>int64_t</code>，<code>string</code> 就是 <code>const char*</code>。没有装箱、没有运行时类型标签、没有 GC 暂停。</p>
+      </div>
+      <div class="card">
+        <span class="ic">◇</span>
+        <h3>只有一条隐式转换</h3>
+        <p>仅允许 <code>int → float</code> 这种不会丢信息的提升。<code>"答案是 " + 42</code> 会编译失败，你必须写 <code>string(42)</code>。</p>
+      </div>
+      <div class="card">
+        <span class="ic">▲</span>
+        <h3>条件必须是 bool</h3>
+        <p>不做 C 那种"非零即真"的隐式转换。<code>if 1 { }</code> 是错误，挡掉一整类常见 bug。</p>
+      </div>
+      <div class="card">
+        <span class="ic">◆</span>
+        <h3>除零是运行时错误</h3>
+        <p>整数除法走带检查的 <code>lx_idiv()</code>，除零时打印清晰的错误信息，而不是 SIGFPE 崩溃。</p>
+      </div>
+      <div class="card">
+        <span class="ic">✦</span>
+        <h3>诊断指回源文件</h3>
+        <p>生成的 C 里插入 <code>#line</code> 指令，C 编译器的警告和运行时断言都能指回 <code>.lux</code> 的行号。</p>
+      </div>
+      <div class="card">
+        <span class="ic">❖</span>
+        <h3>生成的代码零警告</h3>
+        <p>所有示例生成的 C 在 <code>-Wall -Wextra</code> 下都是 0 警告 —— 中间产物也是干净的。</p>
+      </div>
+      <div class="card">
+        <span class="ic">▦</span>
+        <h3>数组，引用语义 <span style="color:var(--gold2)">0.5 新增</span></h3>
+        <p><code>let a: int[] = [1,2,3]</code>，越界立即 panic，<code>push</code> / <code>pop</code> / <code>insert</code> / <code>remove</code> 自动扩容；传参与赋值共享同一数组，和 Python list 一致。</p>
+      </div>
+      <div class="card">
+        <span class="ic">↻</span>
+        <h3>for-in 迭代 <span style="color:var(--gold2)">0.5 新增</span></h3>
+        <p><code>for x in arr</code> 逐元素、<code>for c in s</code> 逐字符；配合 <code>split</code> / <code>chars</code> / <code>join</code>，文本处理一行搞定。</p>
+      </div>
+      <div class="card">
+        <span class="ic">❏</span>
+        <h3>struct 结构体 <span style="color:var(--gold2)">0.7 新增</span></h3>
+        <p><code>struct Point { let x: int; }</code>，构造 <code>Point { x: 1 }</code>，成员读写 <code>p.x += 1</code>，支持嵌套与 struct 数组，双后端行为一致。</p>
+      </div>
+      <div class="card">
+        <span class="ic">◈</span>
+        <h3>if 表达式 <span style="color:var(--gold2)">0.7 新增</span></h3>
+        <p><code>let x = if c { a } else { b };</code> —— 分支各是一个表达式，<code>int</code> / <code>float</code> 混合自动提升。</p>
+      </div>
+      <div class="card">
+        <span class="ic">▸</span>
+        <h3>命令行参数 <span style="color:var(--gold2)">0.7 新增</span></h3>
+        <p><code>fn main(argv: string[])</code> 直接拿到参数数组，<code>argv[0]</code> 为程序名；C 后端与原生后端约定一致。</p>
+      </div>
+      <div class="card">
+        <span class="ic">✳</span>
+        <h3>原始字符串 / nan · inf <span style="color:var(--gold2)">0.7 新增</span></h3>
+        <p><code>r"no\escape"</code> 不做任何转义；<code>nan</code> / <code>inf</code> 作为浮点字面量，与 <code>isnan</code> / <code>isinf</code> 配合。</p>
+      </div>
+      <div class="card">
+        <span class="ic">⟲</span>
+        <h3>通用左值复合赋值 <span style="color:var(--gold2)">0.7 新增</span></h3>
+        <p><code>a[i] += v</code>、<code>grid[i][j] = v</code>、<code>p.x *= 2</code>、<code>arr[i].x += 1</code>；左值子表达式只求值一次。</p>
+      </div>
+      <div class="card">
+        <span class="ic">⌘</span>
+        <h3>原生代码生成后端 <span style="color:var(--gold2)">0.6 新增</span></h3>
+        <p><code>luxc --native</code> 直出本机架构（x86-64 / aarch64）Linux ELF，不调用 C 编译器、不链接 libc；运行时全部由 Lux 自身实现。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 语法速查 ================= -->
+  <section>
+    <h2><span class="num">04</span>语法速查</h2>
+    <p class="sub">基础语法 + 语法糖 + 模块系统。</p>
+    <div class="cols">
+      <pre><code><span class="c">// 变量与常量</span>
+<span class="k">let</span> x: <span class="t">int</span> = <span class="n">10</span>;      <span class="c">// 显式类型</span>
+<span class="k">let</span> y = <span class="n">3.14</span>;        <span class="c">// 推断为 float</span>
+<span class="k">let</span> z: <span class="t">int</span>;          <span class="c">// 默认 0</span>
+<span class="k">const</span> MAX: <span class="t">int</span> = <span class="n">100</span>;  <span class="c">// 不可变</span>
+
+<span class="c">// 顶层全局常量（编译期常量折叠）</span>
+<span class="k">const</span> VERSION = <span class="s">"0.7"</span>;
+<span class="k">const</span> KB: <span class="t">int</span> = <span class="n">2</span> * <span class="n">1024</span>;
+
+<span class="c">// 函数</span>
+<span class="k">fn</span> <span class="f">add</span>(a: <span class="t">int</span>, b: <span class="t">int</span>) -&gt; <span class="t">int</span> {
+    <span class="k">return</span> a + b;
+}
+<span class="k">fn</span> <span class="f">greet</span>() {          <span class="c">// 返回 void</span>
+    <span class="k">println</span>(<span class="s">"hi"</span>);
+}
+
+<span class="c">// 字面量</span>
+<span class="n">1_000_000</span>  <span class="n">0xFF</span>  <span class="n">0b1010</span>  <span class="n">0o777</span>
+<span class="n">3.14</span>  <span class="n">1.5e3</span>  <span class="s">"含 \n 转义 \u4f60"</span></code></pre>
+      <pre><code><span class="c">// 分支</span>
+<span class="k">if</span> score &gt;= <span class="n">90</span> {
+    <span class="k">println</span>(<span class="s">"优秀"</span>);
+} <span class="k">elif</span> score &gt;= <span class="n">60</span> {
+    <span class="k">println</span>(<span class="s">"及格"</span>);
+} <span class="k">else</span> {
+    <span class="k">println</span>(<span class="s">"不及格"</span>);
+}
+
+<span class="c">// 循环</span>
+<span class="k">while</span> i &lt; <span class="n">10</span> { i = i + <span class="n">1</span>; }
+<span class="k">for</span> i <span class="k">in</span> <span class="n">0</span>..<span class="n">10</span> { }     <span class="c">// 左闭右开</span>
+<span class="k">for</span> i <span class="k">in</span> <span class="n">1</span>..=<span class="n">10</span> { }    <span class="c">// 闭区间</span>
+<span class="k">repeat</span> <span class="n">5</span> { }             <span class="c">// 重复 5 次</span>
+<span class="k">loop</span> {
+    <span class="k">if</span> done { <span class="k">break</span>; }
+    <span class="k">if</span> skip { <span class="k">continue</span>; }
+}
+
+<span class="c">// 语法糖：复合赋值与自增</span>
+x += <span class="n">5</span>;  s += <span class="s">"!"</span>;  i++;  j--;
+
+<span class="c">// 内置函数</span>
+<span class="f">print</span>(...) <span class="f">println</span>(...) <span class="f">len</span>(s)
+<span class="f">input</span>() <span class="f">int</span>(x) <span class="f">float</span>(x) <span class="f">string</span>(x)
+<span class="f">abs</span>(x) <span class="f">sqrt</span>(x) <span class="f">assert</span>(c) <span class="f">exit</span>(n)</code></pre>
+    </div>
+    <pre style="margin-top:22px"><code><span class="c">// 模块与标准库</span>
+<span class="k">import</span> <span class="s">"math"</span>;          <span class="c">// pow / floor / sin / max / pi ...</span>
+<span class="k">import</span> <span class="s">"time"</span>;          <span class="c">// now / monotonic / sleep / sleep_ms</span>
+<span class="k">import</span> <span class="s">"system"</span>;        <span class="c">// system(cmd) / env / setenv</span>
+<span class="k">import</span> <span class="s">"file"</span>;          <span class="c">// read / write / append / exists / remove / rename</span>
+<span class="k">import</span> <span class="s">"string"</span>;        <span class="c">// contains / replace / trim / substr / format ...</span>
+<span class="k">import</span> <span class="s">"./util.lux"</span>;   <span class="c">// 相对路径的 .lux 文件</span>
+<span class="k">import</span> <span class="s">"mypkg"</span>;         <span class="c">// 包目录（lux.json）或已安装的包</span>
+<span class="k">import</span> <span class="s">"c:m"</span>;           <span class="c">// 链接 C 库（-lm）</span>
+
+<span class="c">// 命名空间：默认导入可裸名访问；as 别名不污染全局</span>
+<span class="k">import</span> <span class="s">"math"</span> <span class="k">as</span> m;
+<span class="f">m</span>.<span class="f">pow</span>(<span class="n">2.0</span>, <span class="n">10.0</span>)   <span class="c">// 限定访问</span>
+<span class="f">math</span>.<span class="f">pow</span>(<span class="n">2.0</span>, <span class="n">8.0</span>)  <span class="c">// 默认导入的模块也支持限定访问</span>
+
+<span class="c">// 调用 C 库函数</span>
+<span class="k">extern fn</span> <span class="f">cbrt</span>(x: <span class="t">float</span>) -&gt; <span class="t">float</span>;
+
+<span class="c"># 包管理</span>
+$ luxc add ./mypkg       <span class="c"># 安装到 ~/.lux/packages/</span>
+$ luxc list              <span class="c"># 列出已安装的包</span>
+$ luxc delete mypkg      <span class="c"># 卸载</span></code></pre>
+    <pre style="margin-top:22px"><code><span class="c">// 0.7：struct 结构体</span>
+<span class="k">struct</span> <span class="t">Point</span> {
+    <span class="k">let</span> x: <span class="t">int</span>;
+    <span class="k">let</span> y: <span class="t">int</span>;
+}
+
+<span class="k">fn</span> <span class="f">shift</span>(p: <span class="t">Point</span>, dx: <span class="t">int</span>) {
+    p.x += dx;               <span class="c">// 引用语义：调用方可见</span>
+}
+
+<span class="k">fn</span> <span class="f">main</span>(argv: <span class="t">string[]</span>) {   <span class="c">// 0.7：命令行参数</span>
+    <span class="k">let</span> p = <span class="t">Point</span> { x: <span class="n">3</span>, y: <span class="n">4</span> };  <span class="c">// 构造（字段必须全给）</span>
+    <span class="k">println</span>(p);                        <span class="c">// Point { x: 3, y: 4 }</span>
+
+    <span class="k">let</span> dx = <span class="k">if</span> len(argv) &gt; <span class="n">1</span> { <span class="n">1</span> } <span class="k">else</span> { <span class="n">0</span> };  <span class="c">// 0.7：if 表达式</span>
+    <span class="f">shift</span>(p, dx);
+
+    <span class="k">let</span> raw = <span class="f">r</span><span class="s">"C:\path\no\escape"</span>;    <span class="c">// 0.7：原始字符串</span>
+    <span class="k">let</span> big = <span class="n">inf</span>;                     <span class="c">// 0.7：inf / nan 字面量</span>
+}</code></pre>
+  </section>
+
+  <!-- ================= 性能 ================= -->
+  <section>
+    <h2><span class="num">05</span>性能</h2>
+    <p class="sub">同一套试除法素数算法，统计 2..2,000,000 之间的素数（正确结果 148,933），各跑 3 次取最快。括号内为相对手写 C 的倍数。</p>
+    <div class="bench">
+      <div class="bar-row">
+        <div class="bar-label">手写 C <em>gcc -O2（基准 1.00×）</em></div>
+        <div class="bar-track"><div class="bar-fill fast" style="width:5%">1.00×</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Lux C 后端 <em>luxc -O2 → gcc -O2</em></div>
+        <div class="bar-track"><div class="bar-fill fast" style="width:6%">1.01×</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Lux 原生后端 <em>luxc --native（未优化直出）</em></div>
+        <div class="bar-track"><div class="bar-fill slow" style="width:11%">2.05×</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Python 3 <em>解释执行</em></div>
+        <div class="bar-track"><div class="bar-fill slow" style="width:100%">9.7×</div></div>
+      </div>
+    </div>
+    <p style="margin-top:20px;color:var(--dim);font-size:14.5px">
+      Lux 生成的代码与手写 C <b style="color:var(--gold2)">同速（1.01×）</b>；
+      原生后端不依赖 C 编译器、不做优化，约 <b style="color:var(--gold2)">2 倍</b> 于
+      手写 C，仍远快于解释执行（Python 的 9.7× 与本机原生 2.05× 同量级基准）。
+      两套独立后端在回归里做<b style="color:var(--gold2)">逐字节差分对拍</b>，互相校验正确性。
+    </p>
+  </section>
+
+  <!-- ================= 限制与路线图 ================= -->
+  <section>
+    <h2><span class="num">06</span>已知限制与下一步</h2>
+    <p class="sub">以下取舍是刻意为之 —— 把不确定的东西留在后面，先把确定的部分做对。</p>
+    <div class="road">
+      <div>
+        <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">当前限制（0.7）</h3>
+        <ul class="li">
+          <li class="warn"><b>不会自动释放内存</b> —— 字符串拼接、数组扩容、struct 构造都会持续占用；ARC 是 0.7.x / 0.8 的主题（设计草案见 <code>docs/arc.md</code>）</li>
+          <li class="warn">数组与 struct 都是引用语义，<b>不支持 <code>==</code> 比较</b>（请逐个比较元素 / 字段）</li>
+          <li class="warn"><code>len()</code> / <code>find</code> / <code>substr</code> / <code>chars</code> / 字符串 for-in 按 UTF-8 <b>字节</b>计，不是字符数</li>
+          <li class="warn">空数组 <code>[]</code> 作为函数实参无法推断元素类型（请先声明带类型的变量）</li>
+          <li class="warn">原生后端在<b>溢出 / 下溢 / 极端指数</b>附近的浮点数学与 libm 有末位差异（常规范围精度良好）</li>
+          <li class="warn">标识符只支持 ASCII；C 后端需系统装有 C 编译器（原生后端不需要）</li>
+          <li class="warn">只支持 POSIX 平台（Linux / macOS），Windows 请用 WSL / MSYS2</li>
+        </ul>
+      </div>
+      <div>
+        <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">路线图</h3>
+        <ul class="li">
+          <li class="done"><b>模块系统（import / 包 / extern）</b> ✓ 已完成</li>
+          <li class="done"><b>标准库（math / time / system / file / string）</b> ✓ 已完成</li>
+          <li class="done"><b>命名空间与导入别名（import "x" as y）</b> ✓ 已完成</li>
+          <li class="done"><b>常量表达式求值（编译期折叠）</b> ✓ 已完成</li>
+          <li class="done"><b>错误恢复与错误码诊断</b> ✓ 已完成</li>
+          <li class="done"><b>交互式 REPL（行编辑 / 历史 / TAB 补全）</b> ✓ 已完成</li>
+          <li class="done"><b>数组：字面量 / 下标读写 / push 等方法 / 嵌套 / 引用语义</b> ✓ 0.5 已完成</li>
+          <li class="done"><b>for-in 迭代数组与字符串 + split / chars / join</b> ✓ 0.5 已完成</li>
+          <li class="done"><b>完整的返回路径分析 + 最短往返浮点打印</b> ✓ 0.5 已完成</li>
+          <li class="done"><b>原生后端（x86-64 / aarch64 直出 ELF，运行时由 Lux 实现）</b> ✓ 0.6 已完成</li>
+          <li class="done"><b>数组切片 <code>a[lo..hi]</code> / <code>a[lo..=hi]</code>（复制语义）</b> ✓ 0.6 已完成</li>
+          <li class="done"><b><code>struct</code> 结构体：声明 / 构造 / 成员读写 / 嵌套 / struct 数组</b> ✓ 0.7 已完成</li>
+          <li class="done"><b>if 表达式、原始字符串、<code>nan</code> / <code>inf</code>、<code>main(argv)</code></b> ✓ 0.7 已完成</li>
+          <li class="done"><b>通用左值复合赋值（<code>a[i] += v</code> / <code>p.x += v</code>）</b> ✓ 0.7 已完成</li>
+          <li>自动内存管理（ARC / 引用计数）— 0.7.x / 0.8</li>
+          <li>错误通道 <code>T?</code> / <code>?</code> / <code>or</code> — 0.8</li>
+          <li>高阶函数与 <code>fn</code> 类型（sort / map / filter）— 0.8</li>
+          <li>枚举与模式匹配、泛型 — 1.x</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p><span class="lx">Lux</span> v0.7.0 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
+    <p style="margin-top:8px">
+      完整文档见 <a href="README.md">README.md</a> ·
+      <a href="docs/grammar.md">文法定义</a> ·
+      <a href="docs/design.md">架构与扩展指南</a> ·
+      <a href="docs/stability.md">稳定性说明</a> ·
+      <a href="docs/arc.md">ARC 草案</a>
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>

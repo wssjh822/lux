@@ -1,0 +1,5 @@
+// 切片下界大于上界：lo > hi 必须 panic
+fn main() {
+    let a = [1, 2, 3];
+    println(a[2..1]);
+}

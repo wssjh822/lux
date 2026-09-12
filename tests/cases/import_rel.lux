@@ -1,0 +1,7 @@
+// import 相对路径的 .lux 文件
+import "mod/helper.lux";
+
+fn main() {
+    println(MOD_TAG);
+    println(triple(5));
+}

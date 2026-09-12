@@ -1,0 +1,35 @@
+// 语法糖：复合赋值 / 自增自减 / repeat / elif
+fn grade(n: int) -> string {
+    if n >= 90 {
+        return "A";
+    } elif n >= 60 {
+        return "B";
+    } else {
+        return "C";
+    }
+}
+fn main() {
+    let x = 10;
+    x += 5;
+    println(x);
+    x *= 2;
+    println(x);
+    x -= 4;
+    println(x);
+    x++;
+    println(x);
+    x--;
+    x--;
+    println(x);
+    let n = 0;
+    repeat 3 {
+        n += 1;
+    }
+    println(n);
+    println(grade(95));
+    println(grade(70));
+    println(grade(10));
+    let s = "a";
+    s += "b";
+    println(s);
+}

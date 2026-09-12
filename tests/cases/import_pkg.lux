@@ -1,0 +1,9 @@
+// import 一个包目录（含 lux.json），传递依赖与重复 import 去重
+import "pkg";
+import "pkg/util.lux";   // 包内已加载过，这里应被去重
+
+fn main() {
+    println(VERSION);
+    println(greeting("lux"));
+    println(double(21));
+}

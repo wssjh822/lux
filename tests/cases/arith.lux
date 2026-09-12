@@ -1,0 +1,24 @@
+// 算术、位运算、比较运算
+fn main() {
+    println(1 + 2);
+    println(10 - 3);
+    println(6 * 7);
+    println(20 / 3);
+    println(20 % 3);
+    println(-5);
+    println(2 * 3 + 4);
+    println(2 + 3 * 4);
+    println((2 + 3) * 4);
+    println(7 / 2.0);
+    println(1 << 4);
+    println(255 >> 4);
+    println(0b1100 & 0b1010);
+    println(0b1100 | 0b0011);
+    println(0b1100 ^ 0b0101);
+    println(true && false);
+    println(true || false);
+    println(!true);
+    println(2 > 1);
+    println(2 == 2);
+    println("a" < "b");
+}

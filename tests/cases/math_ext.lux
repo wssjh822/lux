@@ -1,0 +1,16 @@
+import "math";
+
+fn main() {
+    println(atan2(0.0, 1.0) == 0.0);
+    println(fmod(7.0, 2.5));
+    println(hypot(3.0, 4.0));
+    println(trunc(3.7));
+    println(trunc(-3.7));
+    println(isnan(0.0 / 0.0));
+    println(isnan(1.0));
+    println(isinf(1.0 / 0.0));
+    println(isinf(1.0));
+    println(random() >= 0.0 && random() < 1.0);
+    seed(12345);
+    println(random() >= 0.0 && random() < 1.0);
+}
