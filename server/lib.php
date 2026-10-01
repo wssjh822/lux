@@ -17,7 +17,7 @@
 declare(strict_types=1);
 
 const LUX_SCHEMA  = 1;
-const LUX_VERSION = '0.9.2';
+const LUX_VERSION = '1.0.0';
 
 function lux_pkg_dir(): string    { return __DIR__ . '/packages'; }
 function lux_data_dir(): string   { return __DIR__ . '/data'; }

@@ -168,7 +168,7 @@
     </p>
     <div class="cmd"><span>$ </span>luxc hello.lux --run</div>
     <div class="badges">
-      <span class="badge">v0.9.4</span>
+      <span class="badge">v1.0.0 正式版</span>
       <span class="badge">静态类型</span>
       <span class="badge">错误通道 T? / ? / or / !</span>
       <span class="badge">ARC 引用计数（默认开启）</span>
@@ -399,12 +399,12 @@ $ luxc hello.lux --emit-c
       </div>
       <div class="card">
         <span class="ic">♻</span>
-        <h3>ARC 收官 <span style="color:var(--gold2)">0.9.4 新增</span></h3>
+        <h3>ARC 内存管理 <span style="color:var(--gold2)">0.9.4 新增 · 1.0 冻结</span></h3>
         <p><b>引用计数默认开启，两个后端都支持</b>。原生后端按 <code>docs/arc.md</code> §2.3 落地<b>尺寸分级 free list</b>（2 的幂分级 + bss 桶 + 无锁）与延迟释放模型，<code>--arc --native</code> 解禁；<code>T?</code> 装箱槽参与回收、不再只增不减。需要退回旧行为时用 <code>--no-arc</code>。</p>
       </div>
       <div class="card">
         <span class="ic">⚠</span>
-        <h3>错误消息携带 <span style="color:var(--gold2)">0.9.4 新增</span></h3>
+        <h3>错误消息携带 <span style="color:var(--gold2)">0.9.4 新增 · 1.0 冻结</span></h3>
         <p><code>T?</code> 只回答「成没成」，新的全局 <code>last_error(): string</code> 补上「为什么」—— <code>read()</code> 失败能区分<b>不存在</b>与<b>没权限</b>，<code>int()</code> / <code>float()</code> / <code>find_opt()</code> 也填充。外加 <code>find_opt(s, sub): int?</code> 可选变体，扫掉 A3 尾巴。</p>
       </div>
     </div>
@@ -567,7 +567,7 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
     <p class="sub">以下取舍是刻意为之 —— 把不确定的东西留在后面，先把确定的部分做对。</p>
     <div class="road">
       <div>
-        <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">当前限制（0.9）</h3>
+        <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">当前限制（1.0）</h3>
         <ul class="li">
           <li class="done"><b>内存由 ARC 自动回收，0.9.4 起两个后端都默认开启</b> —— 临时对象在<b>每条语句结束时</b>归还，局部变量在作用域出口回收。C 后端 1e6 次拼接峰值 117MB→11MB；原生后端 20 万次 × 3 串 churn 峰值 RSS &lt; 32MB。需要旧行为时用 <code>--no-arc</code>。
             仍存的最小缺口（<b>只泄漏、不误释放</b>）：<code>main(argv)</code> 的 argv 数组是一次性泄漏；原生后端 <code>break</code> / <code>continue</code> / <code>return</code> 提前离开块时不释放该块已声明的引用型局部（见 <code>docs/arc.md</code> §2.4）</li>
@@ -610,7 +610,8 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
           <li class="done"><b>原生后端尺寸分级 free list（2 的幂分级 + bss 桶 + 无锁）+ 引用计数；<code>--arc --native</code> 解禁</b> ✓ 0.9.4 已完成</li>
           <li class="done"><b>ARC 默认开启（两个后端）+ <code>T?</code> 装箱回收 + <code>--no-arc</code> 逃生阀</b> ✓ 0.9.4 已完成</li>
           <li class="done"><b>错误消息携带 <code>last_error()</code> + <code>find_opt()</code> 可选变体</b> ✓ 0.9.4 已完成</li>
-          <li class="done"><b>回归全绿 222/222（含双后端逐字节差分 + churn 内存回归）</b> ✓ 0.9.4 已完成</li>
+          <li class="done"><b>回归全绿 227/227（含双后端逐字节差分 + churn 内存回归）</b> ✓ 0.9.4 已完成</li>
+          <li class="done"><b>Lux 1.0.0 正式版：语言 / 标准库 / 错误通道 / 构建 / 包管理 / ARC 全部冻结</b> ✓ 1.0 已完成</li>
           <li>高阶函数与 <code>fn</code> 类型（sort / map / filter）— 不进 1.0，留 1.x</li>
           <li>aarch64 原生数学末位对齐 — 待有 aarch64 机器的版本校准</li>
           <li>枚举与模式匹配、泛型 — 1.x</li>
@@ -620,7 +621,7 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
   </section>
 
   <footer>
-    <p><span class="lx">Lux</span> v0.9.4 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
+    <p><span class="lx">Lux</span> v1.0.0 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
     <p style="margin-top:8px">
       完整文档见 <a href="README.md">README.md</a> ·
       <a href="docs/language.md">语言教程</a> ·
