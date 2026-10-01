@@ -1,0 +1,31 @@
+// ARC 边界：env 返回的原始 C 串在存储时必须先拷成 Lux 字符串；
+// 可选装箱内层是 string 时必须 retain，避免源变量释放后悬空。
+import "system";
+
+fn geto(k: int) -> string? {
+    if k == 0 { return "v" + string(k); }
+    return none;
+}
+
+fn main() {
+    setenv("LUX_ARC_TEST", "abc");
+    let a = env("LUX_ARC_TEST");
+    let b = a + "/x";
+    println(b);
+
+    // 同一个可选值被两处 or 复用：不能双重释放
+    let o = geto(0);
+    let p = o or "x";
+    let q = o or "y";
+    println(p + q);
+
+    // 原始 C 串进入数组
+    let arr: string[] = [];
+    arr.push(env("LUX_ARC_TEST"));
+    arr.push(env("LUX_ARC_TEST"));
+    println(arr);
+
+    // 装箱后 base 变量离开作用域，箱内仍可用
+    let boxed: string? = a;
+    println(boxed or "none");
+}

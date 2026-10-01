@@ -1,0 +1,29 @@
+// 0.8（C1）：复合赋值 /= %= 走带零检查的运行时；>> 统一为算术右移
+struct Box { let v: int; }
+fn main() {
+    let a = 17;
+    a /= 5;
+    println(a);
+    let b = 17;
+    b %= 5;
+    println(b);
+    let c = -8;
+    println(c >> 1);
+    let d = -8;
+    d >>= 1;
+    println(d);
+    let e = 1 << 62;
+    println(e >> 3);
+    let xs = [100, 200, 300];
+    xs[0] /= 7;
+    xs[1] %= 7;
+    xs[2] /= 3;
+    println(xs);
+    let p = Box { v: 99 };
+    p.v /= 10;
+    p.v %= 4;
+    println(p);
+    let f = 1.0;
+    f /= 4.0;
+    println(f);
+}

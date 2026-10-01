@@ -1,0 +1,27 @@
+// jsonx 包回归：解析 / 取值 / 路径 / 生成 / 错误定位
+import "jsonx";
+
+fn main() {
+    let r = parse("{\"a\":1,\"b\":[true,null,\"x\u4e2d\"],\"c\":1.5}");
+    if !r.ok {
+        println("解析失败: " + r.error);
+    } else {
+        println(kindName(r.value));
+        println(getInt(r.value, "a"));
+        println(asString(getPath(r.value, "b[2]")));
+        println(asString(getPath(r.value, "b[0]")));
+        println(getFloat(r.value, "c"));
+        println(stringify(r.value));
+        println(pretty(r.value));
+    }
+
+    // 代理对解码
+    let emoji = parse("\"\\uD83D\\uDE00\"");
+    println(emoji.ok);
+    println(len(emoji.value.s));
+
+    // 错误定位
+    let e = parse("{\n  \"x\": tru\n}");
+    println(e.ok);
+    println(e.error + " @" + string(e.line) + ":" + string(e.col));
+}

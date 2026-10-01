@@ -4,6 +4,7 @@
 #include "lux.hpp"
 
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -118,6 +119,8 @@ const char* tokName(Tok t) {
             return "not";
         case Tok::KwImport:
             return "import";
+        case Tok::KwFrom:
+            return "from";
         case Tok::KwExtern:
             return "extern";
         case Tok::KwAs:
@@ -132,6 +135,8 @@ const char* tokName(Tok t) {
             return "nan";
         case Tok::KwInf:
             return "inf";
+        case Tok::KwNone:
+            return "none";
         case Tok::KwInt:
             return "int";
         case Tok::KwFloat:
@@ -234,6 +239,8 @@ const char* tokName(Tok t) {
             return "<<=";
         case Tok::ShrEq:
             return ">>=";
+        case Tok::Question:
+            return "?";
         default:
             return "?";
     }
@@ -280,6 +287,7 @@ const std::unordered_map<std::string, Tok>& keywordTable() {
         {"as", Tok::KwAs},
         {"struct", Tok::KwStruct},
         {"nan", Tok::KwNan},       {"inf", Tok::KwInf},
+        {"none", Tok::KwNone},
     };
     return table;
 }
@@ -590,7 +598,15 @@ struct Lexer {
     std::vector<Token> run() {
         std::vector<Token> toks;
         for (;;) {
-            skipWhitespaceAndComments();
+            // 0.9.3：skipWhitespaceAndComments 也会对未闭合块注释抛 LexBail，
+            // 必须包在恢复逻辑里，否则异常会逃出 run() 导致 terminate/abort。
+            try {
+                skipWhitespaceAndComments();
+            } catch (const LexBail&) {
+                if (diags.errors > 100) break;
+                if (!eof()) bump();
+                continue;
+            }
             if (eof()) break;
             SourceLoc start = loc();
             Token tk;
@@ -779,6 +795,7 @@ struct Lexer {
                         case '|': tk.kind = Tok::Pipe; break;
                         case '^': tk.kind = Tok::Caret; break;
                         case '~': tk.kind = Tok::Tilde; break;
+                        case '?': tk.kind = Tok::Question; break;
                         default:
                             error(start,
                                   std::string("无法识别的字符 '") + c +
@@ -805,9 +822,390 @@ struct Lexer {
 
 }  // namespace
 
+// -----------------------------------------------------------------------------
+//  极简预处理（0.9.3）
+//
+//  在词法分析前逐行处理以 '#' 开头的指令，行数严格保持不变（诊断定位不漂）：
+//    #import "mod";        等价于 import "mod";（#include 同义）
+//    #define NAME [值]      对象式宏（不做函数式宏）
+//    #undef NAME
+//    #ifdef / #ifndef / #if / #elif / #else / #endif
+//    #error 消息
+//  宏在普通代码行中做整词展开，展开时跳过字符串字面量与 // 行注释；
+//  块注释内的行不做指令解析与展开。
+// -----------------------------------------------------------------------------
+namespace {
+
+bool ppIsIdentStart(char c) {
+    return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
+}
+bool ppIsIdentChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+std::string ppTrim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r");
+    return s.substr(a, b - a + 1);
+}
+
+// #if 表达式求值：支持整数、defined(NAME)/defined NAME、! && || 与括号。
+// 未定义的标识符按 0 处理（C 预处理器的常规行为）。
+struct PpIfEval {
+    const std::string& s;
+    size_t i = 0;
+    explicit PpIfEval(const std::string& str) : s(str) {}
+    void ws() {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+    }
+    bool eat(const char* op) {
+        ws();
+        size_t n = std::strlen(op);
+        if (s.compare(i, n, op) == 0) {
+            i += n;
+            return true;
+        }
+        return false;
+    }
+    long long parseOr() {
+        long long v = parseAnd();
+        while (eat("||")) {
+            long long r = parseAnd();
+            v = (v || r) ? 1 : 0;
+        }
+        return v;
+    }
+    long long parseAnd() {
+        long long v = parseUnary();
+        while (eat("&&")) {
+            long long r = parseUnary();
+            v = (v && r) ? 1 : 0;
+        }
+        return v;
+    }
+    long long parseUnary() {
+        if (eat("!")) return parseUnary() ? 0 : 1;
+        return parsePrimary();
+    }
+    long long parsePrimary() {
+        ws();
+        if (eat("(")) {
+            long long v = parseOr();
+            eat(")");
+            return v;
+        }
+        if (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+            long long v = 0;
+            while (i < s.size() &&
+                   std::isdigit(static_cast<unsigned char>(s[i])))
+                v = v * 10 + (s[i++] - '0');
+            return v;
+        }
+        if (i < s.size() && ppIsIdentStart(s[i])) {
+            while (i < s.size() && ppIsIdentChar(s[i])) i++;
+            return 0;
+        }
+        if (i < s.size()) i++;  // 未知字符：跳过
+        return 0;
+    }
+};
+
+struct Preproc {
+    const std::string& src;
+    const std::string& filename;
+    Diags& diags;
+    std::unordered_map<std::string, std::string> macros;
+    struct Cond {
+        bool parent = true;
+        bool active = true;
+        bool taken = false;
+        bool seenElse = false;
+    };
+    std::vector<Cond> conds;
+    std::string out;
+
+    Preproc(const std::string& s, const std::string& f, Diags& d)
+        : src(s), filename(f), diags(d) {}
+
+    bool active() const { return conds.empty() || conds.back().active; }
+
+    void err(int line, const std::string& msg) {
+        diags.error(DiagCode::kLex, filename, SourceLoc{line, 1}, msg);
+    }
+
+    // 整词展开宏（跳过字符串字面量与 // 注释）
+    std::string expand(const std::string& line, int depth) {
+        if (macros.empty() || depth > 16) return line;
+        std::string res;
+        size_t i = 0, n = line.size();
+        while (i < n) {
+            char c = line[i];
+            if (c == '"') {
+                res += c;
+                i++;
+                while (i < n) {
+                    res += line[i];
+                    if (line[i] == '\\' && i + 1 < n) {
+                        res += line[i + 1];
+                        i += 2;
+                        continue;
+                    }
+                    if (line[i] == '"') {
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+                continue;
+            }
+            if (c == '/' && i + 1 < n && line[i + 1] == '/') {
+                res += line.substr(i);
+                break;
+            }
+            if (ppIsIdentStart(c)) {
+                size_t j = i + 1;
+                while (j < n && ppIsIdentChar(line[j])) j++;
+                std::string word = line.substr(i, j - i);
+                auto it = macros.find(word);
+                if (it != macros.end())
+                    res += expand(it->second, depth + 1);
+                else
+                    res += word;
+                i = j;
+                continue;
+            }
+            res += c;
+            i++;
+        }
+        return res;
+    }
+
+    // 把 defined(NAME) / defined NAME 替换成 0/1，再交给 PpIfEval
+    long long evalIf(const std::string& raw) {
+        std::string e = expand(raw, 0);
+        std::string r;
+        size_t i = 0, n = e.size();
+        while (i < n) {
+            if (e.compare(i, 7, "defined") == 0 &&
+                (i == 0 || !ppIsIdentChar(e[i - 1])) &&
+                (i + 7 >= n || !ppIsIdentChar(e[i + 7]))) {
+                size_t j = i + 7;
+                while (j < n && (e[j] == ' ' || e[j] == '\t')) j++;
+                std::string name;
+                if (j < n && e[j] == '(') {
+                    j++;
+                    while (j < n && (e[j] == ' ' || e[j] == '\t')) j++;
+                    while (j < n && ppIsIdentChar(e[j])) name += e[j++];
+                    while (j < n && (e[j] == ' ' || e[j] == '\t')) j++;
+                    if (j < n && e[j] == ')') j++;
+                } else {
+                    while (j < n && ppIsIdentChar(e[j])) name += e[j++];
+                }
+                r += macros.count(name) ? "1" : "0";
+                i = j;
+                continue;
+            }
+            r += e[i++];
+        }
+        PpIfEval ev(r);
+        return ev.parseOr();
+    }
+
+    void pushCond(bool val, int line) {
+        bool parent = active();
+        Cond c;
+        c.parent = parent;
+        c.active = parent && val;
+        c.taken = c.active;
+        conds.push_back(c);
+        (void)line;
+    }
+
+    void handleDirective(const std::string& t, int line, std::string& emit) {
+        size_t i = 1;
+        while (i < t.size() && (t[i] == ' ' || t[i] == '\t')) i++;
+        std::string name;
+        while (i < t.size() && ppIsIdentChar(t[i])) name += t[i++];
+        std::string rest = ppTrim(t.substr(i));
+        if (name.empty()) {
+            if (active()) err(line, "无法识别的预处理指令（'#' 后需要指令名）");
+            return;
+        }
+        if (name == "ifdef" || name == "ifndef") {
+            bool v = macros.count(rest) > 0;
+            if (name == "ifndef") v = !v;
+            pushCond(v, line);
+            return;
+        }
+        if (name == "if") {
+            pushCond(evalIf(rest) != 0, line);
+            return;
+        }
+        if (name == "elif") {
+            if (conds.empty()) {
+                err(line, "#elif 没有对应的 #if / #ifdef");
+                return;
+            }
+            Cond& c = conds.back();
+            if (c.seenElse) {
+                err(line, "#elif 不能出现在 #else 之后");
+                return;
+            }
+            if (!c.parent || c.taken) {
+                c.active = false;
+            } else {
+                bool v = evalIf(rest) != 0;
+                c.active = v;
+                c.taken = v;
+            }
+            return;
+        }
+        if (name == "else") {
+            if (conds.empty()) {
+                err(line, "#else 没有对应的 #if / #ifdef");
+                return;
+            }
+            Cond& c = conds.back();
+            if (c.seenElse) {
+                err(line, "#else 重复出现");
+                return;
+            }
+            c.seenElse = true;
+            c.active = c.parent && !c.taken;
+            c.taken = true;
+            return;
+        }
+        if (name == "endif") {
+            if (conds.empty()) {
+                err(line, "#endif 没有对应的 #if / #ifdef");
+                return;
+            }
+            conds.pop_back();
+            return;
+        }
+        if (!active()) return;  // 非活动分支：忽略其余指令
+        if (name == "define") {
+            size_t j = 0;
+            while (j < rest.size() && ppIsIdentChar(rest[j])) j++;
+            std::string macro = rest.substr(0, j);
+            if (macro.empty()) {
+                err(line, "#define 缺少宏名");
+                return;
+            }
+            if (j < rest.size() && rest[j] == '(') {
+                diags.warn(DiagCode::kLex, filename, SourceLoc{line, 1},
+                           "暂不支持函数式宏 '#define " + macro +
+                               "(...)'（已忽略）");
+                return;
+            }
+            macros[macro] = ppTrim(rest.substr(j));
+            return;
+        }
+        if (name == "undef") {
+            macros.erase(ppTrim(rest));
+            return;
+        }
+        if (name == "import" || name == "include") {
+            std::string p = ppTrim(rest);
+            size_t cm = p.find("//");
+            if (cm != std::string::npos) p = ppTrim(p.substr(0, cm));
+            if (!p.empty() && p.back() == ';') {
+                p.pop_back();
+                p = ppTrim(p);
+            }
+            if (p.empty() || p[0] != '"') {
+                err(line, "#" + name + " 需要一个字符串路径，例如 #" + name +
+                              " \"math\";");
+                return;
+            }
+            emit = "import " + p + ";";
+            return;
+        }
+        if (name == "error") {
+            err(line, "#error " + rest);
+            return;
+        }
+        if (name == "pragma" || name == "warning" || name == "line")
+            return;  // 已知但忽略
+        diags.warn(DiagCode::kLex, filename, SourceLoc{line, 1},
+                   "未知的预处理指令 '#" + name + "'（已忽略）");
+    }
+
+    std::string run() {
+        size_t pos = 0;
+        int line = 1;
+        int blockDepth = 0;  // 跨行块注释深度：其内不解析指令
+        while (true) {
+            size_t nl = src.find('\n', pos);
+            bool last = (nl == std::string::npos);
+            std::string lineStr =
+                last ? src.substr(pos) : src.substr(pos, nl - pos);
+            std::string t = ppTrim(lineStr);
+            bool inComment = blockDepth > 0;
+            if (!inComment && !t.empty() && t[0] == '#') {
+                std::string emit;
+                handleDirective(t, line, emit);
+                out += emit;
+                out += '\n';
+            } else if (inComment) {
+                out += lineStr;
+                out += '\n';
+            } else if (active()) {
+                out += expand(lineStr, 0);
+                out += '\n';
+            } else {
+                // 非活动分支：整行丢弃（只保留换行以维持行号）
+                out += '\n';
+            }
+            // 更新块注释深度（跳过字符串字面量）
+            for (size_t k = 0; k < lineStr.size();) {
+                char c = lineStr[k];
+                if (c == '"') {
+                    k++;
+                    while (k < lineStr.size()) {
+                        if (lineStr[k] == '\\' && k + 1 < lineStr.size()) {
+                            k += 2;
+                            continue;
+                        }
+                        if (lineStr[k] == '"') {
+                            k++;
+                            break;
+                        }
+                        k++;
+                    }
+                    continue;
+                }
+                if (c == '/' && k + 1 < lineStr.size() &&
+                    lineStr[k + 1] == '*') {
+                    blockDepth++;
+                    k += 2;
+                    continue;
+                }
+                if (c == '*' && k + 1 < lineStr.size() &&
+                    lineStr[k + 1] == '/') {
+                    if (blockDepth > 0) blockDepth--;
+                    k += 2;
+                    continue;
+                }
+                k++;
+            }
+            line++;
+            if (last) break;
+            pos = nl + 1;
+        }
+        if (!conds.empty())
+            err(line, "条件编译 #if / #ifdef 缺少 #endif");
+        return out;
+    }
+};
+
+}  // namespace
+
 std::vector<Token> tokenize(const std::string& src, const std::string& filename,
                             Diags& diags) {
-    Lexer lex(src, filename, diags);
+    std::string pre = Preproc(src, filename, diags).run();
+    Lexer lex(pre, filename, diags);
     return lex.run();
 }
 

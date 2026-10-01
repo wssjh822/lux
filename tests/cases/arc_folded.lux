@@ -1,0 +1,24 @@
+// 0.9.3（A1）回归：折叠字符串常量在 ARC 下必须是有头对象。
+// 覆盖：局部折叠拼接、全局折叠常量、无初始化 string、循环体内拼接。
+const F = "x" + "y";
+
+fn make() -> string {
+    let s = "a" + "b";
+    return s;
+}
+
+fn main() {
+    let s = "a" + "b";
+    println(s);
+    let t = F;
+    println(t);
+    let u: string;
+    println(u);
+    let i = 0;
+    while i < 3 {
+        let c = "n" + string(i);
+        println(c);
+        i += 1;
+    }
+    println(make());
+}

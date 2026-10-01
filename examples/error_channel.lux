@@ -1,0 +1,37 @@
+// error_channel.lux —— 0.8 的错误通道
+// 编译运行： luxc examples/error_channel.lux --run
+// 原生后端： luxc --native examples/error_channel.lux --run
+
+import "file";
+import "string";
+
+// 返回 int?：读取或解析失败都返回 none
+fn load_port(path: string) -> int? {
+    let text = read(path)?;      // ? 传播：失败直接向上返回 none
+    return int(text)?;           // 解析失败也传播
+}
+
+fn describe(v: int?) -> string {
+    // or 兜底：左边是 T?，取不到就用右侧
+    return "port = " + string(v or 0);
+}
+
+fn main() {
+    // 写一个配置文件再读回来
+    write("__lux_port.txt", "8080");
+
+    println(load_port("__lux_port.txt"));   // some(8080)
+    println(load_port("__lux_nope.txt"));   // none
+    println(describe(load_port("__lux_port.txt")));
+    println(describe(load_port("__lux_nope.txt")));
+
+    // ! panic 变体：确定不会失败时更简洁
+    println(int!("42") + 1);
+    println(float!("2.5") * 2.0);
+
+    // 非可选的类型转换保持原样
+    println(int(3.99));
+    println(float(3) / 2.0);
+
+    remove("__lux_port.txt");
+}

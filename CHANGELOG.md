@@ -3,6 +3,340 @@
 本文件记录各版本的改动。0.1 → 0.2 → 0.3 的内容从 git 历史整理而来，
 0.4 起每个版本都会在这里登记。
 
+## 0.9.3
+
+**转正版：修 ARC 正确性 + 项目构建 + 导入系统 + 预处理**。0.9.3 按
+`建议.txt` 的 A 块把 ARC 的正确性裂缝焊死，并按用户需求新增 `luxc build`、
+`from … import …`、`#import` 与条件编译。ARC 的默认开启、原生后端 free list
+与 `T?` 装箱回收仍挂账（见文末「已知缺口」）。
+
+### A. ARC 正确性（A 块）
+
+- **A1 折叠串 bug（最致命）**：`expr(Binary)` 的 `foldedIsStr` 分支在 ARC 下
+  以前发裸 C 字面量，导致 `let s = "a" + "b";`、`const F = "x" + "y";`
+  得到的指针没有 16 字节头，retain/release 读到非法头而崩溃。现在 ARC 下统一
+  走 `internLit`（`refs = -1` 的静态不可变对象）。新增回归用例
+  `tests/cases/arc_folded.lux`（局部折叠 / 全局常量 / 未初始化 string /
+  循环内拼接），并在 `--arc` 维度下与 C / 原生后端差分。
+- **A2-8 打印临时串回收**：`println(int/float/数组/struct/可选值)` 经 `toStrOf`
+  产生的堆串在打印后 `lx_gc_release`；`bool`（返回静态字面量）与 `string`
+  借用不释放，避免误 free .rodata。
+- **A2 其余不变量核销**：return 走 `coerceStore`、赋值先存新值再释旧值、
+  cleanup 仅挂 `arcMode && isRefTy`、`for c in s` 循环变量每轮释放、
+  struct `cn_on_zero` 逐个发射、字面量包装区先于全局常量区。
+- **原生后端未初始化 string**：`let s: string;` 以前压入 NULL，`println` /
+  `len` 会段错误；现在指向合法的空串对象（`pushStrRef("")`）。
+- 删除死代码 `lx_arr_print`。
+- **未闭合块注释导致编译器 abort**：`skipWhitespaceAndComments` 对未闭合
+  `/*` 抛出的 `LexBail` 以前在 `try` 之外，异常逃出 `run()` 触发
+  `terminate`（fuzzing 命中）。现在也包进恢复逻辑，报错后继续。
+
+### B. 项目构建：`luxc build`
+
+- `luxc build [路径] [build|run|test|clean|rebuild]`：在路径下查找
+  `LuxBuildFile`（兼容 `LuxBuildFile.lux` / `LuxBulidFile` / `lux.build` /
+  `LuxBuild`），按配置构建 / 运行 / 测试 / 清理，面向更大项目。
+- `LuxBuildFile` 为行式 `键 = 值` 配置：`name` / `main`(=`src`/`source`) /
+  `out` / `outdir` / `backend`(c|native) / `arc` / `opt` / `cc` / `cflags` /
+  `run_args` / `testdir` / `test` / `clean`，`#` 起注释，值可用引号。
+- `build test` 会逐个编译测试文件、运行并与同名 `.expected` 比对，
+  支持 `.args` 传参；`clean` 删除输出目录与额外清理项。
+- 编译流水线从 `main()` 抽出为 `compilePipeline()`，供主命令与构建共用。
+
+### C. 导入系统与预处理
+
+- **`from "mod" import a, b;`（0.9.3）**：选择性导入，只把列出的成员注入
+  当前命名空间；`from "mod" import *;` 等价默认导入。`from` 是**上下文
+  关键字**（只在顶层 `from "路径" import` 生效），仍可作普通标识符。
+- **`#import "mod";` / `#include "mod";`**：预处理写法，等价于 `import`。
+- **预处理指令**：`#define NAME [值]`（对象式宏，整词展开、跳过字符串与
+  行注释）、`#undef`、`#ifdef` / `#ifndef` / `#if` / `#elif` / `#else` /
+  `#endif`（`#if` 支持整数、`defined(NAME)`、`!` / `&&` / `||` 与括号）、
+  `#error`。预处理逐行进行，**行号严格保持不变**，诊断定位不漂。
+  这套指令即「增 / 删 / 改语言结构」的入口：`#define` 增、`#undef` 删、
+  `#if*` 条件改。
+
+### D. 自带库
+
+- `packages/mathx` 增补 `sign` / `is_even` / `is_odd` / `ipow` /
+  `digit_sum`；`packages/strx` 增补 `is_empty` / `index_of` / `trim_left` /
+  `trim_right` / `replace_all`；新增官方包 `packages/arrx`（数组小工具：
+  `reverse` / `sum` / `min` / `max` / `contains` / `index_of`，含 int /
+  float / string 重载）。
+
+### E. 文档
+
+- `docs/grammar.md`：`importDecl` 增补 `from … import …` 与 `#import`，
+  新增预处理指令说明；`docs/language.md` §10 增补选择性导入、预处理与
+  `luxc build`；`docs/stability.md` §1/§4/§5 同步 0.9.3；`docs/arc.md`
+  增补 0.9.3 状态与已知缺口（同时删掉顶部重复 H1）。
+
+### F. 包注册表服务端（0.9.3）
+
+- **上传方式**：网页与 API 都支持「直接上传 `.tar.gz`」或「上传具体文件，服务端
+  打包」；散装文件会保留相对路径、自动补全 / 合并归档内 `lux.json`，整目录上传
+  会自动去掉公共顶层目录。
+- **更新包**：`publish` 支持 `base_version`，只需提供改动 / 新增的文件，服务端在
+  基础版本归档上叠加（同名覆盖、新文件追加）后生成完整归档；压缩包与逐文件两种
+  方式都可用。tar.gz 读写为纯 PHP 实现（ustar + GNU 长名 + pax），不依赖 Phar
+  扩展或 `tar` 命令。
+- **意见反馈**：新增网页 `?p=feedback` 与 API `?action=feedback`（免登录、按 IP
+  限流），存储于 `data/feedback.json`；登录用户可见自己的反馈，管理员可查看全部
+  并标记已处理 / 重新打开 / 删除。
+- **网页界面**：上传页重做（发布类型 / 提供方式分段选择、拖拽与整目录上传、
+  文件清单与总大小、基础版本自动加载）；导航新增「反馈」；下载页支持
+  `kind=update` 的更新包条目；包详情页对拥有者提供「发布更新包」入口；
+  表单超过 `post_max_size` 时给出可读提示。
+- **数据文件加固**：`users` / `tokens` / `feedback` 与限流文件改用 `.php` 后缀并以
+  `<?php exit; ?>` 开头，旧 `.json` 在首次请求时自动迁移后删除；即使站点未配置
+  拒绝访问 `data/`，直接请求也只会得到空响应。
+- 服务端版本号 `LUX_VERSION` 同步到 0.9.3。
+
+### 已知缺口（1.0 前）
+
+- ARC 仍非默认（需 `--arc`）；原生后端仍是 bump 分配器（`--arc --native`
+  明确报错）；`T?` 装箱仍只增不减；`main(argv)` 的 argv 数组是一次性泄漏。
+
+## 0.9.2
+
+**只修不扩 + ARC 落地 + 注册表加固 + 语法手册**。0.9.2 把 `建议.txt`
+（A/B/C/D 四块）清干净，并按拍板结果把 **ARC（引用计数）** 的表示层与
+C 后端实现落地（实验性 `--arc`，0.9.3 转正）；同时新增面向人与 AI 的
+`docs/language.md` 语言教程。
+
+### ARC（0.9.2 的重头戏，拍板：进 1.0）
+
+- **表示层**：每个堆对象（string / 数组 / struct）前面加 16 字节头
+  `{ refs, on_zero }`；字符串字面量是 `refs = -1` 的静态不可变对象，
+  `retain` / `release` 对其跳过。数组头新增元素释放器 `relem`。
+- **C 后端引用计数**（`--arc`，默认关闭）：在 `let` / 赋值（含 `x = x + …`、
+  `x += …`）/ `return` / 数组 `push·pop·insert·remove·set·clear·slice` /
+  struct 字段与嵌套 / **嵌套字符串拼接** 处插入 retain / release；
+  局部变量用 `__attribute__((cleanup))` 在作用域出口释放。
+- **extern 借用视图**：extern fn 的 string 参数与返回值仍是 `const char*`，
+  不参与回收（遵守 0.9.2 拍板）。
+- **实测**：1e6 次字符串构造的峰值 RSS 从 ~117 MiB 降到 ~11 MiB；
+  全部行为用例在 `--arc` 下输出与非 ARC 逐字节一致（含 MALLOC_CHECK_ 抽查）。
+- **已知缺口（0.9.3 补）**：`T?` 装箱不回收；控制流条件里的临时串会漏；
+  原生后端仍是 bump 分配器（`--arc --native` 明确报错）。
+
+### 建议.txt 审阅修复（A 块）
+
+- `docs/stability.md` 开头改为“0.9.2 是最后一个破坏窗口”，与 §5 一致。
+- `docs/grammar.md` 头部版本 0.8 → 0.9；`docs/design.md` §7 补登 `E0005`。
+- struct 返回落穿（`E0005`）的 `stmtAlwaysReturns` 假阳性审计；新增
+  `return_paths_deep` / `struct_fallthrough_break` 防御用例。
+- `strx` 的 `pad_left` / `pad_right` 在 `fill == ""` 时直接返回，不再死循环。
+- `jsonx` 支持 `INT64_MIN`（`-9223372036854775808` 不再退化成 float）。
+- `src/json.cpp`：孤立代理→U+FFFD（不再产非法 UTF-8）；`dumpTo` 对
+  ≥2^63 的 double 先做范围检查再转整数（修 UB）；注释写明前导 `+` 的宽松处理。
+- 删除孤儿文件 `tests/cases/qualified_stdlib.expected`；双架构注释对齐
+  （本机架构：x86-64 / aarch64）。
+- 原生后端 `luxrt_math_pow2i` 修次正规 / 上下溢（`exp(-745)` 不再输出垃圾）。
+
+### 测试缺口（B 块）
+
+- `main_argv`：argv[0] 为程序名 + 参数逐个（支持 `tests/cases/*.args`）；
+  测试脚本两后端各跑一遍。
+- `math_edges`：`asin(±0.99999)` / `log(1e±300)` / `pow(1e300,2)` /
+  `exp(±745/710)`，双后端差分（收敛到 6 位小数以屏蔽自研级数与 libm 的差异）。
+- `optional_double_box`：`int??` 被 Sema 拒绝（`.err` 锁定）。
+- `optional_eq`：`int("1") == int("2")` 被 Sema 拒绝（`.err` 锁定）。
+- panic 文案（`assert_fail` / `read_fail` / `slices_oob_*`）继续由
+  原生后端差分矩阵逐字校验。
+
+### 拍板（C 块，详见 `docs/stability.md` §6）
+
+- **ARC 进 1.0**：0.9.2 落地表示层 + C 后端，0.9.3 默认开启并补原生后端。
+- **`fn` 类型不进 1.0**：`sort` / `map` / `filter` 留到 1.x。
+- **deps 语义**：`install` / `upgrade` 确实递归安装 `deps`，仅做
+  `^ ~ >= <= =` 的简单匹配，不做 semver 求解（与 pkgs.cpp 一致）。
+
+### 注册表加固（D 块）
+
+- `data/tokens.json` 只存令牌的 **SHA-256**，不再存明文。
+- 注册（10 次/小时/IP）与上传（60 次/小时/IP）加速率限制
+  （`data/ratelimit/`）。
+- `server/README.md` 写明部署顺序：**先自己注册管理员账号，再开放公网**。
+- 移除 `src/pkgs.cpp` 里内置的 FTP 账号密码：FTP 发布现在必须显式设置
+  `LUX_FTP_USER` / `LUX_FTP_PASS`（或在 `~/.lux/config.json` 配置）；
+  正式发布推荐账号 API（`luxc login` + `luxc publish`）。
+
+### 新增文档
+
+- **`docs/language.md`**：面向人与 AI 的 Lux 语言教程（语法 → 类型 →
+  错误通道 → 标准库 → 惯用法 → 常见错误），配可运行的片段。
+
+## 0.9.1
+
+**注册表账号系统 + 网页界面 + 源码下载**。在 0.9.0 的在线包管理之上，把服务端
+从「静态文件 + FTP」升级为带账号体系的完整注册表：上传 / 修改 / 删除自己发布的
+包都要求登录，网页端提供注册 / 登录 / 浏览 / 搜索 / 上传 / 编辑 / 删除，并提供
+编译器与包管理系统的源码下载。
+
+### 服务端（server/）
+
+- `index.html` 改为 `index.php`：暗色主题的网页界面，支持在线注册 / 登录 /
+  退出、浏览与搜索包、查看包详情与版本、上传新包、编辑元数据、删除自己的包，
+  也能查看与下载别人的包。
+- 新增 `lib.php`：账号（`password_hash`）、API 令牌、包存储与所有权校验，
+  纯文件存储（`data/users.json` / `data/tokens.json`），不依赖数据库扩展。
+- `lux.php` 扩展为完整 API：`register` / `login` / `logout` / `whoami` / `mine` /
+  `publish` / `edit` / `delete`，公开接口 `index` / `search` / `info` /
+  `download` / `health` 保持兼容。
+- 上传 / 修改 / 删除均校验所有权：只能操作自己发布的包（管理员除外），
+  已存在的他人版本禁止覆盖。
+- 新增「源码下载」页与 `downloads/downloads.json` 清单；
+  `server/make_downloads.sh` 一键打包包管理系统源码、当前 Lux 源码，
+  并收集 `/sdcard/code/lux/` 里的历史版本。
+- 官方包新增 **`jsonx` 1.0.0**（专业 JSON 处理：解析 / 生成 / 美化 /
+  文件读写，完整转义与 `\u` 代理对、错误行列、64 位整数溢出退化），
+  已发布到注册表；`packages/jsonx/` 附带源码与 README。
+
+### 命令行（luxc）
+
+- 新增 `luxc login [用户名]`（密码无回显）/ `logout` / `whoami`，令牌存到
+  `~/.lux/config.json`，也可用 `$LUX_TOKEN`。
+- `luxc publish` 默认改走账号 API（HTTP POST + 令牌）；未登录会提示先
+  `luxc login`。`ftp://` 注册表仍回退到 FTP 上传。
+- 新增 `luxc unpublish <包名> [版本]` 删除自己发布的包；发布 / 删除后自动
+  作废本地索引缓存。
+
+### 0.9.0 内容（保留）
+
+**在线包管理 + 建议.txt 审阅修复**。把包管理从「本地 `add`」升级成完整的
+注册表客户端（下载 / 校验 / 依赖 / 版本 / 搜索 / 升级 / 发布），并落地
+`建议.txt` 里一批已确认的 bug 修复。
+
+### 包管理（在线注册表）
+
+- 新增 `luxc install <名字[@版本] | URL | 本地路径>`：从注册表下载安装，
+  自动按 `lux.json` 的 `deps` 递归安装依赖，支持 `^` / `~` / `>=` 等语义化
+  版本约束；下载后校验元数据里的 SHA-256，安装走「临时目录 → 原子 rename」。
+- 新增 `luxc search` / `info` / `update` / `upgrade` / `remove` / `registry`，
+  `list` 显示版本、来源与入口。
+- 新增 `luxc publish <包目录>`：打包 + 算哈希 + 生成元数据，通过 FTP 上传到
+  注册表的 `packages/<名字>/<版本>.{tar.gz,json}`。
+- 注册表默认 `https://lux.xfes.top/lux/lux.php`，可用 `luxc registry` 或
+  `$LUX_REGISTRY` 换成任何返回相同 JSON 结构的外部地址；索引缓存在
+  `$LUX_HOME/cache/index.json`，离线可读。
+- 新增 `server/lux.php`（注册表服务端，动态扫描索引）与示例包
+  `packages/mathx`、`packages/strx`、`packages/numx`（`numx` 演示依赖）。
+- 新增完整 JSON 解析器（`src/json.cpp`）与 SHA-256（`src/sha256.cpp`）。
+
+### 建议.txt 修复（代码级）
+
+- **struct 返回落穿**：返回类型是 struct 的函数存在不经过 `return` 的路径时，
+  从警告升级为硬错误 `E0005`（原来会返回空指针，访问字段直接崩溃）。
+- **`Point[][]` 打印跨后端分歧**：原生后端把 struct 字段裸 qword 当整数打印，
+  现在 `arrayToStrOnStack` 按类型结构递归展开到任意嵌套。
+- **extern fn × Optional**：Sema 拒绝 extern 收发 `T?`（运行时私有指针表示，
+  C 侧没有对应 ABI）。
+- **panic 文案对齐 stability.md §3**：切片越界补上「起点 / 终点 / 长度」数字；
+  `assert` 并进统一的 `lx_panic` 通道；`read!` 失败带上具体路径。
+- **可选类型边界**：`T?` 不能作为数组元素类型（parser 报错）或 struct 字段
+  （Sema 报错），与 grammar §8.1 一致。
+- **`patchArm64SyscallNumbers`**：常量整个缺失时也报内部错误，不再静默用错
+  系统调用号。
+- 防御 `NoneLit` 类型缺失时的 codegen 崩溃；删除死代码 `lx_file_read` /
+  `lx_file_err` / `lx_str_to_i64` / `lx_str_to_f64`。
+
+### 文档 / 卫生
+
+- grammar：修正前后缀类型 EBNF（`'[]'` 不是 token），删掉 "`int?[]` 合法"
+  与 `T?` 不能作数组元素的自相矛盾表述。
+- stability.md：`read!` 文案单列一行。
+- 测试：新增 `struct_nested_arr`、`assert_fail`、`read_fail`、
+  `struct_fallthrough`、`extern_optional`、`optional_arr_elem`、
+  `optional_struct_field`，以及一个 `file://` 本地注册表的在线安装端到端用例。
+- 版本号提升到 0.9.0。
+
+## 0.8.0
+
+**错误通道 + 发布工程版**。实装语言层最后一个破坏性特性：可选类型 `T?`、
+错误传播后缀 `expr?`、兜底表达式 `lhs or rhs`、panic 变体 `name!(...)`，并把
+`int` / `float` / `read` 三个最常失败的标准库函数迁移到错误通道。同时清掉一批
+欠了多个版本的 C 层硬伤（复合 `/=` `%=` 的除零、`>>` 语义分裂、struct 零值、
+`f([])` 空数组实参、C 后端标识符撞名），并发现 / 修复了三个长期潜伏的原生
+后端 bug（aarch64 浮点数组元素读取、文件路径少了 8 字节偏移、大数浮点格式化）。
+
+> **关于 ARC（A1）与 `fn` 类型（B6）**：两者按 `docs/arc.md` 的计划顺延。
+> `建议.txt` 的决策树明确指出**不要把 A1 与 A3 塞进同一个版本**（两者都触碰
+> 所有值传递路径，差分体系无法归因）。本版选择先把错误通道做扎实；ARC 与
+> 高阶函数明确列为 1.0 的“顺延 / 不包含”项（见 `docs/stability.md`）。
+
+### 语言：错误通道（A3）
+
+- 新增可选类型 `T?`（`int?` / `float?` / `string?` / struct? / 数组?，可嵌套
+  `int??`）。表示层统一为**指向堆槽的指针，NULL = none**，两后端都是单个 8 字节槽。
+- 新增 `none` 字面量：类型完全由上下文决定（标注 / 返回类型 / `or` 右侧）；
+  没有可选上下文时报定向错误。
+- 新增传播后缀 `expr?`：`operand` 必须是 `T?`，所在函数必须返回 `U?`；失败时
+  整个函数直接返回 `none`，成功时解包出 `T`。
+- 新增兜底表达式 `lhs or rhs`（**A3.1 方案 a**）：`or` 关键字按**左操作数类型**
+  分派——左边是 `bool` 时仍是逻辑或，是 `T?` 时是兜底（失败取右侧）；`||`
+  永远是逻辑或。规则已写进 `docs/grammar.md`。
+- 新增 panic 变体 `name!(...)`：`int!` / `float!` / `read!` 失败即 panic；
+  任意返回 `T?` 的用户函数也支持 `f!(...)`。
+- **标准库语义迁移（破坏性，A3.4）**：
+  - `int(x)`：数值 / bool → `int`（不变）；字符串 → `int?`（解析失败返回 none，
+    不再静默返回 0）。
+  - `float(x)`：数值 / bool → `float`；字符串 → `float?`。
+  - `read(path)` → `string?`（文件不存在返回 none，不再直接 panic）。
+  - 其余保持原值语义：`write` / `append` / `remove` / `rename` / `exists` 仍返回
+    `bool`，`system` 仍返回退出码，`env` 仍返回空串（这些函数本来就把失败
+    编码在返回值里）。
+- **迁移指南 + 定向诊断（A3.6）**：`?` 用在非 `T?` 返回的函数里、`or` 左侧不是
+  `T?`、`!` 用在不会失败的内建上、对 `T?` 直接做算术——各给专属报错，错误信息
+  里写明如何改用 `?` 传播 / `or` 兜底 / `!` panic，而不是泛化的“类型不匹配”。
+- **测试迁移（A3.7）**：所有用到 `int("...")` / `read(...)` 的存量用例已重录
+  （改用 `int!` / `read!`）；新增 `tests/cases/error_channel.lux` 与 7 个诊断用例，
+  覆盖传播链、`or` 兜底、`!` panic、嵌套 `int??`、`none`，并全程双后端差分。
+- **REPL（A3.8）**：`T?` 结果直接显示为 `some(x)` / `none`；补全词表加入 `none`。
+
+### 语言：其他
+
+- **B3 —— `f([])` 空数组实参**：`checkCall` 重构为先解析被调签名、再用形参类型
+  逐个检查实参，空数组字面量终于能从形参推断元素类型（欠了四个版本的缺陷）。
+- **C2 —— struct 零值**：Sema 拒绝 `let p: Point;` 这种无初始化的 struct 声明
+  （默认空指针访问字段会崩溃）；确实要空值请声明为 `Point?`。
+- **C1 —— 复合赋值与移位**：`x /= v` / `x %= v`（含 `a[i]` / `p.x`）改走带零检查
+  的 `lx_idiv` / `lx_imod`，不再因为除以 0 触发 SIGFPE；`>>` 两后端统一为**算术
+  右移**（旧版 C 后端是逻辑右移，`-8 >> 1` 与原生结果不同）。
+- **C7 —— 原生 syscall 编号改写防脆弱**：常量存在但不是整数字面量时报内部错误，
+  不再静默留下错误编号。
+- **C4**：生成 C 的数组字面量仍用 GCC 语句表达式（`--emit-c` 可移植性列为 1.0
+  的不包含项）。
+
+### 修复：三个长期潜伏的原生后端 bug
+
+- **aarch64 浮点数组元素读取（C11）**：`ldr <Dt>, [Xn, Xm, lsl #3]` 的机器码多置了
+  bit24（`0xFD600800` → 正确 `0xFC600800`），导致 `xs[0]` 对 `float[]` 恒为 0。
+  旧测试只打印整个 float 数组（走另一条路径）所以一直未暴露。
+- **原生文件 I/O 路径（C12）**：`__sys_open` / `unlink` / `rename` 传的是
+  Lux 字符串头（head 8 字节是长度），实际读写的是名字里带长度字节的畸形文件。
+  因为测试里“写 / 读 / 存在 / 删”用的是同一个变异名而自洽，所以一直“通过”。
+  修正为 `__sptr(path) + 8`，原生与 C 后端现在操作的是真正的文件。
+- **大数浮点格式化（C13）**：`luxrt_f64_to_str` 在 `bigE ≥ 0` 路径把指数重复
+  计入（`xp = nd + bigE`），导致 `≥ ~4.5e15` 的整数打印出错误指数
+  （`1e150` → `1e595`）；修正为 `xp = nd`。最后一位精度仍可能与 libm 有差异。
+- **C 后端标识符撞名**：用户标识符从 `lx_` 改为 `lxv_` / `lxm_` 前缀，
+  与运行时 `lx_*` 命名空间彻底分开（旧版 `let arr = ...` 会生成
+  `lx_arr lx_arr = ...`，直接编译错误）。
+
+### 发布工程与文档
+
+- 新增 `.github/workflows/ci.yml`：构建 + 全量回归 + 双后端差分矩阵
+  （x86-64 与 aarch64），另加 ASan/UBSan 构建跑测试、ASan 编译生成的 C。
+- 新增黑盒 fuzzing 冒烟（`tests/fuzz_lexparse.sh`）：随机字节 + 合法程序变异，
+  断言编译器不崩溃 / 不挂死。
+- 新增回归用例：`error_channel`、`b3_empty_array`、`compound_divmod`、
+  `struct_stress`、`float_index` + 7 个诊断用例。
+- `docs/grammar.md` 升格为 0.8 文法（`?` / `none` / `or` 分派 / `name!`）。
+- `docs/stability.md` 更新：错误通道进入稳定承诺；ARC、`fn` 类型、`static let`、
+  `--emit-c` 可移植性明确列入 1.0 不包含项。
+- `README.md` / `index.html` / `docs/design.md` 全面对齐。
+
 ## 0.7.0
 
 **语言完整版**。新增 `struct` 结构体、`if` 表达式、原始字符串与 `nan`/`inf`

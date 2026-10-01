@@ -21,6 +21,16 @@ static int ekindOf(const Ty* t) {
     }
 }
 
+// 类型中（递归地）是否含 struct。含 struct 的数组不能走通用
+// luxrt_arr_to_str（元素种类表里 Named 被当成 EK_INT），
+// 必须由 codegen 逐层展开成字段字符串。
+static bool containsNamed(const Ty* t) {
+    if (!t) return false;
+    if (t->kind == TyKind::Named) return true;
+    if (t->kind == TyKind::Array) return containsNamed(t->elem);
+    return false;
+}
+
 struct NativeGen {
     NativeArch c;
     std::vector<uint8_t> data;
@@ -134,6 +144,74 @@ struct NativeGen {
         c.cvtsi2sd(0, RAX);
         c.movsdToMem(0, RSP, off);
     }
+
+    // ---- 可选值（0.8 错误通道） ----
+    // T? 统一是 8 字节槽里的指针，0 = none；装箱 / 解包都走运行时。
+    void boxTop() {
+        c.call32(symLabel("luxrt_opt_box"));
+        addRspImm(8);
+        c.push(RAX);
+    }
+    // 求值 e 并按目标类型 to 做隐式转换（int→float / T→T? 装箱）
+    void evalCoerced(Expr* e, const Ty* to) {
+        evalExpr(e);
+        const Ty* from = e ? e->ty : nullptr;
+        if (!from || !to || from == to) return;
+        if (from->kind == TyKind::Int && to->kind == TyKind::Float) {
+            fpromoteTop();
+            return;
+        }
+        if (to->kind == TyKind::Optional) {
+            if (from == to->elem) { boxTop(); return; }
+            if (from->kind == TyKind::Int && to->elem &&
+                to->elem->kind == TyKind::Float) {
+                fpromoteTop();
+                boxTop();
+            }
+        }
+    }
+    // RAX 中是 T? 指针；为 none 时 panic，否则换成 T 压栈
+    void panicUnwrapTop(const std::string& what) {
+        int lok = c.newLabel();
+        c.testRR(RAX, RAX);
+        c.jcc32(CJne, lok);
+        pushStrRef(what);
+        c.call32(symLabel("luxrt_panic_opt"));
+        addRspImm(8);
+        c.bind(lok);
+        c.movrm(RAX, RAX, 0);
+        c.push(RAX);
+    }
+    // read! 专用：栈顶还保留着路径（调用方多压了一份），panic 时一起报出来。
+    // RAX 中是 lx_read_opt 的返回（string?）。
+    void panicUnwrapFileTop() {
+        int lok = c.newLabel();
+        c.testRR(RAX, RAX);
+        c.jcc32(CJne, lok);
+        // 栈：[path]；luxrt_panic_opt_file(what, path)
+        pushStrRef("文件读取");
+        c.movrm(RAX, RSP, 8);   // 取出保存的 path
+        c.push(RAX);
+        c.call32(symLabel("luxrt_panic_opt_file"));
+        addRspImm(24);
+        c.bind(lok);
+        c.movrm(RAX, RAX, 0);
+        addRspImm(8);           // 丢掉保存的 path
+        c.push(RAX);
+    }
+    // expr?（0.8）：为 none 时返回 none（当前函数必须返回 T?）
+    void evalTry(TryExpr* e) {
+        evalExpr(e->operand);
+        c.pop(RAX);
+        int lok = c.newLabel();
+        c.testRR(RAX, RAX);
+        c.jcc32(CJne, lok);
+        c.zeroReg(RAX);
+        c.frameLeave();  // 返回 none
+        c.bind(lok);
+        c.movrm(RAX, RAX, 0);
+        c.push(RAX);
+    }
     // inc qword [base+disp]（for 循环自增用）
     void incMem(int base, int32_t disp) { c.incMem(base, disp); }
 
@@ -231,6 +309,12 @@ struct NativeGen {
             case ExprKind::If:
                 evalIfExpr(static_cast<IfExpr*>(e));
                 return;
+            case ExprKind::NoneLit:
+                pushImm(0);  // none = 0
+                return;
+            case ExprKind::Try:
+                evalTry(static_cast<TryExpr*>(e));
+                return;
             case ExprKind::Index:
                 evalIndex(static_cast<IndexExpr*>(e));
                 return;
@@ -316,12 +400,8 @@ struct NativeGen {
             for (size_t i = 0; i < sd->fields.size(); i++)
                 if (sd->fields[i].name == kv.first) idx = static_cast<int>(i);
             if (idx < 0) continue;
-            evalExpr(kv.second);
             const Ty* ft = sd->fields[idx].ty;
-            if (ft && ft->kind == TyKind::Float && kv.second->ty &&
-                kv.second->ty->kind == TyKind::Int) {
-                fpromoteTop();
-            }
+            evalCoerced(kv.second, ft);
             c.pop(RAX);
             c.movrm(RCX, RBP, slot);
             c.movmr(RCX, idx * 8, RAX);
@@ -347,16 +427,10 @@ struct NativeGen {
         c.testRR(RAX, RAX);
         int lelse = c.newLabel(), lend = c.newLabel();
         c.jcc32(CJe, lelse);
-        evalExpr(e->thenVal);
-        if (e->ty && e->ty->kind == TyKind::Float && e->thenVal->ty &&
-            e->thenVal->ty->kind == TyKind::Int)
-            fpromoteTop();
+        evalCoerced(e->thenVal, e->ty);
         c.jmp32(lend);
         c.bind(lelse);
-        evalExpr(e->elseVal);
-        if (e->ty && e->ty->kind == TyKind::Float && e->elseVal->ty &&
-            e->elseVal->ty->kind == TyKind::Int)
-            fpromoteTop();
+        evalCoerced(e->elseVal, e->ty);
         c.bind(lend);
     }
 
@@ -492,6 +566,22 @@ struct NativeGen {
     }
 
     void evalBinary(BinaryExpr* e) {
+        // 0.8：or 兜底（lhs 是 T?）
+        if (e->orFallback) {
+            const Ty* elem = e->lhs->ty->elem;
+            evalExpr(e->lhs);
+            c.pop(RAX);
+            int lnone = c.newLabel(), lend = c.newLabel();
+            c.testRR(RAX, RAX);
+            c.jcc32(CJe, lnone);
+            c.movrm(RAX, RAX, 0);
+            c.push(RAX);
+            c.jmp32(lend);
+            c.bind(lnone);
+            evalCoerced(e->rhs, elem);
+            c.bind(lend);
+            return;
+        }
         // 常量折叠（Sema）
         if (e->folded) {
             if (e->foldedIsStr) { pushStrRef(e->foldedS); return; }
@@ -707,8 +797,10 @@ struct NativeGen {
                     n += strSlotsForType(f.ty);
             return n;
         }
-        if (t->kind == TyKind::Array && t->elem &&
-            t->elem->kind == TyKind::Named) {
+        if (t->kind == TyKind::Optional) {
+            return 1 + strSlotsForType(t->elem);  // __opt 临时槽（0.8）
+        }
+        if (t->kind == TyKind::Array && t->elem && containsNamed(t->elem)) {
             return 5 + strSlotsForType(t->elem);  // arr/len/i/acc + 递归
         }
         return 0;
@@ -761,7 +853,10 @@ struct NativeGen {
         c.movSib(RAX, RDX, RAX, 3);
         c.push(RAX);
         c.movmr(RSP, 0, RAX);
-        structToStr(elemTy->name);
+        if (elemTy->kind == TyKind::Named)
+            structToStr(elemTy->name);
+        else
+            replaceTopWithStr(elemTy);
         c.call32(symLabel("luxrt_str_concat"));
         addRspImm(16);
         c.movmr(RBP, accslot, RAX);
@@ -775,9 +870,42 @@ struct NativeGen {
         c.push(RAX);
     }
 
+    // 栈顶值转字符串（不给 string 加引号）：供可选值 some(...) 拼接使用
+    void valueToStrTop(const Ty* t) {
+        if (t && t->kind == TyKind::String) return;
+        replaceTopWithStr(t);
+    }
+
+    // 栈顶是 T? 指针；换成 "some(...)" / "none" 字符串（0.8）
+    void optToStrTop(const Ty* optTy) {
+        const Ty* elem = optTy->elem;
+        c.pop(RAX);
+        int slot = declareVar("__opt" + std::to_string(uid_++));
+        c.movmr(RBP, slot, RAX);
+        int lnone = c.newLabel(), lend = c.newLabel();
+        c.testRR(RAX, RAX);
+        c.jcc32(CJe, lnone);
+        pushStrRef("some(");
+        c.push(RAX);  // 占位，下一行覆写
+        c.movrm(RAX, RBP, slot);
+        c.movrm(RAX, RAX, 0);
+        c.movmr(RSP, 0, RAX);
+        valueToStrTop(elem);
+        strConcatTop2();
+        pushStrRef(")");
+        strConcatTop2();
+        c.jmp32(lend);
+        c.bind(lnone);
+        pushStrRef("none");
+        c.bind(lend);
+    }
+
     // 把栈顶值（按类型 t）原地换成它的字符串表示
     void replaceTopWithStr(const Ty* t) {
         switch (t ? t->kind : TyKind::Int) {
+            case TyKind::Optional:
+                optToStrTop(t);
+                return;
             case TyKind::String:
                 // struct 字段里的字符串带引号转义（与 C 后端 lx_pe_str 一致）
                 c.call32(symLabel("luxrt_quote"));
@@ -800,7 +928,7 @@ struct NativeGen {
                 c.push(RAX);
                 return;
             case TyKind::Array:
-                if (t->elem && t->elem->kind == TyKind::Named) {
+                if (t->elem && containsNamed(t->elem)) {
                     arrayToStrOnStack(t->elem);
                     return;
                 }
@@ -844,12 +972,16 @@ struct NativeGen {
     // 栈顶值转 string 并压回（ToString / format 参数共用）
     void toStringTop(Expr* a) {
         const Ty* t = a ? a->ty : nullptr;
+        if (t && t->kind == TyKind::Optional) {
+            optToStrTop(t);
+            return;
+        }
         if (t && t->kind == TyKind::Named) {
             structToStr(t->name);
             return;
         }
         if (t && t->kind == TyKind::Array && t->elem &&
-            t->elem->kind == TyKind::Named) {
+            containsNamed(t->elem)) {
             arrayToStrOnStack(t->elem);
             return;
         }
@@ -885,6 +1017,13 @@ struct NativeGen {
     // =====================================================================
     void emitPrintOne(Expr* a) {
         evalExpr(a);
+        if (a->ty && a->ty->kind == TyKind::Optional) {
+            // 可选值：先转字符串再输出 some(x) / none（0.8）
+            optToStrTop(a->ty);
+            c.call32(symLabel("luxrt_print_str"));
+            addRspImm(8);
+            return;
+        }
         if (a->ty && a->ty->kind == TyKind::Named) {
             // struct：先转字符串再输出（0.7）
             structToStr(a->ty->name);
@@ -893,7 +1032,7 @@ struct NativeGen {
             return;
         }
         if (a->ty && a->ty->kind == TyKind::Array && a->ty->elem &&
-            a->ty->elem->kind == TyKind::Named) {
+            containsNamed(a->ty->elem)) {
             arrayToStrOnStack(a->ty->elem);
             c.call32(symLabel("luxrt_print_str"));
             addRspImm(8);
@@ -985,18 +1124,21 @@ struct NativeGen {
             int n = (int)e->args.size();
             for (int i = 0; i < n; i++) {
                 Expr* a = e->args[i];
-                evalExpr(a);
-                // 实参到形参的隐式提升（int -> float）
-                if (i < (int)e->target->params.size() &&
-                    e->target->params[i].ty &&
-                    e->target->params[i].ty->kind == TyKind::Float && a->ty &&
-                    a->ty->kind == TyKind::Int) {
-                    fpromoteTop();
-                }
+                const Ty* pt = (i < (int)e->target->params.size())
+                                   ? e->target->params[i].ty
+                                   : nullptr;
+                // 实参到形参的隐式转换（int→float / T→T? 装箱）
+                evalCoerced(a, pt);
             }
             c.call32(symLabel(keyOf(*e->target)));
             addRspImm(8 * n);
-            callRet(e->ty);
+            // 0.8：panic 变体 f!(...)（f 返回 T?，失败即退出）
+            if (e->panicVariant && e->target->retTy &&
+                e->target->retTy->kind == TyKind::Optional) {
+                panicUnwrapTop(e->target->name);
+            } else {
+                callRet(e->ty);
+            }
             return;
         }
         pushImm(0);  // Sema 报错后的残局
@@ -1046,9 +1188,12 @@ struct NativeGen {
                         c.movmr(RSP, 0, RAX);
                         return;
                     case TyKind::String:
-                        c.call32(symLabel("luxrt_str_to_i64"));
+                        c.call32(symLabel("luxrt_str_to_i64_opt"));
                         addRspImm(8);
-                        c.push(RAX);
+                        if (e->panicVariant)
+                            panicUnwrapTop("int 解析");
+                        else
+                            c.push(RAX);
                         return;
                     default:  // int / bool 位模式一致，透传
                         return;
@@ -1060,9 +1205,12 @@ struct NativeGen {
                     case TyKind::Float:
                         return;
                     case TyKind::String:
-                        c.call32(symLabel("luxrt_str_to_f64"));
+                        c.call32(symLabel("luxrt_str_to_f64_opt"));
                         addRspImm(8);
-                        pushFloatXmm0();
+                        if (e->panicVariant)
+                            panicUnwrapTop("float 解析");
+                        else
+                            c.push(RAX);
                         return;
                     default:  // int / bool → cvtsi2sd
                         c.pop(RAX);
@@ -1448,10 +1596,19 @@ struct NativeGen {
 
             // ---- file ----
             case Builtin::FileRead:
-                evalExpr(args[0]);
-                c.call32(symLabel("luxrt_file_read"));
-                addRspImm(8);
-                c.push(RAX);
+                if (e->panicVariant) {
+                    evalExpr(args[0]);
+                    c.movrm(RAX, RSP, 0);   // 保存一份 path
+                    c.push(RAX);
+                    c.call32(symLabel("luxrt_read_opt"));
+                    addRspImm(8);           // 消费参数，保留保存的 path
+                    panicUnwrapFileTop();
+                } else {
+                    evalExpr(args[0]);
+                    c.call32(symLabel("luxrt_read_opt"));
+                    addRspImm(8);
+                    c.push(RAX);
+                }
                 return;
             case Builtin::FileExists:
                 evalExpr(args[0]);
@@ -1847,7 +2004,20 @@ struct NativeGen {
         const Ty* tt = a->elemTy;
         bool toFloat = tt && tt->kind == TyKind::Float;
         auto promote = [&](Expr* val) {
-            if (toFloat && val->ty && val->ty->kind == TyKind::Int) fpromoteTop();
+            if (toFloat && val->ty && val->ty->kind == TyKind::Int) {
+                fpromoteTop();
+                return;
+            }
+            // 0.8：目标类型是 T?（或 float?）时把值装箱
+            if (tt && tt->kind == TyKind::Optional) {
+                if (val->ty == tt->elem) {
+                    boxTop();
+                } else if (val->ty && val->ty->kind == TyKind::Int &&
+                           tt->elem && tt->elem->kind == TyKind::Float) {
+                    fpromoteTop();
+                    boxTop();
+                }
+            }
         };
         if (t->kind == ExprKind::Ident) {
             Var* v = findVar(static_cast<IdentExpr*>(t)->name);
@@ -1954,14 +2124,14 @@ struct NativeGen {
 
             case StmtKind::Let: {
                 auto* let = static_cast<LetStmt*>(s);
-                bool isF = let->resolved && let->resolved->kind == TyKind::Float;
                 int slot = declareVar(let->name, let->resolved);
                 if (let->init) {
-                    evalExpr(let->init);
-                    if (isF && let->init->ty &&
-                        let->init->ty->kind == TyKind::Int) {
-                        fpromoteTop();
-                    }
+                    evalCoerced(let->init, let->resolved);
+                } else if (let->resolved &&
+                           let->resolved->kind == TyKind::String) {
+                    // 0.9.3（A1）：未初始化的 string 必须指向合法的空串对象
+                    // （布局 [len][bytes]），不能是 NULL，否则 println/len 会段错误。
+                    pushStrRef("");
                 } else {
                     pushImm(0);
                 }
@@ -2048,17 +2218,15 @@ struct NativeGen {
             case StmtKind::Return: {
                 auto* r = static_cast<ReturnStmt*>(s);
                 if (r->value) {
-                    evalExpr(r->value);
+                    evalCoerced(r->value, curRet);
                     if (curRet && curRet->kind == TyKind::Float) {
-                        if (r->value->ty && r->value->ty->kind == TyKind::Int)
-                            fpromoteTop();
                         c.movsdFromMem(0, RSP, 0);
                         addRspImm(8);
                     } else {
                         c.pop(RAX);
                     }
                 } else {
-                    // void 返回：把返回值寄存器归零（void main 的退出码 = 0）
+                    // void 返回：返回值寄存器归零；Optional 返回：none = 0
                     c.zeroReg(RAX);
                 }
                 c.frameLeave();  // mov rsp,rbp / pop rbp / ret（arm64 恢复 x29,x30）
@@ -2208,6 +2376,8 @@ struct NativeGen {
                 for (Expr* a : call->args) n += countExprSlots(a);
                 return n;
             }
+            case ExprKind::Try:
+                return countExprSlots(static_cast<TryExpr*>(e)->operand);
             default:
                 return 0;
         }

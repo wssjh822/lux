@@ -3,6 +3,14 @@ build/
 *.o
 *.out
 
+# 下载分发包（由 server/make_downloads.sh 生成）
+dist/
+
+# 注册表服务端的运行时数据：账号 / 令牌 / 上传的包，绝不能提交
+server/data/
+server/downloads/
+server/packages/
+
 # luxc 生成的中间 C 文件与可执行文件（都在工作目录里）
 /*.c
 /hello

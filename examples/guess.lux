@@ -19,7 +19,7 @@ fn main() {
             break;
         }
 
-        let n = int(line);
+        let n = int!(line);
         if n < SECRET {
             println("太小了");
         } else if n > SECRET {

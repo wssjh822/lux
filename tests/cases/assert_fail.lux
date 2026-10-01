@@ -1,0 +1,5 @@
+// assert 失败：panic 文案必须与 stability.md §3 一致
+fn main() {
+    println("before");
+    assert(1 == 2, "一加一不等于二");
+}

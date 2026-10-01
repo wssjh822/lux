@@ -1,0 +1,27 @@
+// 官方包 mathx / strx / arrx 联合行为测试
+import "mathx";
+import "strx";
+import "arrx";
+
+fn main() {
+    println(sign(-9));
+    println(ipow(2, 10));
+    println(digit_sum(12345));
+    println(is_even(8));
+    println(is_odd(8));
+    println(trim_left("  hi"));
+    println(trim_right("hi  "));
+    println(replace_all("a-b-c", "-", "+"));
+    println(is_empty(""));
+    println(index_of("hello", "ll"));
+    let a = [3, 1, 2];
+    println(arr_sum_int(a));
+    println(arr_min_int(a));
+    println(arr_max_int(a));
+    println(arr_reverse_int(a)[0]);
+    println(arr_contains_int(a, 2));
+    println(arr_index_of_int(a, 9));
+    println(arr_join(["x", "y"], ","));
+    let f = [1.5, 2.5];
+    println(arr_sum_float(f));
+}

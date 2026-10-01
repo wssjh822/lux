@@ -163,7 +163,20 @@ bool canCoerce(const Ty* from, const Ty* to) {
     if (from == to) return true;
     if (from->kind == TyKind::Int && to->kind == TyKind::Float)
         return true;  // int 自动提升为 float
+    // 0.8 错误通道：T -> T?（自动装箱）；int -> float? 先提升再装箱。
+    // 注意：T? -> T 不自动转换（必须显式 ? / or / !），否则错误通道会泄漏。
+    if (to->kind == TyKind::Optional) {
+        if (from == to->elem) return true;
+        if (from->kind == TyKind::Int && to->elem &&
+            to->elem->kind == TyKind::Float)
+            return true;
+    }
     return false;
+}
+
+// 是否为可选类型 T?
+bool isOptional(const Ty* t) {
+    return t && t->kind == TyKind::Optional;
 }
 
 // 拆分限定名 "prefix.member"（只支持一级限定）
@@ -673,8 +686,37 @@ struct Analyzer {
             case ExprKind::Binary: {
                 auto* b = static_cast<BinaryExpr*>(e);
                 const Ty* lt = checkExpr(b->lhs);
+                // 0.8（A3.1）：`or` 关键字按左操作数类型分派。
+                // 左边是 T? → 兜底（fallback）；否则仍是逻辑或。
+                if (b->op == BinOp::LogicOr && b->orKeyword &&
+                    isOptional(lt)) {
+                    b->orFallback = true;
+                    const Ty* elem = lt->elem;
+                    const Ty* rt = checkExpr(b->rhs, elem);
+                    if (rt == tInvalid) {
+                        e->ty = tInvalid;
+                        return tInvalid;
+                    }
+                    if (!canCoerce(rt, elem) &&
+                        !tryCoerceArrayLit(b->rhs, elem)) {
+                        typeError(b->rhs->loc, rt, elem,
+                                  "'or' 右侧的兜底值类型与可选值内部类型不匹配");
+                        e->ty = tInvalid;
+                        return tInvalid;
+                    }
+                    e->ty = elem;
+                    return e->ty;
+                }
                 const Ty* rt = checkExpr(b->rhs);
                 if (lt == tInvalid || rt == tInvalid) {
+                    e->ty = tInvalid;
+                    return tInvalid;
+                }
+                if (isOptional(lt) || isOptional(rt)) {
+                    err(b->loc,
+                        "不能直接对可选值做运算（这里是 '" + tyName(lt) +
+                            "' 和 '" + tyName(rt) +
+                            "'）；请先用 ? 传播、or 兜底或 ! 解包");
                     e->ty = tInvalid;
                     return tInvalid;
                 }
@@ -939,6 +981,50 @@ struct Analyzer {
                 }
                 return e->ty;
             }
+
+            case ExprKind::NoneLit: {
+                // none 字面量（0.8）：类型完全由上下文 hint 决定
+                if (hint && hint->kind == TyKind::Optional) {
+                    e->ty = hint;
+                    return hint;
+                }
+                err(e->loc,
+                    "'none' 只能用在可选类型 T? 的上下文里（如 let x: int? = "
+                    "none; 或 return none;）");
+                e->ty = tInvalid;
+                return tInvalid;
+            }
+
+            case ExprKind::Try: {
+                // expr?（0.8）：operand 必须是 T?，所在函数必须返回 U?
+                auto* tr = static_cast<TryExpr*>(e);
+                const Ty* ot = checkExpr(tr->operand);
+                if (ot == tInvalid) {
+                    e->ty = tInvalid;
+                    return tInvalid;
+                }
+                if (!isOptional(ot)) {
+                    err(tr->loc,
+                        "'?' 只能用在可选类型 T? 的表达式上（这里是 '" +
+                            tyName(ot) + "'）；不会失败的表达式无需传播");
+                    e->ty = tInvalid;
+                    return tInvalid;
+                }
+                if (!curFunc || !isOptional(curFunc->retTy)) {
+                    std::string ret =
+                        curFunc ? tyName(curFunc->retTy) : std::string("void");
+                    err(tr->loc,
+                        "'?' 向上传播错误，要求所在函数的返回类型是 T?（当前 "
+                        "'" + (curFunc ? curFunc->name : std::string("?")) +
+                            "' 返回 '" + ret +
+                            "'）。库代码用 ? 传播；脚本可用 int!()/read!() 直接 "
+                            "panic，或用 'or 默认值' 兜底");
+                    e->ty = tInvalid;
+                    return tInvalid;
+                }
+                e->ty = ot->elem;
+                return e->ty;
+            }
         }
         return tInvalid;
     }
@@ -1008,23 +1094,28 @@ struct Analyzer {
         return tInvalid;
     }
 
-    const Ty* checkCall(CallExpr* c) {
-        std::vector<const Ty*> argTys;
-        for (Expr* a : c->args) argTys.push_back(checkExpr(a));
+    // 逐个检查实参（无 hint）。用于无法提供形参提示的调用路径。
+    std::vector<const Ty*> checkArgsNoHint(CallExpr* c) {
+        std::vector<const Ty*> tys;
+        for (Expr* a : c->args) tys.push_back(checkExpr(a));
+        return tys;
+    }
 
+    const Ty* checkCall(CallExpr* c) {
         std::string prefix, member;
         if (splitQualified(c->callee, prefix, member)) {
             // ---- 数组方法（0.5 新增）： a.push(x) / a.pop() / ... ----
             VarInfo* recv = findVar(prefix);
             if (recv && recv->ty && recv->ty->kind == TyKind::Array) {
                 recv->used = true;
-                return checkArrayMethod(c, recv, member, argTys);
+                return checkArrayMethod(c, recv, member, checkArgsNoHint(c));
             }
             if (recv && recv->ty && recv->ty->kind != TyKind::Invalid) {
                 err(c->calleeLoc,
                     "'" + tyName(recv->ty) + "' 类型的变量 '" + prefix +
                         "' 没有 '" + member +
                         "' 方法（方法只存在于数组上，例如 a.push(x)）");
+                checkArgsNoHint(c);
                 c->ty = tInvalid;
                 return tInvalid;
             }
@@ -1034,6 +1125,7 @@ struct Analyzer {
                 err(c->calleeLoc, "模块 '" + mod +
                                           "' 没有被 import（请先写 import \"" +
                                           mod + "\"）");
+                checkArgsNoHint(c);
                 c->ty = tInvalid;
                 return tInvalid;
             }
@@ -1041,14 +1133,15 @@ struct Analyzer {
             if (it != builtinTable().end() &&
                 builtinModule(it->second) == mod) {
                 c->builtin = it->second;
-                return checkBuiltinCall(c, argTys);
+                return checkBuiltinCall(c, checkArgsNoHint(c));
             }
             auto fit = modFuncs.find(mod + "\x01" + member);
             if (fit != modFuncs.end()) {
                 c->target = fit->second;
-                return checkUserCall(c, fit->second, argTys);
+                return checkUserCall(c, fit->second);
             }
             err(c->calleeLoc, "模块 '" + mod + "' 中没有函数 '" + member + "'");
+            checkArgsNoHint(c);
             c->ty = tInvalid;
             return tInvalid;
         }
@@ -1083,6 +1176,9 @@ struct Analyzer {
             auto iit = intrinsics.find(c->callee);
             if (iit != intrinsics.end()) {
                 c->builtin = iit->second;
+                // 特权内建的参数不做类型检查（运行时库专用 DSL），但仍要
+                // 递归检查实参里的表达式，避免漏掉嵌套的语义错误。
+                for (Expr* a : c->args) checkExpr(a);
                 // 参数个数检查（0.7，C1）：缺参会让后端在发射阶段读越界，
                 // 以前直接导致编译器自身崩溃；现在在 Sema 阶段报错。
                 static const std::unordered_map<std::string,
@@ -1155,7 +1251,7 @@ struct Analyzer {
             c->builtin = it->second;
             // 属于标准库模块的内置函数必须先 import 对应模块（默认导入方式）
             const char* mod = builtinModule(c->builtin);
-            if (mod && !modules.flat.count(mod)) {
+            if (mod && !modules.memberVisible(mod, c->callee)) {
                 err(c->calleeLoc,
                     "函数 '" + c->callee + "' 属于 '" + std::string(mod) +
                         "' 模块，需要在文件顶部写 import \"" + mod +
@@ -1163,7 +1259,7 @@ struct Analyzer {
                 c->ty = tInvalid;
                 return tInvalid;
             }
-            return checkBuiltinCall(c, argTys);
+            return checkBuiltinCall(c, checkArgsNoHint(c));
         }
 
         FuncDecl* fn = nullptr;
@@ -1175,30 +1271,50 @@ struct Analyzer {
                 warn(DiagCode::kWNoEffect, c->calleeLoc,
                      "Lux 里输出请用 println(...)，不要直接调用 C 函数");
             }
+            checkArgsNoHint(c);
             c->ty = tInvalid;
             return tInvalid;
         }
         c->target = fn;
-        return checkUserCall(c, fn, argTys);
+        return checkUserCall(c, fn);
     }
 
-    // 用户函数调用的通用检查（实参个数 + 类型兼容）
-    const Ty* checkUserCall(CallExpr* c, FuncDecl* fn,
-                            const std::vector<const Ty*>& argTys) {
+    // 用户函数调用的通用检查（实参个数 + 类型兼容）。
+    // 0.8：逐个实参带上形参类型作为 hint，这样 f([]) / f(none) 能正确推断。
+    const Ty* checkUserCall(CallExpr* c, FuncDecl* fn) {
         if (fn->params.size() != c->args.size()) {
             err(c->loc, "函数 '" + fn->name + "' 需要 " +
                                     std::to_string(fn->params.size()) +
                                     " 个参数，但调用时给了 " +
                                     std::to_string(c->args.size()) + " 个");
+            for (Expr* a : c->args) checkExpr(a);
         } else {
             for (size_t i = 0; i < c->args.size(); i++) {
-                if (argTys[i] == tInvalid) continue;
-                if (!canCoerce(argTys[i], fn->params[i].ty) &&
-                    !tryCoerceArrayLit(c->args[i], fn->params[i].ty)) {
-                    typeError(c->args[i]->loc, argTys[i], fn->params[i].ty,
-                              "传给参数 '" + fn->params[i].name + "' 的实参类型不匹配");
+                const Ty* want = fn->params[i].ty;
+                const Ty* hint =
+                    (want && want != tVoid && want != tInvalid) ? want
+                                                                : nullptr;
+                const Ty* at = checkExpr(c->args[i], hint);
+                if (at == tInvalid) continue;
+                if (!canCoerce(at, want) &&
+                    !tryCoerceArrayLit(c->args[i], want)) {
+                    typeError(c->args[i]->loc, at, want,
+                              "传给参数 '" + fn->params[i].name +
+                                  "' 的实参类型不匹配");
                 }
             }
+        }
+        // 0.8 panic 变体：f!(...) 要求 f 返回 T?，解包出 T
+        if (c->panicVariant) {
+            if (!isOptional(fn->retTy)) {
+                err(c->calleeLoc,
+                    "'! ' 只能用于返回可选类型 T? 的函数（'" + fn->name +
+                        "' 返回 '" + tyName(fn->retTy) + "'）");
+                c->ty = tInvalid;
+                return tInvalid;
+            }
+            c->ty = fn->retTy->elem;
+            return c->ty;
         }
         c->ty = fn->retTy;
         return fn->retTy;
@@ -1297,6 +1413,19 @@ struct Analyzer {
     }
 
     const Ty* checkBuiltinCall(CallExpr* c, const std::vector<const Ty*>& argTys) {
+        // 0.8 panic 变体（name!）：只有可能失败的内建才配 ! 后缀
+        if (c->panicVariant) {
+            bool canPanic = c->builtin == Builtin::ToInt ||
+                            c->builtin == Builtin::ToFloat ||
+                            c->builtin == Builtin::FileRead;
+            if (!canPanic) {
+                err(c->calleeLoc,
+                    "'!' 只能用于可能失败的内建函数（int / float / read）；'" +
+                        c->callee + "' 不会失败，无需 '!'");
+                c->ty = tInvalid;
+                return tInvalid;
+            }
+        }
         auto arity = [&](size_t n) {
             if (c->args.size() != n) {
                 err(c->loc, "内置函数 '" + c->callee + "' 需要 " +
@@ -1351,16 +1480,39 @@ struct Analyzer {
             }
 
             case Builtin::ToInt: {
+                if (!arity(1)) { c->ty = tInvalid; return tInvalid; }
+                if (argTys[0] == tInvalid) { c->ty = tInvalid; return tInvalid; }
+                // 0.8 语义迁移：字符串解析可能失败 → int?（int! 保留 panic 版）
+                if (argTys[0] == tString) {
+                    c->ty = c->panicVariant ? tInt : TyStore::optionalOf(tInt);
+                    return c->ty;
+                }
+                if (c->panicVariant) {
+                    err(c->calleeLoc,
+                        "int! 只能用于字符串解析；数值 / bool 转 int 不会失败");
+                    c->ty = tInvalid;
+                    return tInvalid;
+                }
                 c->ty = tInt;
-                if (!arity(1)) return tInvalid;
-                if (argTys[0] == tInvalid) return tInvalid;
                 return tInt;
             }
 
             case Builtin::ToFloat: {
+                if (!arity(1)) { c->ty = tInvalid; return tInvalid; }
+                if (argTys[0] == tInvalid) { c->ty = tInvalid; return tInvalid; }
+                // 0.8 语义迁移：字符串解析可能失败 → float?（float! 保留 panic 版）
+                if (argTys[0] == tString) {
+                    c->ty =
+                        c->panicVariant ? tFloat : TyStore::optionalOf(tFloat);
+                    return c->ty;
+                }
+                if (c->panicVariant) {
+                    err(c->calleeLoc,
+                        "float! 只能用于字符串解析；数值 / bool 转 float 不会失败");
+                    c->ty = tInvalid;
+                    return tInvalid;
+                }
                 c->ty = tFloat;
-                if (!arity(1)) return tInvalid;
-                if (argTys[0] == tInvalid) return tInvalid;
                 return tFloat;
             }
 
@@ -1572,11 +1724,19 @@ struct Analyzer {
             }
 
             // ---- file 模块 ----
-            case Builtin::FileRead:
+            case Builtin::FileRead: {
+                if (!arity(1)) { c->ty = tInvalid; return tInvalid; }
+                if (argTys[0] == tInvalid) { c->ty = tInvalid; return tInvalid; }
+                strArg(0, c->callee + "() 的文件路径必须是字符串");
+                // 0.8：读文件可能失败 → string?（read! 保留 panic 版）
+                c->ty =
+                    c->panicVariant ? tString : TyStore::optionalOf(tString);
+                return c->ty;
+            }
+
             case Builtin::FileExists:
             case Builtin::FileRemove: {
-                if (c->builtin == Builtin::FileRead) c->ty = tString;
-                else c->ty = tBool;
+                c->ty = tBool;
                 if (!arity(1)) return tInvalid;
                 if (argTys[0] == tInvalid) return tInvalid;
                 strArg(0, c->callee + "() 的文件路径必须是字符串");
@@ -1780,6 +1940,14 @@ struct Analyzer {
                     err(let->nameLoc, "变量不能被声明为 void 类型");
                 }
                 let->resolved = finalTy;
+                // 0.8（C2）：struct 的零值是空指针，未初始化声明会在访问字段时
+                // 崩溃。在这里直接拒绝，引导用户初始化或改用可选类型。
+                if (!let->init && finalTy && finalTy->kind == TyKind::Named) {
+                    err(let->nameLoc,
+                        "struct 变量 '" + let->name +
+                            "' 必须初始化（struct 默认值是空指针，访问字段会崩溃）；"
+                            "若确实需要空值请声明为 '" + tyName(finalTy) + "?'");
+                }
                 declare(VarInfo{let->name, finalTy, let->isConst, let->nameLoc,
                                 nullptr, false});
                 break;
@@ -1915,7 +2083,8 @@ struct Analyzer {
                 auto* r = static_cast<ReturnStmt*>(s);
                 const Ty* want = curFunc ? curFunc->retTy : tVoid;
                 if (!r->value) {
-                    if (want != tVoid) {
+                    // 0.8：返回类型是 T? 时，'return;' 等价于 'return none;'
+                    if (want != tVoid && !isOptional(want)) {
                         err(r->loc, "函数 '" + std::string(curFunc ? curFunc->name : "?") +
                                                 "' 的返回类型是 '" + tyName(want) +
                                                 "'，这里必须 return 一个值");
@@ -1960,11 +2129,25 @@ struct Analyzer {
         // 非 void 函数必须有可达的 return 路径（0.5：完整的返回路径分析）
         // if/else 两个分支都 return、while(true)/loop 且不含 break 都算覆盖；
         // 普通结尾没有 return 的情况仍然只是警告（返回默认值）。
-        if (fn->retTy != tVoid && !stmtAlwaysReturns(fn->body)) {
-            warn(DiagCode::kWMissingReturn, fn->body->loc,
-                 "函数 '" + fn->name + "' 的返回类型是 '" + tyName(fn->retTy) +
-                     "'，但存在不经过 return 的执行路径；"
-                     "运行时将返回该类型的默认值");
+        // 例外（0.9）：返回类型是 struct 时“默认值”是 NULL 指针，落穿 = 随后
+        // 访问字段必然崩，因此升级为硬错误。Optional 落穿 = none 是正确的，
+        // 不在此列。
+        if (fn->retTy != tVoid && !isOptional(fn->retTy) &&
+            !stmtAlwaysReturns(fn->body)) {
+            if (fn->retTy->kind == TyKind::Named) {
+                diags.error(DiagCode::kEStructReturn, curFile, fn->body->loc,
+                            "函数 '" + fn->name + "' 的返回类型是 struct '" +
+                                tyName(fn->retTy) +
+                                "'，存在不经过 return 的执行路径；"
+                                "struct 没有可用的默认值（落穿会返回空指针，"
+                                "访问字段将崩溃）。请让所有分支都 return。");
+            } else {
+                warn(DiagCode::kWMissingReturn, fn->body->loc,
+                     "函数 '" + fn->name + "' 的返回类型是 '" +
+                         tyName(fn->retTy) +
+                         "'，但存在不经过 return 的执行路径；"
+                         "运行时将返回该类型的默认值");
+            }
         }
         curFunc = nullptr;
     }
@@ -1986,6 +2169,11 @@ struct Analyzer {
                 if (f.ty == tVoid) {
                     err(f.loc, "struct 字段不能是 void 类型");
                 }
+                if (f.ty && isOptional(f.ty)) {
+                    err(f.loc, "struct '" + sd->name + "' 的字段 '" + f.name +
+                                   "' 不能是可选类型（T? 只活于局部 / 参数 /"
+                                   "返回值）；请改用普通字段 + 单独的 bool 标记");
+                }
                 if (f.ty && f.ty->kind == TyKind::Named &&
                     !findStruct(f.ty->name)) {
                     err(f.loc, "struct '" + sd->name + "' 的字段 '" + f.name +
@@ -2005,7 +2193,9 @@ struct Analyzer {
         // 定向报错，而不是误导性的"未定义的函数"（0.5.1）。
         // 重复定义的检测仍由第 1 步统一完成，这里遇到同名只跳过。
         for (FuncDecl* fn : prog->funcs) {
-            bool visible = fn->module.empty() || modules.flat.count(fn->module);
+            bool visible =
+                fn->module.empty() ||
+                modules.memberVisible(fn->module, fn->name);
             if (visible && !funcs.count(fn->name)) funcs[fn->name] = fn;
         }
         for (GlobalConstDecl* gc : prog->consts) {
@@ -2058,7 +2248,8 @@ struct Analyzer {
             }
             gc->resolved = finalTy;
             // 别名导入的模块不注入全局命名空间，只能通过 模块名/别名.常量 访问
-            if (gc->module.empty() || modules.flat.count(gc->module)) {
+            if (gc->module.empty() ||
+                modules.memberVisible(gc->module, gc->name)) {
                 declare(VarInfo{gc->name, finalTy, true, gc->nameLoc, gc,
                                 false});
             }
@@ -2075,7 +2266,9 @@ struct Analyzer {
                 err(fn->nameLoc, "函数名 '" + fn->name +
                                              "' 与内置函数重名，请换一个名字");
             }
-            bool visible = fn->module.empty() || modules.flat.count(fn->module);
+            bool visible =
+                fn->module.empty() ||
+                modules.memberVisible(fn->module, fn->name);
             if (visible) {
                 auto it = funcs.find(fn->name);
                 // 预注册阶段写入的是 fn 自身，不算重复；只有不同的
@@ -2103,12 +2296,26 @@ struct Analyzer {
                             "' 的返回类型不能是数组：lx_arr 是 Lux 运行时的"
                             "私有结构，C 侧没有对应类型；请改用指针 / 标量类型");
                 }
+                if (fn->retTy && isOptional(fn->retTy)) {
+                    err(fn->nameLoc,
+                        "extern fn '" + fn->name +
+                            "' 的返回类型不能是可选类型：T? 是 Lux 运行时的"
+                            "指针状私有表示，C 侧没有对应 ABI；"
+                            "请改用指针 / 标量类型，或在 Lux 侧用包装函数");
+                }
                 for (const Param& p : fn->params) {
                     if (p.ty && p.ty->kind == TyKind::Array) {
                         err(p.loc,
                             "extern fn '" + fn->name + "' 的参数 '" + p.name +
                                 "' 不能是数组：lx_arr 是 Lux 运行时的私有"
                                 "结构，C 侧没有对应类型；请改用指针 / 标量类型");
+                    }
+                    if (p.ty && isOptional(p.ty)) {
+                        err(p.loc,
+                            "extern fn '" + fn->name + "' 的参数 '" + p.name +
+                                "' 不能是可选类型：T? 是 Lux 运行时的指针状"
+                                "私有表示，C 侧没有对应 ABI；"
+                                "请改用指针 / 标量类型，或在 Lux 侧先解包");
                     }
                 }
                 if (fn->name.rfind("lx_", 0) == 0) {

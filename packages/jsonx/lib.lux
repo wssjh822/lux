@@ -1,0 +1,838 @@
+// =============================================================================
+//  jsonx —— JSON 解析 / 生成 / 文件读写（纯 Lux 实现）
+//
+//  安装： luxc install jsonx
+//  使用： import "jsonx";
+//
+//  设计要点：
+//    * 用带类型标签的 struct Json 表示任意 JSON 值（无泛型 / 无 union，
+//      对象用并行的 keys[] / vals[]，避免引入 map）；
+//    * 解析完全手写：数字自己做溢出检测，字符串支持全部转义与
+//      \uXXXX 代理对，错误带行列；
+//    * 生成保持 UTF-8 原字节，只转义 JSON 必需的字符；
+//    * 不依赖 C 库，C 后端与原生后端行为一致。
+// =============================================================================
+import "string";
+import "file";
+import "math";
+
+// 类型标签
+const J_NULL: int = 0;
+const J_BOOL: int = 1;
+const J_INT: int = 2;
+const J_FLOAT: int = 3;
+const J_STR: int = 4;
+const J_ARR: int = 5;
+const J_OBJ: int = 6;
+
+// -----------------------------------------------------------------------------
+//  字节表：chrByte(b) 取出值为 b 的单字节字符串（0x00 无法表示，返回空串）
+//  前 127 字节是 0x01..0x7F；之后依次覆盖 UTF-8 的续字节与前导字节。
+//  OFF_B=127 OFF_C=255 OFF_D=315 OFF_E=363
+// -----------------------------------------------------------------------------
+const BYTE_MASTER: string =
+    "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c" +
+    "\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18" +
+    "\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24" +
+    "\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30" +
+    "\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c" +
+    "\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46\x47\x48" +
+    "\x49\x4a\x4b\x4c\x4d\x4e\x4f\x50\x51\x52\x53\x54" +
+    "\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f\x60" +
+    "\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c" +
+    "\x6d\x6e\x6f\x70\x71\x72\x73\x74\x75\x76\x77\x78" +
+    "\x79\x7a\x7b\x7c\x7d\x7e\x7f\u0080\u0081\u0082\u0083\u0084" +
+    "\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090" +
+    "\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c" +
+    "\u009d\u009e\u009f\u00a0\u00a1\u00a2\u00a3\u00a4\u00a5\u00a6\u00a7\u00a8" +
+    "\u00a9\u00aa\u00ab\u00ac\u00ad\u00ae\u00af\u00b0\u00b1\u00b2\u00b3\u00b4" +
+    "\u00b5\u00b6\u00b7\u00b8\u00b9\u00ba\u00bb\u00bc\u00bd\u00be\u00bf\u0080" +
+    "\u00c0\u0100\u0140\u0180\u01c0\u0200\u0240\u0280\u02c0\u0300\u0340\u0380" +
+    "\u03c0\u0400\u0440\u0480\u04c0\u0500\u0540\u0580\u05c0\u0600\u0640\u0680" +
+    "\u06c0\u0700\u0740\u0780\u07c0\u0800\u1000\u2000\u3000\u4000\u5000\u6000" +
+    "\u7000\u8000\u9000\ua000\ub000\uc000\ud000\ue000\uf000\U00010000\U00050000\U00090000" +
+    "\U000d0000\U00100000";
+
+fn chrByte(b: int) -> string {
+    if b >= 1 && b <= 0x7F {
+        return substr(BYTE_MASTER, b - 1, 1);
+    }
+    if b >= 0x80 && b <= 0xBF {
+        return substr(BYTE_MASTER, 127 + (b - 0x80) * 2 + 1, 1);
+    }
+    if b >= 0xC2 && b <= 0xDF {
+        return substr(BYTE_MASTER, 255 + (b - 0xC2) * 2, 1);
+    }
+    if b >= 0xE0 && b <= 0xEF {
+        return substr(BYTE_MASTER, 315 + (b - 0xE0) * 3, 1);
+    }
+    if b >= 0xF0 && b <= 0xF4 {
+        return substr(BYTE_MASTER, 363 + (b - 0xF0) * 4, 1);
+    }
+    return "";
+}
+
+// 码点 → UTF-8 字符串
+fn utf8Encode(cp: int) -> string {
+    if cp < 0x80 {
+        return chrByte(cp);
+    }
+    if cp < 0x800 {
+        return chrByte(0xC0 + (cp >> 6)) + chrByte(0x80 + (cp & 0x3F));
+    }
+    if cp < 0x10000 {
+        return chrByte(0xE0 + (cp >> 12)) + chrByte(0x80 + ((cp >> 6) & 0x3F)) +
+               chrByte(0x80 + (cp & 0x3F));
+    }
+    return chrByte(0xF0 + (cp >> 18)) + chrByte(0x80 + ((cp >> 12) & 0x3F)) +
+           chrByte(0x80 + ((cp >> 6) & 0x3F)) + chrByte(0x80 + (cp & 0x3F));
+}
+
+// -----------------------------------------------------------------------------
+//  值类型
+// -----------------------------------------------------------------------------
+struct Json {
+    kind: int;
+    b: bool;
+    i: int;
+    f: float;
+    s: string;
+    arr: Json[];
+    keys: string[];
+    vals: Json[];
+}
+
+// 解析结果：ok=false 时 error / line / col 有意义
+struct JResult {
+    ok: bool;
+    value: Json;
+    error: string;
+    line: int;
+    col: int;
+}
+
+// 解析器状态（struct 是引用语义，递归函数就地修改）
+struct JParser {
+    src: string;
+    cs: string[];
+    pos: int;
+    n: int;
+    failed: bool;
+    error: string;
+    line: int;
+    col: int;
+}
+
+// -----------------------------------------------------------------------------
+//  构造
+// -----------------------------------------------------------------------------
+fn jNull() -> Json {
+    return Json { kind: J_NULL, b: false, i: 0, f: 0.0, s: "", arr: [],
+                  keys: [], vals: [] };
+}
+fn jBool(v: bool) -> Json {
+    return Json { kind: J_BOOL, b: v, i: 0, f: 0.0, s: "", arr: [],
+                  keys: [], vals: [] };
+}
+fn jInt(v: int) -> Json {
+    return Json { kind: J_INT, b: false, i: v, f: 0.0, s: "", arr: [],
+                  keys: [], vals: [] };
+}
+fn jFloat(v: float) -> Json {
+    return Json { kind: J_FLOAT, b: false, i: 0, f: v, s: "", arr: [],
+                  keys: [], vals: [] };
+}
+fn jStr(v: string) -> Json {
+    return Json { kind: J_STR, b: false, i: 0, f: 0.0, s: v, arr: [],
+                  keys: [], vals: [] };
+}
+fn jArray(items: Json[]) -> Json {
+    return Json { kind: J_ARR, b: false, i: 0, f: 0.0, s: "", arr: items,
+                  keys: [], vals: [] };
+}
+fn jObject(keys: string[], vals: Json[]) -> Json {
+    return Json { kind: J_OBJ, b: false, i: 0, f: 0.0, s: "", arr: [],
+                  keys: keys, vals: vals };
+}
+
+fn jArrayOfInts(xs: int[]) -> Json {
+    let out: Json[] = [];
+    for x in xs { out.push(jInt(x)); }
+    return jArray(out);
+}
+fn jArrayOfFloats(xs: float[]) -> Json {
+    let out: Json[] = [];
+    for x in xs { out.push(jFloat(x)); }
+    return jArray(out);
+}
+fn jArrayOfBools(xs: bool[]) -> Json {
+    let out: Json[] = [];
+    for x in xs { out.push(jBool(x)); }
+    return jArray(out);
+}
+fn jArrayOfStrings(xs: string[]) -> Json {
+    let out: Json[] = [];
+    for x in xs { out.push(jStr(x)); }
+    return jArray(out);
+}
+
+// -----------------------------------------------------------------------------
+//  类型判定 / 取值
+// -----------------------------------------------------------------------------
+fn kindName(j: Json) -> string {
+    if j.kind == J_NULL { return "null"; }
+    if j.kind == J_BOOL { return "bool"; }
+    if j.kind == J_INT { return "int"; }
+    if j.kind == J_FLOAT { return "float"; }
+    if j.kind == J_STR { return "string"; }
+    if j.kind == J_ARR { return "array"; }
+    if j.kind == J_OBJ { return "object"; }
+    return "invalid";
+}
+fn isNull(j: Json) -> bool { return j.kind == J_NULL; }
+fn isBool(j: Json) -> bool { return j.kind == J_BOOL; }
+fn isInt(j: Json) -> bool { return j.kind == J_INT; }
+fn isFloat(j: Json) -> bool { return j.kind == J_FLOAT; }
+fn isNumber(j: Json) -> bool { return j.kind == J_INT || j.kind == J_FLOAT; }
+fn isString(j: Json) -> bool { return j.kind == J_STR; }
+fn isArray(j: Json) -> bool { return j.kind == J_ARR; }
+fn isObject(j: Json) -> bool { return j.kind == J_OBJ; }
+
+fn asBool(j: Json) -> bool {
+    if j.kind == J_BOOL { return j.b; }
+    return false;
+}
+fn asInt(j: Json) -> int {
+    if j.kind == J_INT { return j.i; }
+    if j.kind == J_FLOAT { return int(j.f); }
+    if j.kind == J_BOOL { if j.b { return 1; } return 0; }
+    return 0;
+}
+fn asFloat(j: Json) -> float {
+    if j.kind == J_FLOAT { return j.f; }
+    if j.kind == J_INT { return float(j.i); }
+    if j.kind == J_BOOL { if j.b { return 1.0; } return 0.0; }
+    return 0.0;
+}
+fn asString(j: Json) -> string {
+    if j.kind == J_STR { return j.s; }
+    if j.kind == J_INT { return string(j.i); }
+    if j.kind == J_FLOAT { return formatFloat(j.f); }
+    if j.kind == J_BOOL { if j.b { return "true"; } return "false"; }
+    if j.kind == J_NULL { return ""; }
+    return stringify(j);
+}
+fn asArray(j: Json) -> Json[] {
+    if j.kind == J_ARR { return j.arr; }
+    return [];
+}
+
+fn size(j: Json) -> int {
+    if j.kind == J_ARR { return len(j.arr); }
+    if j.kind == J_OBJ { return len(j.keys); }
+    if j.kind == J_STR { return len(j.s); }
+    return 0;
+}
+
+fn keys(j: Json) -> string[] {
+    if j.kind == J_OBJ { return j.keys; }
+    return [];
+}
+
+fn get(j: Json, key: string) -> Json? {
+    if j.kind != J_OBJ { return none; }
+    let i = 0;
+    while i < len(j.keys) {
+        if j.keys[i] == key { return j.vals[i]; }
+        i = i + 1;
+    }
+    return none;
+}
+fn has(j: Json, key: string) -> bool {
+    if j.kind != J_OBJ { return false; }
+    let i = 0;
+    while i < len(j.keys) {
+        if j.keys[i] == key { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+fn getOr(j: Json, key: string, fallback: Json) -> Json {
+    return get(j, key) or fallback;
+}
+fn at(j: Json, index: int) -> Json? {
+    if j.kind != J_ARR { return none; }
+    if index < 0 || index >= len(j.arr) { return none; }
+    return j.arr[index];
+}
+fn atOr(j: Json, index: int, fallback: Json) -> Json {
+    return at(j, index) or fallback;
+}
+
+fn getString(j: Json, key: string) -> string {
+    return asString(get(j, key) or jNull());
+}
+fn getInt(j: Json, key: string) -> int {
+    return asInt(get(j, key) or jNull());
+}
+fn getFloat(j: Json, key: string) -> float {
+    return asFloat(get(j, key) or jNull());
+}
+fn getBool(j: Json, key: string) -> bool {
+    return asBool(get(j, key) or jNull());
+}
+fn getArray(j: Json, key: string) -> Json[] {
+    return asArray(get(j, key) or jNull());
+}
+fn getObject(j: Json, key: string) -> Json {
+    let v = get(j, key) or jNull();
+    if v.kind == J_OBJ { return v; }
+    return jNull();
+}
+
+// 路径访问：getPath(root, "a.b[0].c")；缺失返回 null 值
+fn getPath(j: Json, path: string) -> Json {
+    let cur = j;
+    let i = 0;
+    let n = len(path);
+    while i < n {
+        let c = substr(path, i, 1);
+        if c == "." { i = i + 1; }
+        else if c == "[" {
+            let j2 = i + 1;
+            while j2 < n && substr(path, j2, 1) != "]" { j2 = j2 + 1; }
+            if j2 >= n { return jNull(); }
+            let idx = int(substr(path, i + 1, j2 - i - 1)) or -1;
+            if idx < 0 || idx >= size(cur) { return jNull(); }
+            cur = at(cur, idx) or jNull();
+            i = j2 + 1;
+        } else {
+            let j2 = i;
+            while j2 < n {
+                let d = substr(path, j2, 1);
+                if d == "." || d == "[" { break; }
+                j2 = j2 + 1;
+            }
+            let key = substr(path, i, j2 - i);
+            if !has(cur, key) { return jNull(); }
+            cur = get(cur, key) or jNull();
+            i = j2;
+        }
+    }
+    return cur;
+}
+
+fn toIntArray(j: Json) -> int[] {
+    let out: int[] = [];
+    if j.kind == J_ARR {
+        for x in j.arr { out.push(asInt(x)); }
+    }
+    return out;
+}
+fn toStringArray(j: Json) -> string[] {
+    let out: string[] = [];
+    if j.kind == J_ARR {
+        for x in j.arr { out.push(asString(x)); }
+    }
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+//  解析器
+// -----------------------------------------------------------------------------
+fn pFail(p: JParser, msg: string) {
+    if p.failed { return; }
+    p.failed = true;
+    p.error = msg;
+    let line = 1;
+    let col = 1;
+    let i = 0;
+    while i < p.pos && i < p.n {
+        if p.cs[i] == "\n" { line = line + 1; col = 1; }
+        else { col = col + 1; }
+        i = i + 1;
+    }
+    p.line = line;
+    p.col = col;
+}
+
+fn pSkipWs(p: JParser) {
+    while p.pos < p.n {
+        let c = p.cs[p.pos];
+        if c == " " || c == "\t" || c == "\n" || c == "\r" {
+            p.pos = p.pos + 1;
+        } else {
+            return;
+        }
+    }
+}
+
+fn digitVal(c: string) -> int {
+    return find("0123456789", c);
+}
+
+fn hexVal(c: string) -> int {
+    let d = find("0123456789", c);
+    if d >= 0 { return d; }
+    let l = find("abcdef", lower(c));
+    if l >= 0 { return l + 10; }
+    return -1;
+}
+
+fn pParseLit(p: JParser, word: string, val: Json) -> Json {
+    let w = len(word);
+    if p.pos + w > p.n {
+        pFail(p, "非法字面量（期望 " + word + "）");
+        return jNull();
+    }
+    if substr(p.src, p.pos, w) != word {
+        pFail(p, "非法字面量（期望 " + word + "）");
+        return jNull();
+    }
+    p.pos = p.pos + w;
+    return val;
+}
+
+fn pParseNumber(p: JParser) -> Json {
+    let start = p.pos;
+    let neg = false;
+    if p.cs[p.pos] == "-" {
+        neg = true;
+        p.pos = p.pos + 1;
+    }
+    let intDigits = 0;
+    let fracDigits = 0;
+    let expDigits = 0;
+    let hasFrac = false;
+    let hasExp = false;
+    while p.pos < p.n {
+        if digitVal(p.cs[p.pos]) < 0 { break; }
+        intDigits = intDigits + 1;
+        p.pos = p.pos + 1;
+    }
+    if p.pos < p.n && p.cs[p.pos] == "." {
+        hasFrac = true;
+        p.pos = p.pos + 1;
+        while p.pos < p.n {
+            if digitVal(p.cs[p.pos]) < 0 { break; }
+            fracDigits = fracDigits + 1;
+            p.pos = p.pos + 1;
+        }
+    }
+    if p.pos < p.n && (p.cs[p.pos] == "e" || p.cs[p.pos] == "E") {
+        hasExp = true;
+        p.pos = p.pos + 1;
+        if p.pos < p.n && (p.cs[p.pos] == "+" || p.cs[p.pos] == "-") {
+            p.pos = p.pos + 1;
+        }
+        while p.pos < p.n {
+            if digitVal(p.cs[p.pos]) < 0 { break; }
+            expDigits = expDigits + 1;
+            p.pos = p.pos + 1;
+        }
+    }
+    if intDigits == 0 {
+        pFail(p, "数字格式错误");
+        return jNull();
+    }
+    if hasFrac && fracDigits == 0 {
+        pFail(p, "小数点后缺少数字");
+        return jNull();
+    }
+    if hasExp && expDigits == 0 {
+        pFail(p, "指数部分缺少数字");
+        return jNull();
+    }
+    let token = substr(p.src, start, p.pos - start);
+    if hasFrac || hasExp {
+        return jFloat(float(token) or 0.0);
+    }
+    // 纯整数：手动累加并把溢出退化为浮点。负数额外允许 INT64_MIN
+    // （-9223372036854775808 = -(maxv) - 1），避免它被误判成浮点。
+    let maxv = 9223372036854775807;
+    let v = 0;
+    let k = 0;
+    if neg { k = 1; }
+    let kend = len(token);
+    let overflow = false;
+    while k < kend {
+        let d = digitVal(substr(token, k, 1));
+        if v > (maxv - d) / 10 {
+            overflow = true;
+            break;
+        }
+        v = v * 10 + d;
+        k = k + 1;
+    }
+    if overflow {
+        if neg && substr(token, 1, len(token) - 1) == "9223372036854775808" {
+            return jInt((0 - maxv) - 1);
+        }
+        return jFloat(float(token) or 0.0);
+    }
+    if neg { return jInt(0 - v); }
+    return jInt(v);
+}
+
+fn pParseString(p: JParser) -> string {
+    p.pos = p.pos + 1;  // 跳过开引号
+    let out = "";
+    while p.pos < p.n {
+        let c = p.cs[p.pos];
+        if c == "\"" {
+            p.pos = p.pos + 1;
+            return out;
+        }
+        if c == "\\" {
+            p.pos = p.pos + 1;
+            if p.pos >= p.n {
+                pFail(p, "字符串在转义符后结束");
+                return "";
+            }
+            let e = p.cs[p.pos];
+            p.pos = p.pos + 1;
+            if e == "\"" { out = out + "\""; }
+            else if e == "\\" { out = out + "\\"; }
+            else if e == "/" { out = out + "/"; }
+            else if e == "n" { out = out + "\n"; }
+            else if e == "t" { out = out + "\t"; }
+            else if e == "r" { out = out + "\r"; }
+            else if e == "b" { out = out + "\b"; }
+            else if e == "f" { out = out + "\f"; }
+            else if e == "u" {
+                if p.pos + 4 > p.n {
+                    pFail(p, "\\u 转义不完整");
+                    return "";
+                }
+                let h1 = hexVal(p.cs[p.pos]);
+                let h2 = hexVal(p.cs[p.pos + 1]);
+                let h3 = hexVal(p.cs[p.pos + 2]);
+                let h4 = hexVal(p.cs[p.pos + 3]);
+                if h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0 {
+                    pFail(p, "\\u 转义含非十六进制字符");
+                    return "";
+                }
+                p.pos = p.pos + 4;
+                let cp = (h1 << 12) + (h2 << 8) + (h3 << 4) + h4;
+                if cp >= 0xD800 && cp <= 0xDBFF {
+                    if p.pos + 6 <= p.n && p.cs[p.pos] == "\\" &&
+                        p.cs[p.pos + 1] == "u" {
+                        let g1 = hexVal(p.cs[p.pos + 2]);
+                        let g2 = hexVal(p.cs[p.pos + 3]);
+                        let g3 = hexVal(p.cs[p.pos + 4]);
+                        let g4 = hexVal(p.cs[p.pos + 5]);
+                        if g1 < 0 || g2 < 0 || g3 < 0 || g4 < 0 {
+                            pFail(p, "代理对含非十六进制字符");
+                            return "";
+                        }
+                        let lo = (g1 << 12) + (g2 << 8) + (g3 << 4) + g4;
+                        if lo < 0xDC00 || lo > 0xDFFF {
+                            pFail(p, "高代理后缺少低代理");
+                            return "";
+                        }
+                        p.pos = p.pos + 6;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    } else {
+                        pFail(p, "高代理后缺少低代理");
+                        return "";
+                    }
+                } else if cp >= 0xDC00 && cp <= 0xDFFF {
+                    pFail(p, "孤立的低代理");
+                    return "";
+                }
+                out = out + utf8Encode(cp);
+            } else {
+                pFail(p, "非法的转义字符 '\\" + e + "'");
+                return "";
+            }
+        } else {
+            out = out + c;
+            p.pos = p.pos + 1;
+        }
+    }
+    pFail(p, "字符串未闭合");
+    return "";
+}
+
+fn pParseArray(p: JParser, depth: int) -> Json {
+    p.pos = p.pos + 1;  // 跳过 '['
+    let items: Json[] = [];
+    pSkipWs(p);
+    if p.pos < p.n && p.cs[p.pos] == "]" {
+        p.pos = p.pos + 1;
+        return jArray(items);
+    }
+    while true {
+        let v = pParseValue(p, depth);
+        if p.failed { return jNull(); }
+        items.push(v);
+        pSkipWs(p);
+        if p.pos >= p.n {
+            pFail(p, "数组未闭合");
+            return jNull();
+        }
+        let c = p.cs[p.pos];
+        if c == "," {
+            p.pos = p.pos + 1;
+            continue;
+        }
+        if c == "]" {
+            p.pos = p.pos + 1;
+            return jArray(items);
+        }
+        pFail(p, "数组里期望 ',' 或 ']'");
+        return jNull();
+    }
+    return jNull();
+}
+
+fn pParseObject(p: JParser, depth: int) -> Json {
+    p.pos = p.pos + 1;  // 跳过 '{'
+    let keys: string[] = [];
+    let vals: Json[] = [];
+    pSkipWs(p);
+    if p.pos < p.n && p.cs[p.pos] == "}" {
+        p.pos = p.pos + 1;
+        return jObject(keys, vals);
+    }
+    while true {
+        pSkipWs(p);
+        if p.pos >= p.n || p.cs[p.pos] != "\"" {
+            pFail(p, "对象键必须是字符串");
+            return jNull();
+        }
+        let k = pParseString(p);
+        if p.failed { return jNull(); }
+        pSkipWs(p);
+        if p.pos >= p.n || p.cs[p.pos] != ":" {
+            pFail(p, "键后缺少 ':'");
+            return jNull();
+        }
+        p.pos = p.pos + 1;
+        let v = pParseValue(p, depth);
+        if p.failed { return jNull(); }
+        keys.push(k);
+        vals.push(v);
+        pSkipWs(p);
+        if p.pos >= p.n {
+            pFail(p, "对象未闭合");
+            return jNull();
+        }
+        let c = p.cs[p.pos];
+        if c == "," {
+            p.pos = p.pos + 1;
+            continue;
+        }
+        if c == "}" {
+            p.pos = p.pos + 1;
+            return jObject(keys, vals);
+        }
+        pFail(p, "对象里期望 ',' 或 '}'");
+        return jNull();
+    }
+    return jNull();
+}
+
+fn pParseValue(p: JParser, depth: int) -> Json {
+    if p.failed { return jNull(); }
+    if depth > 256 {
+        pFail(p, "嵌套层级过深（上限 256）");
+        return jNull();
+    }
+    pSkipWs(p);
+    if p.pos >= p.n {
+        pFail(p, "意外结束：缺少值");
+        return jNull();
+    }
+    let c = p.cs[p.pos];
+    if c == "\"" { return jStr(pParseString(p)); }
+    if c == "{" { return pParseObject(p, depth + 1); }
+    if c == "[" { return pParseArray(p, depth + 1); }
+    if c == "t" { return pParseLit(p, "true", jBool(true)); }
+    if c == "f" { return pParseLit(p, "false", jBool(false)); }
+    if c == "n" { return pParseLit(p, "null", jNull()); }
+    if c == "-" || (c >= "0" && c <= "9") { return pParseNumber(p); }
+    pFail(p, "无法识别的字符 '" + c + "'");
+    return jNull();
+}
+
+// 解析 JSON 文本；ok=false 时看 error / line / col
+fn parse(text: string) -> JResult {
+    let p = JParser { src: text, cs: chars(text), pos: 0, n: len(text),
+                      failed: false, error: "", line: 1, col: 1 };
+    let v = pParseValue(p, 0);
+    if p.failed {
+        return JResult { ok: false, value: jNull(), error: p.error,
+                         line: p.line, col: p.col };
+    }
+    pSkipWs(p);
+    if p.pos != p.n {
+        pFail(p, "JSON 结尾有多余内容");
+        return JResult { ok: false, value: jNull(), error: p.error,
+                         line: p.line, col: p.col };
+    }
+    return JResult { ok: true, value: v, error: "", line: 1, col: 1 };
+}
+
+// 解析成功返回 some(value)，失败返回 none
+fn decode(text: string) -> Json? {
+    let r = parse(text);
+    if r.ok { return r.value; }
+    return none;
+}
+
+// 解析失败时用 fallback
+fn decodeOr(text: string, fallback: Json) -> Json {
+    let r = parse(text);
+    if r.ok { return r.value; }
+    return fallback;
+}
+
+// 同 decodeOr（兼容命名）
+fn parseOr(text: string, fallback: Json) -> Json {
+    let r = parse(text);
+    if r.ok { return r.value; }
+    return fallback;
+}
+
+// -----------------------------------------------------------------------------
+//  生成
+// -----------------------------------------------------------------------------
+fn hexDigit(d: int) -> string {
+    if d < 0 || d > 15 { return "0"; }
+    return substr("0123456789abcdef", d, 1);
+}
+fn hex4(v: int) -> string {
+    return "\\u00" + hexDigit((v >> 4) & 15) + hexDigit(v & 15);
+}
+
+// 浮点 → JSON 数字文本（非有限值输出 null）
+fn formatFloat(f: float) -> string {
+    if isnan(f) || isinf(f) { return "null"; }
+    let s = string(f);
+    if contains(s, ".") || contains(s, "e") || contains(s, "E") { return s; }
+    return s + ".0";
+}
+
+// 字符串 → 带引号的 JSON 字符串字面量
+fn quote(s: string) -> string {
+    let out = "\"";
+    let cs = chars(s);
+    for c in cs {
+        if c == "\"" { out = out + "\\\""; }
+        else if c == "\\" { out = out + "\\\\"; }
+        else if c == "\n" { out = out + "\\n"; }
+        else if c == "\t" { out = out + "\\t"; }
+        else if c == "\r" { out = out + "\\r"; }
+        else if c == "\b" { out = out + "\\b"; }
+        else if c == "\f" { out = out + "\\f"; }
+        else if c < " " {
+            let ctrl = substr(BYTE_MASTER, 0, 31);
+            let idx = find(ctrl, c);
+            if idx >= 0 { out = out + hex4(idx + 1); }
+        }
+        else { out = out + c; }
+    }
+    return out + "\"";
+}
+
+// 紧凑 JSON（标准 JSON，可直接 feeding 给别的解析器）
+fn stringify(j: Json) -> string {
+    if j.kind == J_NULL { return "null"; }
+    if j.kind == J_BOOL {
+        if j.b { return "true"; }
+        return "false";
+    }
+    if j.kind == J_INT { return string(j.i); }
+    if j.kind == J_FLOAT { return formatFloat(j.f); }
+    if j.kind == J_STR { return quote(j.s); }
+    if j.kind == J_ARR {
+        let out = "[";
+        let i = 0;
+        while i < len(j.arr) {
+            if i > 0 { out = out + ","; }
+            out = out + stringify(j.arr[i]);
+            i = i + 1;
+        }
+        return out + "]";
+    }
+    let out = "{";
+    let i = 0;
+    while i < len(j.keys) {
+        if i > 0 { out = out + ","; }
+        out = out + quote(j.keys[i]) + ":" + stringify(j.vals[i]);
+        i = i + 1;
+    }
+    return out + "}";
+}
+
+fn indentStr(n: int) -> string {
+    let s = "";
+    let i = 0;
+    while i < n {
+        s = s + "  ";
+        i = i + 1;
+    }
+    return s;
+}
+
+fn prettyIndent(j: Json, depth: int) -> string {
+    if j.kind == J_ARR {
+        if len(j.arr) == 0 { return "[]"; }
+        let pad = indentStr(depth + 1);
+        let out = "[\n";
+        let i = 0;
+        while i < len(j.arr) {
+            if i > 0 { out = out + ",\n"; }
+            out = out + pad + prettyIndent(j.arr[i], depth + 1);
+            i = i + 1;
+        }
+        return out + "\n" + indentStr(depth) + "]";
+    }
+    if j.kind == J_OBJ {
+        if len(j.keys) == 0 { return "{}"; }
+        let pad = indentStr(depth + 1);
+        let out = "{\n";
+        let i = 0;
+        while i < len(j.keys) {
+            if i > 0 { out = out + ",\n"; }
+            out = out + pad + quote(j.keys[i]) + ": " +
+                  prettyIndent(j.vals[i], depth + 1);
+            i = i + 1;
+        }
+        return out + "\n" + indentStr(depth) + "}";
+    }
+    return stringify(j);
+}
+
+// 两空格缩进的美化输出
+fn pretty(j: Json) -> string {
+    return prettyIndent(j, 0);
+}
+
+// -----------------------------------------------------------------------------
+//  文件读写
+// -----------------------------------------------------------------------------
+fn readJson(path: string) -> JResult {
+    if !exists(path) {
+        return JResult { ok: false, value: jNull(),
+                         error: "文件不存在：" + path, line: 1, col: 1 };
+    }
+    let text = read(path) or "";
+    let r = parse(text);
+    if !r.ok { return r; }
+    return r;
+}
+
+fn readJsonOr(path: string, fallback: Json) -> Json {
+    let r = readJson(path);
+    if r.ok { return r.value; }
+    return fallback;
+}
+
+fn writeJson(path: string, j: Json) -> bool {
+    return write(path, stringify(j));
+}
+fn writeJsonPretty(path: string, j: Json) -> bool {
+    return write(path, pretty(j));
+}

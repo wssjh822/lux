@@ -1,0 +1,16 @@
+// 0.8（C11）：float 数组元素读取（aarch64 原生后端曾把 xmm 装载编码写错）
+fn main() {
+    let xs = [1.5, 2.5, 3.5];
+    println(xs[0]);
+    println(xs[1]);
+    println(xs[2]);
+    let i = 1;
+    println(xs[i]);
+    println(xs[0] + xs[1] + xs[2]);
+    let ys: float[] = [1, 2, 3];
+    println(ys[0]);
+    println(ys[2]);
+    let total = 0.0;
+    for x in xs { total += x; }
+    println(total);
+}

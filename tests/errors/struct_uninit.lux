@@ -1,0 +1,5 @@
+struct P { let x: int; }
+fn main() {
+    let p: P;
+    println(p.x);
+}

@@ -1,0 +1,5 @@
+// 可选类型不能作为 struct 字段类型
+struct P { v: int?; }
+fn main() {
+    println("x");
+}

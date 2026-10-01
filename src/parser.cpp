@@ -140,6 +140,7 @@ void Parser::syncStmt() {
                            k == Tok::KwLoop || k == Tok::KwBreak ||
                            k == Tok::KwContinue || k == Tok::KwReturn ||
                            k == Tok::KwRepeat || k == Tok::KwImport ||
+                           k == Tok::KwFrom ||
                            k == Tok::KwExtern || k == Tok::KwStruct)) {
             return;
         }
@@ -156,6 +157,7 @@ void Parser::syncTopLevel() {
         if (k == Tok::LBrace || k == Tok::LBracket) depth++;
         if ((k == Tok::RBrace || k == Tok::RBracket) && depth > 0) depth--;
         if (depth == 0 && (k == Tok::KwFn || k == Tok::KwImport ||
+                           k == Tok::KwFrom ||
                            k == Tok::KwExtern || k == Tok::KwConst ||
                            k == Tok::KwStruct)) {
             return;
@@ -173,6 +175,10 @@ const Ty* Parser::parseTypeTok() {
     if (at(Tok::LBracket)) {
         advance();
         const Ty* elem = parseTypeTok();
+        if (elem->kind == TyKind::Optional) {
+            errorHere("可选类型不能作为数组元素类型（T? 只活于局部 / 参数 / "
+                      "返回值）；请改用 T[] 或 T[]?");
+        }
         expect(Tok::RBracket, "']' 结束数组类型");
         return TyStore::arrayOf(elem);
     }
@@ -208,11 +214,23 @@ const Ty* Parser::parseTypeTok() {
                       "名，或数组类型 int[] / [int] 等）");
             return TyStore::invalid();  // 不可达（errorHere 会抛出）
     }
-    // 数组类型（后缀形式）： int[] / int[][]（0.5 新增）
-    while (at(Tok::LBracket)) {
-        advance();
-        expect(Tok::RBracket, "']'（数组类型写作 int[] 或 [int]）");
-        base = TyStore::arrayOf(base);
+    // 数组类型（后缀形式）： int[] / int[][]（0.5 新增），
+    // 可选类型后缀： int? / int?? / int[]?（0.8）——从左到右依次绑定
+    for (;;) {
+        if (at(Tok::LBracket)) {
+            advance();
+            expect(Tok::RBracket, "']'（数组类型写作 int[] 或 [int]）");
+            if (base->kind == TyKind::Optional) {
+                errorHere("可选类型不能作为数组元素类型（T? 只活于局部 / "
+                          "参数 / 返回值）；请改用 T[] 或 T[]?");
+            }
+            base = TyStore::arrayOf(base);
+        } else if (at(Tok::Question)) {
+            advance();
+            base = TyStore::optionalOf(base);
+        } else {
+            break;
+        }
     }
     return base;
 }
@@ -233,7 +251,7 @@ TypeAnn Parser::parseTypeAnn() {
 Program* Parser::parseProgram() {
     while (!at(Tok::Eof)) {
         try {
-            if (at(Tok::KwImport)) {
+            if (at(Tok::KwImport) || isFromKeyword()) {
                 program_.imports.push_back(parseImport());
             } else if (at(Tok::KwExtern)) {
                 program_.funcs.push_back(parseExternFn());
@@ -258,24 +276,42 @@ Program* Parser::parseProgram() {
     return &program_;
 }
 
-// 顶层 import： import "路径" (as 别名)? ;
+// 顶层 import：
+//   import "路径" (as 别名)? ;
+//   from "路径" import a, b, ... ;      （0.9.3：选择性导入）
+//   from "路径" import * ;              （等价于默认导入）
+// #import "路径"; 由预处理阶段还原成 import，同样走这里。
 ImportDecl* Parser::parseImport() {
     SourceLoc l = cur().loc;
-    expect(Tok::KwImport, "'import'");
+    bool fromForm = isFromKeyword();
+    if (fromForm) advance();
+    else expect(Tok::KwImport, "'import'");
     Token p = expect(Tok::StrLit,
                      "导入路径（字符串），例如 import \"math\"、import "
                      "\"./util.lux\" 或 import \"c:m\"");
-    std::string alias;
-    if (match(Tok::KwAs)) {
-        alias = expect(Tok::Ident, "别名").text;
-    }
-    expect(Tok::Semicolon, "';'");
     importPool_.push_back(std::make_unique<ImportDecl>());
     auto* imp = importPool_.back().get();
     imp->path = p.text;
-    imp->alias = std::move(alias);
     imp->loc = l;
     imp->file = filename_;
+    if (fromForm) {
+        imp->selective = true;
+        expect(Tok::KwImport, "'import'（from \"路径\" import 成员）");
+        if (at(Tok::Star)) {
+            advance();
+            imp->star = true;
+        } else {
+            for (;;) {
+                Token n = expect(Tok::Ident, "要导入的成员名");
+                imp->names.push_back(n.text);
+                if (match(Tok::Comma)) continue;
+                break;
+            }
+        }
+    } else if (match(Tok::KwAs)) {
+        imp->alias = expect(Tok::Ident, "别名").text;
+    }
+    expect(Tok::Semicolon, "';'");
     return imp;
 }
 
@@ -612,13 +648,18 @@ Expr* Parser::parseExpr() {
 }
 
 // or := and (('||' | 'or') and)*
+// 0.8：or 关键字形式打上 orKeyword 标记，Sema 按左操作数类型分派
+// （bool → 逻辑或；T? → 兜底）。'||' 始终是逻辑或。
 Expr* Parser::parseOr() {
     Expr* lhs = parseAnd();
     while (at(Tok::OrOr) || at(Tok::KwOr)) {
         SourceLoc l = cur().loc;
+        bool isKw = at(Tok::KwOr);
         advance();
         Expr* rhs = parseAnd();
-        lhs = newExpr<BinaryExpr>(l, BinOp::LogicOr, lhs, rhs);
+        auto* b = newExpr<BinaryExpr>(l, BinOp::LogicOr, lhs, rhs);
+        b->orKeyword = isKw;
+        lhs = b;
     }
     return lhs;
 }
@@ -809,6 +850,11 @@ Expr* Parser::parsePostfix(Expr* e) {
             advance();  // '.'
             Token m = advance();
             e = newExpr<MemberExpr>(m.loc, e, m.text, m.loc);
+        } else if (at(Tok::Question)) {
+            // 错误传播后缀 expr?（0.8）
+            SourceLoc l = cur().loc;
+            advance();
+            e = newExpr<TryExpr>(l, e);
         } else {
             break;
         }
@@ -866,6 +912,9 @@ Expr* Parser::parsePrimaryBase() {
             advance();
             return newExpr<BoolLitExpr>(l, false);
         }
+        case Tok::KwNone:
+            advance();
+            return newExpr<NoneLitExpr>(l);
         case Tok::KwIf:
             return parseIfExpr();
         case Tok::LParen: {
@@ -886,14 +935,19 @@ Expr* Parser::parsePrimaryBase() {
             expect(Tok::RBracket, "']' 结束数组字面量");
             return newExpr<ArrayLitExpr>(l, std::move(elems));
         }
-        // 类型转换： int(x) / float(x) / string(x)
+        // 类型转换： int(x) / float(x) / string(x)，panic 变体 int!(x)（0.8）
         case Tok::KwInt:
         case Tok::KwFloat:
         case Tok::KwString: {
-            if (peek(1).kind == Tok::LParen) {
+            bool bang = peek(1).kind == Tok::Bang &&
+                        peek(2).kind == Tok::LParen;
+            if (peek(1).kind == Tok::LParen || bang) {
                 Token kw = advance();
-                advance();  // '('
-                return finishCall(l, kw.text, kw.loc);
+                if (bang) advance();  // '!'
+                advance();            // '('
+                Expr* call = finishCall(l, kw.text, kw.loc);
+                if (bang) static_cast<CallExpr*>(call)->panicVariant = true;
+                return call;
             }
             errorHere("类型名只能在类型标注或类型转换中出现");
         }
@@ -908,12 +962,17 @@ Expr* Parser::parsePrimaryBase() {
                 parts.emplace_back(m.text, m.loc);
             }
             // 函数调用：限定名整体作为 callee（mod.fn / a.push）
-            if (at(Tok::LParen)) {
-                advance();  // '('
+            // 0.8：panic 变体 name!(...)（如 read! / int!），失败即退出
+            bool bang = at(Tok::Bang) && peek(1).kind == Tok::LParen;
+            if (at(Tok::LParen) || bang) {
+                if (bang) advance();  // '!'
+                advance();            // '('
                 std::string full = parts[0].first;
                 for (size_t i = 1; i < parts.size(); i++)
                     full += "." + parts[i].first;
-                return finishCall(l, full, name.loc);
+                Expr* call = finishCall(l, full, name.loc);
+                if (bang) static_cast<CallExpr*>(call)->panicVariant = true;
+                return call;
             }
             // struct 字面量 Point { x: 1, y: 2 }（0.7）
             // 只在 '{' 后是 '}' 或 IDENT ':' 时判定，避免与普通语句块冲突。

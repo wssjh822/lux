@@ -342,7 +342,10 @@ struct Arm64 {
     }
     void movsdSib(int xmm, int base, int idx, int scale) {
         if (scale == 3) {
-            emit32(0xFD600800u | ((uint32_t)(R(idx) & 31) << 16) | (3u << 13) | (1u << 12) |
+            // ldr <Dt>, [Xn, Xm, lsl #3]：基码 0xFC600800
+            // （旧值 0xFD600800 多置了 bit24，被译码成别的指令，
+            //  导致 float 数组元素读出来全是 0——C11，0.8 修正）
+            emit32(0xFC600800u | ((uint32_t)(R(idx) & 31) << 16) | (3u << 13) | (1u << 12) |
                    ((uint32_t)(R(base) & 31) << 5) | (uint32_t)(xmm & 31));
         } else {
             emit32(0x8B000000u | ((uint32_t)(R(idx) & 31) << 16) | ((uint32_t)(scale & 31) << 10) |

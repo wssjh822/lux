@@ -1,0 +1,40 @@
+// ARC 压力：大量构造 / 释放字符串、数组、struct，输出确定
+struct Pair { a: string; b: string[]; }
+
+fn make(i: int) -> Pair {
+    let parts: string[] = [];
+    let j = 0;
+    while j < i % 3 {
+        parts.push("p" + string(j));
+        j += 1;
+    }
+    return Pair { a: "k" + string(i), b: parts };
+}
+
+fn main() {
+    let total = 0;
+    let i = 0;
+    while i < 2000 {
+        let p = make(i);
+        let s = p.a + "/" + string(len(p.b));
+        total += len(s);
+        i += 1;
+    }
+    println(total);
+
+    let acc: string[] = [];
+    let k = 0;
+    while k < 100 {
+        acc.push("x" + string(k));
+        if k % 7 == 0 { acc.pop(); }
+        k += 1;
+    }
+    println(len(acc));
+    println(acc[0] + acc[len(acc) - 1]);
+
+    let t = "";
+    for c in "abcdef" {
+        t = t + c + c;
+    }
+    println(t);
+}

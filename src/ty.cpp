@@ -88,6 +88,10 @@ const Ty* TyStore::named(const std::string& name) {
     return pool().intern(Ty{TyKind::Named, nullptr, {}, name});
 }
 
+const Ty* TyStore::optionalOf(const Ty* elem) {
+    return pool().intern(Ty{TyKind::Optional, elem, {}, ""});
+}
+
 std::string tyName(const Ty* t) {
     if (!t) return "<未知类型>";
     switch (t->kind) {
@@ -99,6 +103,7 @@ std::string tyName(const Ty* t) {
         case TyKind::Void:    return "void";
         case TyKind::Named:   return t->name;
         case TyKind::Array:   return tyName(t->elem) + "[]";
+        case TyKind::Optional: return tyName(t->elem) + "?";
         case TyKind::Fn: {
             std::string s = "fn(";
             for (size_t i = 0; i < t->members.size(); i++) {

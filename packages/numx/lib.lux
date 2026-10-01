@@ -1,0 +1,50 @@
+// ============================================================
+//  numx —— Lux 官方包示例：依赖 mathx 的整数分解工具
+//  安装： luxc install numx   （会自动先把 mathx 装上）
+//  使用： import "numx";
+// ============================================================
+import "mathx";
+
+// 返回 n 的质因数（升序）；n 为 0 / 1 时返回空数组
+fn prime_factors(n: int) -> int[] {
+    let out: int[] = [];
+    let x = abs(n);
+    let d = 2;
+    while d * d <= x {
+        while x % d == 0 {
+            out.push(d);
+            x = x / d;
+        }
+        d = d + 1;
+    }
+    if x > 1 { out.push(x); }
+    return out;
+}
+
+// 约数个数（含 1 与自身）
+fn divisor_count(n: int) -> int {
+    let x = abs(n);
+    if x == 0 { return 0; }
+    let count = 0;
+    let d = 1;
+    while d * d <= x {
+        if x % d == 0 {
+            if d * d == x { count = count + 1; }
+            else { count = count + 2; }
+        }
+        d = d + 1;
+    }
+    return count;
+}
+
+// 用 mathx 的 is_prime 找出第 k 个素数（k 从 1 开始）
+fn nth_prime(k: int) -> int {
+    if k <= 0 { return 0; }
+    let found = 0;
+    let n = 1;
+    while found < k {
+        n = n + 1;
+        if is_prime(n) { found = found + 1; }
+    }
+    return n;
+}

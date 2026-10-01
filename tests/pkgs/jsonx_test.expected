@@ -1,0 +1,19 @@
+object
+1
+x中
+true
+1.5
+{"a":1,"b":[true,null,"x中"],"c":1.5}
+{
+  "a": 1,
+  "b": [
+    true,
+    null,
+    "x中"
+  ],
+  "c": 1.5
+}
+true
+4
+false
+非法字面量（期望 true） @2:8

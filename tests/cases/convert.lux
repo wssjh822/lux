@@ -1,8 +1,8 @@
 // 类型转换与内置函数
 fn main() {
     println(int(2.7));
-    println(int("1024"));
-    println(float("0.5"));
+    println(int!("1024"));
+    println(float!("0.5"));
     println(float(5));
     println(string(1) + string(2) + string(3));
     println(len(string(12345)));

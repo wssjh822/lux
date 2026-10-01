@@ -1,0 +1,9 @@
+const SELECT_TAG: string = "sel";
+
+fn pick(x: int) -> int {
+    return x + 1;
+}
+
+fn drop(x: int) -> int {
+    return x - 1;
+}

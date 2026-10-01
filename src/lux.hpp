@@ -32,6 +32,7 @@ inline constexpr const char* kLex            = "E0001";  // 词法错误
 inline constexpr const char* kParse          = "E0002";  // 语法错误
 inline constexpr const char* kSema           = "E0003";  // 语义 / 类型错误
 inline constexpr const char* kModule         = "E0004";  // 模块 / import / 文件错误
+inline constexpr const char* kEStructReturn  = "E0005";  // struct 函数存在不 return 的路径
 inline constexpr const char* kWUnusedVar     = "W1001";  // 未使用的变量 / 参数
 inline constexpr const char* kWNoEffect      = "W1002";  // 表达式结果未被使用
 inline constexpr const char* kWMissingReturn = "W1003";  // 函数末尾缺少 return
@@ -101,6 +102,7 @@ enum class TyKind {
     Array,    // elem[]（预留给数组 / 切片）
     Tuple,    // (a, b, c)（预留给多返回值 / struct 展开）
     Named,    // 具名类型（预留给 struct / enum）
+    Optional, // T?（0.8 错误通道：可能缺失 / 失败的值）
 };
 
 struct Ty {
@@ -123,6 +125,8 @@ public:
     static const Ty* arrayOf(const Ty* elem);
     static const Ty* tupleOf(std::vector<const Ty*> members);
     static const Ty* named(const std::string& name);
+    // 可选类型 T?（0.8）：elem 为 T，intern 化后指针相等依然成立
+    static const Ty* optionalOf(const Ty* elem);
 };
 
 std::string tyName(const Ty* t);
@@ -167,6 +171,7 @@ enum class Tok {
     KwOr,    // or
     KwNot,   // not
     KwImport,   // import
+    KwFrom,     // from（0.9.3：from "mod" import a, b）
     KwExtern,   // extern
     KwAs,       // as（import 别名）
     KwElif,     // elif（else if 的别名）
@@ -174,6 +179,7 @@ enum class Tok {
     KwStruct,   // struct（0.7）
     KwNan,      // nan 字面量（0.7）
     KwInf,      // inf 字面量（0.7）
+    KwNone,     // none 字面量（0.8）
 
     // 类型关键字
     KwInt,
@@ -229,6 +235,7 @@ enum class Tok {
     CaretEq,    // ^=
     ShlEq,      // <<=
     ShrEq,      // >>=
+    Question,   // ?（0.8：类型位 T? / 表达式后缀 expr?）
 };
 
 const char* tokName(Tok t);
@@ -273,6 +280,8 @@ enum class ExprKind {
     StructLit,  // Point { x: 1, y: 2 }（0.7 新增）
     Member,     // p.x（0.7 新增）
     If,         // if c { a } else { b }（0.7 新增，表达式形态）
+    NoneLit,    // none 字面量（0.8 新增）
+    Try,        // expr?（0.8 新增：错误传播后缀）
 };
 
 enum class BinOp {
@@ -458,6 +467,10 @@ struct BinaryExpr : Expr {
     BinOp op;
     Expr* lhs = nullptr;
     Expr* rhs = nullptr;
+    // 0.8：`lhs or rhs` 的 or 关键字形式。当 lhs 是 T? 时按兜底（fallback）
+    // 语义解释；否则仍按逻辑或解释（A3.1 按左操作数类型分派）。
+    bool orKeyword = false;
+    bool orFallback = false;  // Sema 填充：确实走了兜底语义
     // 常量折叠结果（Sema 填充）：folded 为 true 时代码生成直接使用字面量
     bool folded = false;
     bool foldedIsStr = false;
@@ -481,6 +494,8 @@ struct CallExpr : Expr {
     std::vector<Expr*> args;
     Builtin builtin = Builtin::None;  // Sema 填充
     struct FuncDecl* target = nullptr;  // Sema 填充（用户函数）
+    // 0.8：panic 变体调用（如 int!(s) / read!(p)），失败时退出而不是返回 T?
+    bool panicVariant = false;
     // 数组方法调用（a.push(x)）：Sema 填充接收者变量名，代码生成用它
     // 定位 C 变量；methodRecv 为空 = 不是方法调用。
     std::string methodRecv;
@@ -559,6 +574,18 @@ struct IfExpr : Expr {
     Expr* elseVal = nullptr;
     IfExpr(SourceLoc l, Expr* c, Expr* t, Expr* e)
         : Expr(ExprKind::If, l), cond(c), thenVal(t), elseVal(e) {}
+};
+
+// none 字面量（0.8）：类型由上下文（hint）确定为某个 T?，无 hint 时报错
+struct NoneLitExpr : Expr {
+    explicit NoneLitExpr(SourceLoc l) : Expr(ExprKind::NoneLit, l) {}
+};
+
+// 错误传播后缀 expr?（0.8）：operand 必须是 T?，在返回类型为 U? 的函数里
+// 失败时直接向上返回 none，成功时解包出 T
+struct TryExpr : Expr {
+    Expr* operand = nullptr;
+    TryExpr(SourceLoc l, Expr* e) : Expr(ExprKind::Try, l), operand(e) {}
 };
 
 enum class StmtKind {
@@ -759,6 +786,10 @@ struct ImportDecl {
     std::string alias;  // 空 = 默认导入（成员可直接使用）
     SourceLoc loc;
     std::string file;  // 声明所在的源文件
+    // 0.9.3：from "mod" import a, b; / from "mod" import *;
+    bool selective = false;          // 是否选择性导入
+    bool star = false;               // import *（等价于默认导入）
+    std::vector<std::string> names;  // 选择性导入的成员名
 };
 
 struct Program {
@@ -804,6 +835,11 @@ private:
     const Token& cur() const { return peek(0); }
     Token advance();
     bool at(Tok k) const { return cur().kind == k; }
+    // 0.9.3：'from' 是上下文关键字（只在顶层 "from \"路径\" import" 里
+    // 生效），这样用户仍可把 from 当普通标识符（native_rt.lux 就有）。
+    bool isFromKeyword() const {
+        return cur().kind == Tok::Ident && cur().text == "from";
+    }
     bool match(Tok k);
     Token expect(Tok k, const char* what);
     [[noreturn]] void errorHere(const std::string& msg);
@@ -876,6 +912,16 @@ struct ModuleInfo {
     std::set<std::string> imported;  // 已 import 的全部模块名（别名导入也算）
     std::set<std::string> flat;      // 默认导入（成员注入全局命名空间）
     std::unordered_map<std::string, std::string> aliases;  // 别名 -> 模块名
+    // 0.9.3：from "mod" import a, b; —— 只把列出的成员注入全局命名空间
+    std::unordered_map<std::string, std::set<std::string>> selected;
+
+    // 成员 name 是否通过某个 import 注入全局命名空间
+    bool memberVisible(const std::string& mod, const std::string& name) const {
+        if (flat.count(mod)) return true;
+        auto it = selected.find(mod);
+        if (it == selected.end()) return false;
+        return it->second.count("*") || it->second.count(name);
+    }
 };
 
 // 对整个程序做符号解析与类型检查；发现错误时返回 false。
@@ -924,6 +970,7 @@ private:
 
 struct CodegenOptions {
     bool emitLineMarks = false;  // 是否在生成的 C 里插入 Lux 源码行号注释
+    bool arc = false;            // 0.9.2：实验性 ARC（C 后端）引用计数回收
     std::string sourceName;
 };
 
@@ -934,8 +981,8 @@ std::string generateC(Program* prog, const CodegenOptions& opt);
 //  代码生成（原生后端，0.6）
 // =============================================================================
 
-// 直接生成 x86-64 Linux ELF 可执行文件（不依赖 C 编译器 / libc）。
-// 失败返回 false（诊断经 diags 报告）。
+// 直接生成本机架构（x86-64 / aarch64）的 Linux ELF 可执行文件
+//（不依赖 C 编译器 / libc）。失败返回 false（诊断经 diags 报告）。
 bool generateNative(Program* prog, Diags& diags, const std::string& sourceName,
                     std::vector<uint8_t>& outElf);
 
@@ -959,6 +1006,38 @@ bool jsonStringField(const std::string& text, const std::string& key,
 // 从极简 JSON 文本中读取 "key": ["s1", "s2", ...]（数组元素只能是字符串）
 bool jsonStringArray(const std::string& text, const std::string& key,
                      std::vector<std::string>& out);
+
+// -----------------------------------------------------------------------------
+//  JSON（json.cpp）：包注册表 / lux.json 都是嵌套 JSON，需要完整解析
+// -----------------------------------------------------------------------------
+struct JsonValue {
+    enum class Kind { Null, Bool, Num, Str, Arr, Obj };
+    Kind kind = Kind::Null;
+    bool boolean = false;
+    double number = 0;
+    std::string str;
+    std::vector<JsonValue> arr;
+    std::vector<std::pair<std::string, JsonValue>> obj;
+
+    // 对象取字段（不存在 / 类型不是对象时返回 nullptr）
+    const JsonValue* find(const std::string& key) const;
+    // 数组按下标取元素
+    const JsonValue* at(size_t idx) const;
+    std::string asString(const std::string& def = "") const;
+    double asNumber(double def = 0) const;
+    bool asBool(bool def = false) const;
+};
+
+// 解析 JSON；失败时把原因（含行列）写入 err
+bool jsonParse(const std::string& text, JsonValue& out, std::string& err);
+// 转义成 JSON 字符串内容（不含两端的引号）
+std::string jsonEscape(const std::string& s);
+// 序列化（缩进两空格，末尾带换行）
+std::string jsonDump(const JsonValue& v);
+
+// SHA-256（十六进制小写），用于校验下载的包与生成注册表元数据
+std::string sha256Hex(const std::string& data);
+bool sha256File(const std::string& path, std::string& hex);
 
 // 包管理根目录：优先 $LUX_HOME，否则 $HOME/.lux（都没有则 "./.lux"）
 std::string luxHome();
@@ -985,15 +1064,66 @@ int runRepl();
 
 struct PkgInfo {
     std::string name;
-    std::string main;  // 入口文件（相对包目录），未知时为空
-    int files = 0;     // 包目录顶层 .lux 文件数量
+    std::string version;  // 已安装版本（未知 / 本地包为空）
+    std::string main;     // 入口文件（相对包目录），未知时为空
+    std::string source;   // 安装来源：registry / url / local
+    std::string origin;   // 具体来源（URL 或本地路径）
+    int files = 0;        // 包目录顶层 .lux 文件数量
+    std::vector<std::string> deps;  // 依赖（"名字" 或 "名字@约束"）
 };
 
-// 安装包：path 是 .lux 文件或包目录；成功时把包名写入 name
+// 安装本地包：path 是 .lux 文件或包目录；成功时把包名写入 name
 bool pkgAdd(const std::string& path, std::string& name, std::string& err);
 // 列出已安装的包（按名字排序）；还没安装过任何包时返回空
 std::vector<PkgInfo> pkgList();
 // 删除包
 bool pkgDelete(const std::string& name, std::string& err);
+
+// -----------------------------------------------------------------------------
+//  在线包管理（0.9）：从注册表 / URL 下载安装
+//
+//  spec 的几种形态：
+//    "mathx"              注册表能力范围内的最新版本
+//    "mathx@1.2.0"        指定版本
+//    "mathx@^1.2"         满足语义化版本约束的最高版本
+//    "https://.../x.tar.gz" / "ftp://.../x.lux"   直接下载
+//    "./mypkg" / "util.lux"                      本地路径（等价 add）
+// -----------------------------------------------------------------------------
+
+// 注册表地址：$LUX_REGISTRY 优先，否则 ~/.lux/config 的 "registry"，
+// 最后回落到官方默认（https://lux.xfes.top/lux/lux.php）
+std::string registryUrl();
+// 把注册表地址写进 ~/.lux/config.json（空串 = 清除，回到默认）
+bool setRegistryUrl(const std::string& url);
+
+// 安装 spec；force=true 时覆盖已安装版本。成功时写回 installedName
+bool pkgInstall(const std::string& spec, bool force, std::string& err,
+                std::string& installedName);
+// 刷新本地注册表缓存（~/.lux/cache/index.json）
+bool pkgUpdateRegistry(std::string& err);
+// 搜索注册表（query 为空 = 列出全部）；结果按名字排序
+bool pkgSearch(const std::string& query, std::vector<PkgInfo>& out,
+               std::string& err);
+// 生成某个包的详细信息文本（来自注册表）
+bool pkgInfo(const std::string& name, std::string& out, std::string& err);
+// 把已安装包升级到注册表最新版本（name 为空 = 全部）
+bool pkgUpgrade(const std::string& name, std::string& err);
+// 发布本地包目录到注册表（HTTP 账号登录后走 API；ftp 注册表走 FTP）
+bool pkgPublish(const std::string& dir, std::string& err);
+// 删除自己发布在注册表上的包（HTTP API，需登录）
+bool pkgUnpublish(const std::string& name, const std::string& version,
+                  std::string& err);
+
+// -----------------------------------------------------------------------------
+//  账号（luxc login / logout / whoami）
+// -----------------------------------------------------------------------------
+// 当前 API 令牌：$LUX_TOKEN 优先，否则 ~/.lux/config.json 的 "token"
+std::string authToken();
+std::string authUser();
+// 登录并把令牌写入配置；成功时把用户名写入 userOut
+bool luxLogin(const std::string& user, const std::string& pass,
+              std::string& userOut, std::string& err);
+bool luxLogout(std::string& err);
+bool luxWhoami(std::string& userOut, std::string& err);
 
 }  // namespace lux

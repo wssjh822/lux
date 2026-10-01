@@ -2,7 +2,7 @@
 //  types.lux —— 基础类型、字面量、运算符与类型转换
 // ============================================================
 
-const VERSION: string = "0.1";
+const VERSION: string = "0.9";
 const MAX: int = 100;
 
 fn main() {
@@ -61,8 +61,8 @@ fn main() {
     println(int(-3.99));                // -3
     println(float(3) / 2.0);            // 1.5
     println(string(42) + " 是答案");
-    println(int("123") + 1);            // 124
-    println(float("3.5") * 2.0);        // 7
+    println(int!("123") + 1);            // 124（! = 失败即 panic）
+    println(float!("3.5") * 2.0);        // 7
     println(string(true) + " / " + string(false));
 
     // ---- 常量 ----

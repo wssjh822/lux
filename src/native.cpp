@@ -30,7 +30,7 @@ namespace {
 // aarch64 的 Linux 系统调用号与 x86-64 不同。运行时库源码统一按 x86-64 编号
 // 书写直接调用的系统调用，这里在编译运行时库前把相关全局常量改写为目标架构
 // 的编号（open/fork/unlink/rename 这类结构性差异已由 __sys_* 内建吸收）。
-static void patchArm64SyscallNumbers(Program* rt) {
+static bool patchArm64SyscallNumbers(Program* rt, Diags& diags) {
     struct { const char* name; long long val; } mapping[] = {
         {"kSysRead",          63},
         {"kSysWrite",         64},
@@ -43,18 +43,38 @@ static void patchArm64SyscallNumbers(Program* rt) {
         {"kSysClockGettime", 113},
         {"kSysExitGroup",     94},
     };
+    bool matched[sizeof(mapping) / sizeof(mapping[0])] = {false};
     for (GlobalConstDecl* gc : rt->consts) {
-        for (const auto& m : mapping) {
-            if (gc->name == m.name && gc->init &&
-                gc->init->kind == ExprKind::IntLit) {
-                static_cast<IntLitExpr*>(gc->init)->value = m.val;
+        for (size_t i = 0; i < sizeof(mapping) / sizeof(mapping[0]); i++) {
+            const auto& m = mapping[i];
+            if (gc->name != m.name) continue;
+            matched[i] = true;
+            // 0.8（C7）：常量存在但不是整数字面量 → 编译器内部错误，
+            // 明确报出来，而不是静默地留下错误编号。
+            if (!gc->init || gc->init->kind != ExprKind::IntLit) {
+                diags.error(DiagCode::kSema, "native_rt.lux", gc->nameLoc,
+                            std::string("内部错误：syscall 常量 '") + m.name +
+                                "' 不是整数字面量（编译器缺陷）");
+                return false;
             }
+            static_cast<IntLitExpr*>(gc->init)->value = m.val;
         }
     }
+    // C7 补丁（另一半）：常量整个不存在（被改名 / 删除）时，旧实现会静默地
+    // 让 arm64 用上 x86-64 的系统调用号——现在显式报内部错误。
+    for (size_t i = 0; i < sizeof(mapping) / sizeof(mapping[0]); i++) {
+        if (!matched[i]) {
+            diags.error(DiagCode::kSema, "native_rt.lux", SourceLoc{1, 1},
+                        std::string("内部错误：运行时库缺少 syscall 常量 '") +
+                            mapping[i].name + "'（编译器缺陷）");
+            return false;
+        }
+    }
+    return true;
 }
 #endif
 
-// 生成 x86-64 Linux ELF（不依赖 C 编译器 / libc）。见 lux.hpp 接口说明。
+// 生成本机架构的 Linux ELF（不依赖 C 编译器 / libc）。见 lux.hpp 接口说明。
 bool generateNative(Program* prog, Diags& diags, const std::string& sourceName,
                     std::vector<uint8_t>& outElf) {
     NativeGen g;
@@ -76,7 +96,7 @@ bool generateNative(Program* prog, Diags& diags, const std::string& sourceName,
         }
         g.inRuntime = true;
 #if defined(__aarch64__)
-        patchArm64SyscallNumbers(rt);
+        if (!patchArm64SyscallNumbers(rt, diags)) return false;
 #endif
         g.genProgram(rt, true);
     }

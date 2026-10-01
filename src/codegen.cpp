@@ -4,8 +4,8 @@
 //  设计要点：
 //    * 每个 Lux 类型直接映射到最贴近的 C 类型，没有装箱、没有虚表
 //      int -> int64_t   float -> double   bool -> bool   string -> const char*
-//    * 用户标识符统一加 "lx_" 前缀，避免与 C 关键字/库符号冲突；
-//      来自模块的声明再加模块名前缀（lx_模块_名字）
+//    * 用户标识符统一加 "lxv_" / "lxm_" 前缀，避免与 C 关键字 / 库符号 / 运行时
+//      lx_* 命名空间冲突；来自模块的声明再加模块名前缀（lxm_模块_名字）
 //    * 生成的 C 自带运行时（打印、字符串、转换、读行、除零检查）
 //    * 用 #line 指令把 C 编译器的诊断信息指回 .lux 源文件的行号
 // =============================================================================
@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <string>
 
 namespace lux {
@@ -24,6 +25,12 @@ namespace {
 // -----------------------------------------------------------------------------
 const char* kRuntime = R"CLUX_RUNTIME(
 /* ------------------------- Lux 运行时 ------------------------- */
+/* 抑制 GCC 对静态字面量对象（refs = -1）的 free 误报：
+   lx_gc_release 中 refs<0 必然提前返回，但 GCC 内联 + 常量传播后仍会
+   触发 -Wfree-nonheap-object（已知假阳性）。 */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
 #define _POSIX_C_SOURCE 200809L  /* clock_gettime / nanosleep */
 #define _DEFAULT_SOURCE          /* random / srandom */
 #include <stdio.h>
@@ -34,6 +41,7 @@ const char* kRuntime = R"CLUX_RUNTIME(
 #include <stdarg.h>
 #include <math.h>
 #include <ctype.h>
+#include <errno.h>
 #include <time.h>
 #include <sys/wait.h>
 
@@ -73,10 +81,48 @@ static inline int64_t lx_str_len(const char* s) { return (int64_t)strlen(s); }
 static inline bool lx_str_eq(const char* a, const char* b) { return strcmp(a, b) == 0; }
 static inline int lx_str_cmp(const char* a, const char* b) { return strcmp(a, b); }
 
-static inline char* lx_alloc(size_t n) {
-    char* p = (char*)malloc(n);
-    if (!p) lx_panic("内存分配失败");
+/* ---- 引用计数（ARC，0.9.2 实验性） ----
+ * 每个堆对象（string / 数组 / struct）前面有一个 16 字节头：refs + on_zero。
+ *   refs >= 0 : 堆对象，release 归零时调用 on_zero 再 free 头。
+ *   refs == -1: 静态不可变对象（字符串字面量），retain/release 跳过。
+ * 默认关闭（lx_gc_enabled=0）：生成的代码不插入 retain/release，
+ * 堆对象只增不减，与 0.9.1 行为一致；--arc 时在 main 里置 1。
+ * C 后端与原生后端输出不受其影响（内存管理不改变可观察行为）。 */
+typedef struct lx_gc_hdr {
+    int64_t refs;
+    void (*on_zero)(void*);
+} lx_gc_hdr;
+
+static int lx_gc_enabled = 0;
+
+static inline void* lx_gc_retain(void* p) {
+    if (!lx_gc_enabled || !p) return p;
+    lx_gc_hdr* h = ((lx_gc_hdr*)p) - 1;
+    if (h->refs >= 0) h->refs++;
     return p;
+}
+
+static inline void lx_gc_release(void* p) {
+    if (!lx_gc_enabled || !p) return;
+    lx_gc_hdr* h = ((lx_gc_hdr*)p) - 1;
+    if (h->refs < 0) return;
+    if (--h->refs == 0) {
+        if (h->on_zero) h->on_zero(p);
+        free(h);
+    }
+}
+
+/* 供 __attribute__((cleanup)) 使用：p 指向变量本身 */
+static inline void lx_gc_releasep(void* p) {
+    lx_gc_release(*(void**)p);
+}
+
+static inline char* lx_alloc(size_t n) {
+    lx_gc_hdr* h = (lx_gc_hdr*)calloc(1, sizeof(lx_gc_hdr) + n);
+    if (!h) lx_panic("内存分配失败");
+    h->refs = 1;
+    h->on_zero = 0;
+    return (char*)(h + 1);
 }
 
 static inline char* lx_str_concat(const char* a, const char* b) {
@@ -85,6 +131,72 @@ static inline char* lx_str_concat(const char* a, const char* b) {
     memcpy(r, a, la);
     memcpy(r + la, b, lb + 1);
     return r;
+}
+
+static inline char* lx_str_concat3(const char* a, const char* b,
+                                   const char* c) {
+    size_t la = strlen(a), lb = strlen(b), lc = strlen(c);
+    char* r = lx_alloc(la + lb + lc + 1);
+    memcpy(r, a, la);
+    memcpy(r + la, b, lb);
+    memcpy(r + la + lb, c, lc + 1);
+    return r;
+}
+
+/* ---- 可选值（0.8 错误通道） ----
+ * T? 统一表示为 <T>*：指向堆上一个存放 T 的槽，NULL 表示 none。
+ * 这样 int? / float? / string? / 数组? / struct? 都是单个指针，
+ * 两个后端的 ABI 都能用 8 字节槽传递。 */
+static inline void* lx_opt_alloc(size_t n) {
+    void* p = malloc(n);
+    if (!p) lx_panic("内存分配失败（可选值装箱）");
+    return p;
+}
+
+static inline void lx_panic_opt(const char* what) {
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%s 失败：值为 none", what);
+    lx_panic(buf);
+}
+
+/* 文件读取专用：把路径一并写进 panic，用户知道是哪个文件失败 */
+static inline void lx_panic_opt_file(const char* what, const char* path) {
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s 失败：无法读取 '%s'", what,
+             path ? path : "");
+    lx_panic(buf);
+}
+
+/* 切片越界：文案与 stability.md §3 冻结表逐字对齐 */
+static inline void lx_panic_slice(int64_t lo, int64_t hi, int64_t n) {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "切片范围越界：起点 %lld，终点 %lld，长度 %lld",
+             (long long)lo, (long long)hi, (long long)n);
+    lx_panic(buf);
+}
+
+/* 字符串 → int?：解析失败（空 / 有残余字符 / 溢出）返回 NULL */
+static inline int64_t* lx_str_to_i64_opt(const char* s) {
+    if (!s) return NULL;
+    char* end = NULL;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (end == s || (end && *end != '\0') || errno != 0) return NULL;
+    int64_t* p = (int64_t*)lx_opt_alloc(sizeof(int64_t));
+    *p = (int64_t)v;
+    return p;
+}
+
+/* 字符串 → float?：解析失败返回 NULL */
+static inline double* lx_str_to_f64_opt(const char* s) {
+    if (!s) return NULL;
+    char* end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (end == s || (end && *end != '\0')) return NULL;
+    double* p = (double*)lx_opt_alloc(sizeof(double));
+    *p = v;
+    return p;
 }
 
 static inline char* lx_str_dup(const char* s) {
@@ -121,9 +233,6 @@ static inline char* lx_f64_to_str(double v) {
 }
 
 static inline const char* lx_bool_to_str(bool v) { return v ? "true" : "false"; }
-
-static inline int64_t lx_str_to_i64(const char* s) { return (int64_t)strtoll(s, NULL, 10); }
-static inline double lx_str_to_f64(const char* s) { return strtod(s, NULL); }
 
 /* ---- string 模块 ---- */
 static inline bool lx_str_contains(const char* s, const char* sub) {
@@ -230,9 +339,12 @@ static void lx_sb_push(lx_sb* b, const void* data, size_t n) {
     if (b->len + n + 1 > b->cap) {
         size_t nc = b->cap ? b->cap * 2 : 64;
         while (nc < b->len + n + 1) nc *= 2;
-        char* np = (char*)realloc(b->p, nc);
-        if (!np) lx_panic("内存分配失败");
-        b->p = np;
+        /* 缓冲区带 ARC 头：realloc 的是头部，对外指针是头部之后 */
+        lx_gc_hdr* h = b->p ? (((lx_gc_hdr*)b->p) - 1) : 0;
+        lx_gc_hdr* nh = (lx_gc_hdr*)realloc(h, sizeof(lx_gc_hdr) + nc);
+        if (!nh) lx_panic("内存分配失败");
+        if (!h) { nh->refs = 1; nh->on_zero = 0; }
+        b->p = (char*)(nh + 1);
         b->cap = nc;
     }
     memcpy(b->p + b->len, data, n);
@@ -247,10 +359,13 @@ static inline void lx_sb_push_lit(lx_sb* b, const char* s) {
 /* ---- struct（0.7）：字段对象堆分配，布局 = N*8 个槽 ----
  * struct 是引用语义（与数组一致）：变量 / 传参 / 返回共享同一个对象，
  * 字段可原地修改。字段类型为 int/float/bool/string/数组/struct，均占 8 字节。 */
-static inline void* lx_struct_new(size_t n) {
-    void* p = calloc(1, n);
-    if (!p) lx_panic("内存分配失败");
-    return p;
+static inline void* lx_struct_new(size_t n,
+                                  void (*on_zero)(void*)) {
+    lx_gc_hdr* h = (lx_gc_hdr*)calloc(1, sizeof(lx_gc_hdr) + n);
+    if (!h) lx_panic("内存分配失败");
+    h->refs = 1;
+    h->on_zero = on_zero;
+    return (void*)(h + 1);
 }
 
 /* ---- 数组（0.5 新增） ----
@@ -263,16 +378,35 @@ struct lx_arr {
     void* data;
     int64_t esz;  /* 单个元素的字节数 */
     void (*pelem)(lx_sb*, const void*);  /* 元素打印器（打印 / 转字符串用） */
+    void (*relem)(void*);  /* 元素释放器（ARC：字符串/数组/struct 为
+                              lx_gc_release，值类型为 0） */
 };
 typedef struct lx_arr* lx_arr;
 
+/* 数组归零：先释放各元素（若元素是引用类型），再释放数据区。
+   头本身由 lx_gc_release 统一 free。 */
+static void lx_arr_on_zero(void* p) {
+    lx_arr a = (lx_arr)p;
+    if (a->relem && a->data) {
+        for (int64_t i = 0; i < a->len; i++)
+            a->relem((char*)a->data + (size_t)i * (size_t)a->esz);
+    }
+    free(a->data);
+}
+
 /* 新建空数组头（len=cap=0，data=NULL） */
 static inline lx_arr lx_arr_new(int64_t esz,
-                                void (*pelem)(lx_sb*, const void*)) {
-    lx_arr a = (lx_arr)calloc(1, sizeof(struct lx_arr));
-    if (!a) lx_panic("内存分配失败");
+                                void (*pelem)(lx_sb*, const void*),
+                                void (*relem)(void*)) {
+    lx_gc_hdr* h = (lx_gc_hdr*)calloc(1, sizeof(lx_gc_hdr) +
+                                         sizeof(struct lx_arr));
+    if (!h) lx_panic("内存分配失败");
+    h->refs = 1;
+    h->on_zero = lx_arr_on_zero;
+    lx_arr a = (lx_arr)(h + 1);
     a->esz = esz;
     a->pelem = pelem;
+    a->relem = relem;
     return a;
 }
 
@@ -307,14 +441,19 @@ static lx_arr lx_arr_slice(lx_arr a, int64_t lo, int64_t hi) {
     int64_t n = a->len;
     if (hi < 0) hi = n;
     if (lo < 0 || hi > n || lo > hi)
-        lx_panic("切片范围越界");
+        lx_panic_slice(lo, hi, n);
     int64_t esz = a->esz > 0 ? a->esz : 8;
-    lx_arr r = lx_arr_new(esz, a->pelem);
+    lx_arr r = lx_arr_new(esz, a->pelem, a->relem);
     int64_t cnt = hi - lo;
     if (cnt > 0) {
         lx_arr_reserve(r, cnt);
         memcpy(r->data, (char*)a->data + lo * esz, (size_t)(cnt * esz));
         r->len = cnt;
+        /* 切片与原数组各持一份元素引用（ARC）：retain 每个元素值 */
+        if (r->relem)
+            for (int64_t i = 0; i < cnt; i++)
+                lx_gc_retain(*(void**)((char*)r->data +
+                                       (size_t)i * (size_t)esz));
     }
     return r;
 }
@@ -324,7 +463,7 @@ static inline char* lx_str_slice(const char* s, int64_t lo, int64_t hi) {
     int64_t n = lx_str_len(s);
     if (hi < 0) hi = n;
     if (lo < 0 || hi > n || lo > hi)
-        lx_panic("切片范围越界");
+        lx_panic_slice(lo, hi, n);
     return lx_str_substr(s, lo, hi - lo);
 }
 
@@ -341,6 +480,8 @@ static inline char* lx_str_slice(const char* s, int64_t lo, int64_t hi) {
     }                                                                        \
     static inline void lx_arr_set_##NAME(lx_arr a, int64_t i, CTYPE v) {     \
         if (i < 0 || i >= a->len) lx_arr_bounds_fail(i, a->len);             \
+        if (a->relem)                                                        \
+            a->relem((char*)a->data + (size_t)i * (size_t)a->esz);           \
         ((CTYPE*)a->data)[i] = v;                                            \
     }                                                                        \
     static inline CTYPE lx_arr_pop_##NAME(lx_arr a) {                        \
@@ -377,7 +518,13 @@ LX_ARR_OPS(arr, lx_arr)
 LX_ARR_OPS(st, void*)  /* struct 数组：元素是 struct 指针（0.7） */
 
 
-static inline void lx_arr_clear(lx_arr a) { a->len = 0; }
+static inline void lx_arr_clear(lx_arr a) {
+    if (a->relem && a->data) {
+        for (int64_t i = 0; i < a->len; i++)
+            a->relem((char*)a->data + (size_t)i * (size_t)a->esz);
+    }
+    a->len = 0;
+}
 static inline int64_t lx_arr_len(lx_arr a) { return a->len; }
 
 /* 字符串下标：返回单字节字符（堆分配的 1 字符字符串） */
@@ -420,8 +567,8 @@ static void lx_pe_arr(lx_sb* b, const void* p) { lx_arr_sb(b, *(const lx_arr*)p)
 
 /* argc/argv → string[]（main(argv) 用，argv[0] 为程序名，同 C 约定） */
 static inline lx_arr lx_argv_new(int argc, char** argv) {
-    lx_arr a = lx_arr_new(sizeof(char*), lx_pe_str);
-    for (int i = 0; i < argc; i++) lx_arr_push_str(a, argv[i]);
+    lx_arr a = lx_arr_new(sizeof(char*), lx_pe_str, lx_gc_releasep);
+    for (int i = 0; i < argc; i++) lx_arr_push_str(a, lx_str_dup(argv[i]));
     return a;
 }
 
@@ -439,16 +586,6 @@ static void lx_arr_sb(lx_sb* b, lx_arr a) {
     lx_sb_push(b, "]", 1);
 }
 
-static void lx_arr_print(lx_arr a) {
-    lx_sb b = {0, 0, 0};
-    lx_arr_sb(&b, a);
-    if (!b.p) {
-        b.p = lx_alloc(1);
-        b.p[0] = '\0';
-    }
-    fwrite(b.p, 1, b.len, stdout);
-}
-
 static char* lx_arr_to_str(lx_arr a) {
     lx_sb b = {0, 0, 0};
     lx_arr_sb(&b, a);
@@ -462,7 +599,7 @@ static char* lx_arr_to_str(lx_arr a) {
 /* ---- string 模块的数组扩展（0.5） ---- */
 static lx_arr lx_str_split(const char* s, const char* sep) {
     if (*sep == '\0') lx_panic("split() 的分隔符不能是空字符串");
-    lx_arr a = lx_arr_new((int64_t)sizeof(char*), lx_pe_str);
+    lx_arr a = lx_arr_new((int64_t)sizeof(char*), lx_pe_str, lx_gc_releasep);
     size_t ls = strlen(sep);
     const char* p = s;
     for (;;) {
@@ -482,7 +619,7 @@ static lx_arr lx_str_split(const char* s, const char* sep) {
 }
 
 static lx_arr lx_str_chars(const char* s) {
-    lx_arr a = lx_arr_new((int64_t)sizeof(char*), lx_pe_str);
+    lx_arr a = lx_arr_new((int64_t)sizeof(char*), lx_pe_str, lx_gc_releasep);
     int64_t n = (int64_t)strlen(s);
     lx_arr_reserve(a, n);
     for (int64_t i = 0; i < n; i++) {
@@ -552,7 +689,11 @@ static inline int64_t lx_imod(int64_t a, int64_t b) {
 static inline char* lx_read_line(void) {
     fflush(stdout);  /* 保证此前 print 的内容在交互提示前全部显示 */
     size_t cap = 128, len = 0;
-    char* buf = lx_alloc(cap);
+    lx_gc_hdr* h = (lx_gc_hdr*)calloc(1, sizeof(lx_gc_hdr) + cap);
+    if (!h) lx_panic("内存分配失败");
+    h->refs = 1;
+    h->on_zero = 0;
+    char* buf = (char*)(h + 1);
     int c;
     while ((c = getchar()) != EOF && c != '\n') {
         if (len + 1 >= cap) {
@@ -560,9 +701,9 @@ static inline char* lx_read_line(void) {
                 lx_panic("输入行过长（超过 1 MiB 上限）");
             }
             cap *= 2;
-            char* nb = (char*)realloc(buf, cap);
-            if (!nb) lx_panic("内存分配失败");
-            buf = nb;
+            h = (lx_gc_hdr*)realloc(h, sizeof(lx_gc_hdr) + cap);
+            if (!h) lx_panic("内存分配失败");
+            buf = (char*)(h + 1);
         }
         buf[len++] = (char)c;
     }
@@ -579,8 +720,10 @@ static inline char* lx_read_line_prompt(const char* prompt) {
 /* ---- 断言 ---- */
 static inline void lx_assert_at(bool cond, const char* msg, int line) {
     if (!cond) {
-        fprintf(stderr, "lux: 断言失败 (第 %d 行): %s\n", line, msg);
-        exit(1);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "assert 失败：%s（第 %d 行）",
+                 msg ? msg : "条件不成立", line);
+        lx_panic(buf);
     }
 }
 
@@ -644,30 +787,29 @@ static inline int64_t lx_system(const char* cmd) {
 }
 
 /* ---- file 模块 ---- */
-static inline void lx_file_err(const char* op, const char* path) {
-    fprintf(stderr, "lux: 运行时错误: 无法%s文件 '%s'\n", op, path);
-    exit(1);
-}
-
-static inline char* lx_file_read(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) lx_file_err("读取", path);
-    if (fseek(f, 0, SEEK_END) != 0) lx_file_err("读取", path);
-    long n = ftell(f);
-    if (n < 0) lx_file_err("读取", path);
-    rewind(f);
-    char* buf = lx_alloc((size_t)n + 1);
-    size_t got = fread(buf, 1, (size_t)n, f);
-    buf[got] = '\0';
-    fclose(f);
-    return buf;
-}
 
 static inline bool lx_file_exists(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     fclose(f);
     return true;
+}
+
+/* 读整个文件 → string?（0.8）：打开失败返回 NULL */
+static inline const char** lx_read_opt(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char* buf = lx_alloc((size_t)n + 1);
+    size_t got = fread(buf, 1, (size_t)n, f);
+    buf[got] = '\0';
+    fclose(f);
+    const char** p = (const char**)lx_opt_alloc(sizeof(char*));
+    *p = buf;
+    return p;
 }
 
 static inline bool lx_file_write(const char* path, const char* data) {
@@ -727,6 +869,9 @@ std::string cType(const Ty* t) {
             return "lx_arr";  // 0.5：动态数组（lx_arr 即堆头指针，赋值/传参共享）
         case TyKind::Named:
             return structCName(t->name) + "*";  // struct 是字段对象指针（0.7）
+        case TyKind::Optional:
+            // T? 统一表示为指向堆槽的指针，NULL = none（0.8）
+            return cType(t->elem) + "*";
         default:
             return "int64_t";  // 兜底，保证生成的 C 依旧合法
     }
@@ -771,9 +916,22 @@ std::string arrPelem(const Ty* elem) {
     }
 }
 
-// 数组实体的"空值"：一个不指向任何数据的空数组（esz / pelem 按元素类型补全）
+// 数组元素释放器（ARC）：引用类型元素用 lx_gc_releasep（收槽地址），
+// 值类型为 0（无需释放）
+std::string arrRelem(const Ty* elem) {
+    if (!elem) return "0";
+    switch (elem->kind) {
+        case TyKind::String:
+        case TyKind::Array:
+        case TyKind::Named: return "lx_gc_releasep";
+        default: return "0";
+    }
+}
+
+// 数组实体的"空值"：一个不指向任何数据的空数组（esz / pelem / relem 按元素类型补全）
 std::string arrZero(const Ty* elem) {
-    return "lx_arr_new(" + arrEsz(elem) + ", " + arrPelem(elem) + ")";
+    return "lx_arr_new(" + arrEsz(elem) + ", " + arrPelem(elem) + ", " +
+           arrRelem(elem) + ")";
 }
 
 std::string zeroOf(const Ty* t) {
@@ -790,20 +948,25 @@ std::string zeroOf(const Ty* t) {
             return arrZero(t->elem);
         case TyKind::Named:
             return "((" + structCName(t->name) + "*)0)";  // struct 空值 = NULL
+        case TyKind::Optional:
+            return "((" + cType(t) + ")0)";  // none = NULL（0.8）
         default:
             return "0";
     }
 }
 
+// 用户标识符的 C 名字改写。
+// 0.8：用户名字改用 lxv_ / lxm_ 前缀，与运行时的 lx_* 命名空间彻底分开，
+// 避免用户变量名（如 arr → lx_arr）撞上运行时类型 / 辅助函数。
 std::string mangle(const std::string& name) {
     if (name == "main") return "main";  // 入口函数直接映射到 C 的 main
-    return "lx_" + name;
+    return "lxv_" + name;
 }
 
 // 带模块前缀的名字改写：来自模块的声明避免与根文件 / 其他模块撞名
 std::string mangleFor(const std::string& module, const std::string& name) {
     if (module.empty()) return mangle(name);
-    return "lx_" + module + "_" + name;
+    return "lxm_" + module + "_" + name;
 }
 
 // 把 double 格式化成能精确还原的 C 浮点字面量
@@ -825,7 +988,12 @@ struct CGen {
     int indent = 0;
     int tmpId = 0;
     const CodegenOptions& opt;
+    bool arcMode = false;  // 0.9.2：是否启用 ARC 插入
     std::string curFile;  // 当前正在生成的声明所在的源文件（供 #line 使用）
+    // ARC：字符串字面量的静态不可变对象（refs = -1）
+    std::map<std::string, std::string> litNames;
+    std::vector<std::string> litDefs;
+    size_t litAnchor = 0;  // 字面量包装区在 buf 中的位置
 
     const Ty* tInt = TyStore::int64Ty();
     const Ty* tFloat = TyStore::float64Ty();
@@ -833,7 +1001,8 @@ struct CGen {
     const Ty* tString = TyStore::stringTy();
     const Ty* tVoid = TyStore::voidTy();
 
-    explicit CGen(const CodegenOptions& o) : opt(o), curFile(o.sourceName) {
+    explicit CGen(const CodegenOptions& o)
+        : opt(o), arcMode(o.arc), curFile(o.sourceName) {
         buf.reserve(64 * 1024);  // 减少反复扩容（codegen 输出量远大于此）
     }
 
@@ -856,6 +1025,176 @@ struct CGen {
     }
 
     // ---- 表达式 ----
+
+    // 把表达式 e（类型 from）按需转换成目标类型 to 的 C 表达式。
+    // 0.8：处理 int→float 与 T→T?（装箱）。其余情况原样返回（Sema 已校验）。
+    std::string coerceTo(Expr* e, const Ty* to) {
+        const Ty* from = e ? e->ty : nullptr;
+        std::string v = expr(e);
+        if (!from || !to || from == to) return v;
+        if (from->kind == TyKind::Invalid || to->kind == TyKind::Invalid)
+            return v;
+        if (from->kind == TyKind::Int && to->kind == TyKind::Float)
+            return "((double)" + v + ")";
+        if (to->kind == TyKind::Optional) {
+            const Ty* elem = to->elem;
+            std::string inner;
+            if (from == elem) {
+                inner = v;
+            } else if (from->kind == TyKind::Int && elem &&
+                       elem->kind == TyKind::Float) {
+                inner = "((double)" + v + ")";
+            } else {
+                return v;  // Sema 已报错
+            }
+            std::string ct = cType(elem);
+            std::string o = tmpName("box");
+            // ARC：可选装箱目前不参与回收（0.9.3），但若内层是引用类型，
+            // 必须 retain —— 否则源变量的 cleanup 会把对象释放，
+            // 箱里就成悬空指针。多 retain 的引用会随箱一起泄露（安全）。
+            std::string put = inner;
+            if (arcMode && isRefTy(elem))
+                put = "((" + ct + ")lx_gc_retain((void*)(" + inner + ")))";
+            return "({ " + ct + "* " + o + " = (" + ct +
+                   "*)lx_opt_alloc(sizeof(" + ct + ")); *" + o + " = " +
+                   put + "; " + o + "; })";
+        }
+        return v;
+    }
+
+    // ---- ARC 辅助（0.9.2）----
+    // 引用类型（需要引用计数管理）：string / 数组 / struct
+    static bool isRefTy(const Ty* t) {
+        if (!t) return false;
+        return t->kind == TyKind::String || t->kind == TyKind::Array ||
+               t->kind == TyKind::Named;
+    }
+
+    // 字符串字面量 → 静态不可变对象（refs = -1），返回其 data 指针
+    std::string internLit(const std::string& s) {
+        auto it = litNames.find(s);
+        if (it != litNames.end()) return it->second + ".data";
+        std::string name = "lx_lit_" + std::to_string(litDefs.size());
+        litNames[s] = name;
+        litDefs.push_back("static struct { lx_gc_hdr h; char data[" +
+                          std::to_string(s.size() + 1) + "]; } " + name +
+                          " = { { -1, 0 }, \"" + escapeCString(s) + "\" };");
+        return name + ".data";
+    }
+
+    // 表达式是否“产生一个新的引用归调用方所有”（可以转移，不必 retain）。
+    // 保守原则：判不准就返回 false（当成借用 → 存储时 retain），
+    // 宁可多一次 retain / 泄露临时值，也不可误判为 owned 导致双重释放。
+    bool isOwned(Expr* e) {
+        if (!arcMode || !e || !isRefTy(e->ty)) return false;
+        switch (e->kind) {
+            case ExprKind::Binary: {
+                // 只有字符串拼接产生新串；or 兜底的结果可能是借用的
+                auto* b = static_cast<BinaryExpr*>(e);
+                if (b->orFallback) return false;
+                return e->ty->kind == TyKind::String;
+            }
+            case ExprKind::Index: {
+                // s[i] 产生单字节字符（新字符串）
+                auto* ix = static_cast<IndexExpr*>(e);
+                return ix->base && ix->base->ty == tString;
+            }
+            case ExprKind::Slice:
+            case ExprKind::ArrayLit:
+            case ExprKind::StructLit:
+                return true;
+            case ExprKind::Call: {
+                auto* c = static_cast<CallExpr*>(e);
+                if (c->target && c->target->isExtern)
+                    return false;  // extern 返回借用视图（const char*）
+                if (c->target) return true;  // 用户函数返回转移所有权
+                // 内建：只信任确实新建堆对象的那些
+                switch (c->builtin) {
+                    case Builtin::ToString:
+                    case Builtin::Input:
+                    case Builtin::StrReplace:
+                    case Builtin::StrTrim:
+                    case Builtin::StrUpper:
+                    case Builtin::StrLower:
+                    case Builtin::StrSubstr:
+                    case Builtin::StrFormat:
+                    case Builtin::StrSplit:
+                    case Builtin::StrChars:
+                    case Builtin::StrJoin:
+                        return true;
+                    case Builtin::ArrPop:
+                    case Builtin::ArrRemove:
+                        return e->ty && isRefTy(e->ty);
+                    default:
+                        return false;  // Env / FileRead(string?) 等
+                }
+            }
+            default:
+                return false;
+        }
+    }
+
+    // 返回“原始 C 字符串”的表达式（extern 返回、env）：它们没有 ARC 头，
+    // 存储时必须先拷成 Lux 自己的字符串（否则 retain/cleanup 会读到非法头）。
+    bool isRawCString(Expr* e) {
+        if (!arcMode || !e || !e->ty || e->ty->kind != TyKind::String)
+            return false;
+        if (e->kind != ExprKind::Call) return false;
+        auto* c = static_cast<CallExpr*>(e);
+        if (c->target && c->target->isExtern) return true;
+        return !c->target && c->builtin == Builtin::Env;
+    }
+
+    // 存储语义：把 e 存进一个引用类型槽位。
+    //   原始 C 串 → lx_str_dup 拷成有头对象
+    //   owned     → 转移（不 retain，调用方把引用交给槽位）
+    //   借用     → retain 后再存（槽位自己持有一份）
+    std::string coerceStore(Expr* e, const Ty* to) {
+        std::string v = coerceTo(e, to);
+        if (!arcMode || !isRefTy(to)) return v;
+        if (isRawCString(e))
+            return "lx_str_dup((const char*)(" + v + "))";
+        if (isOwned(e)) return v;
+        return "((" + cType(to) + ")lx_gc_retain((void*)(" + v + ")))";
+    }
+
+    // 引用类型的“零值”：ARC 下 string 的空串用静态字面量包装，
+    // 否则清理时会去 free 裸 C 字面量。
+    std::string zeroOfA(const Ty* t) {
+        if (arcMode && t && t->kind == TyKind::String) return internLit("");
+        return zeroOf(t);
+    }
+
+    std::string toStrOf(const Ty* t, const std::string& v) {
+        if (!t) return v;
+        switch (t->kind) {
+            case TyKind::Int: return "lx_i64_to_str(" + v + ")";
+            case TyKind::Float: return "lx_f64_to_str(" + v + ")";
+            case TyKind::Bool: return "lx_bool_to_str(" + v + ")";
+            case TyKind::String: return "(" + v + ")";
+            case TyKind::Array: return "lx_arr_to_str(" + v + ")";
+            case TyKind::Named:
+                return structCName(t->name) + "_to_str(" + v + ")";
+            case TyKind::Optional: {
+                std::string o = tmpName("opts");
+                std::string inner = toStrOf(t->elem, "(*" + o + ")");
+                return "({ " + cType(t) + " " + o + " = " + v + "; " + o +
+                       " ? lx_str_concat3(\"some(\", " + inner +
+                       ", \")\") : lx_str_dup(\"none\"); })";
+            }
+            default: return v;
+        }
+    }
+
+    // panic 变体（name!）解包：opt 是 T? 表达式；为 none 时 panic，否则给 T
+    std::string panicUnwrap(const std::string& opt, const Ty* optTy,
+                            const std::string& what) {
+        std::string o = tmpName("pu");
+        return "({ " + cType(optTy) + " " + o + " = " + opt + "; if (!" + o +
+               ") lx_panic_opt(\"" + escapeCString(what) + "\"); (*" + o +
+               "); })";
+    }
+
     std::string expr(Expr* e) {
         if (!e) return "0";
         switch (e->kind) {
@@ -869,6 +1208,9 @@ struct CGen {
             }
             case ExprKind::StrLit: {
                 auto* n = static_cast<StrLitExpr*>(e);
+                // ARC：字面量换成静态不可变对象（refs = -1），保证
+                // retain/release 安全；非 ARC 保持裸 C 字面量
+                if (arcMode) return internLit(n->value);
                 return "\"" + escapeCString(n->value) + "\"";
             }
             case ExprKind::FloatLit: {
@@ -900,10 +1242,23 @@ struct CGen {
             }
             case ExprKind::Binary: {
                 auto* n = static_cast<BinaryExpr*>(e);
+                // 0.8：or 兜底（lhs 是 T?）
+                if (n->orFallback) {
+                    const Ty* elem = n->lhs->ty->elem;
+                    std::string o = tmpName("or");
+                    return "({ " + cType(n->lhs->ty) + " " + o + " = " +
+                           expr(n->lhs) + "; " + o + " ? (*" + o + ") : (" +
+                           coerceTo(n->rhs, elem) + "); })";
+                }
                 // Sema 折叠过的常量表达式直接落成字面量
                 if (n->folded) {
-                    if (n->foldedIsStr)
+                    if (n->foldedIsStr) {
+                        // 0.9.3（A1）：ARC 下折叠出的字符串常量必须走字面量
+                        // 包装（refs = -1），否则发裸 C 字面量会带着「无头指针」
+                        // 进入引用计数世界，retain/release 读到非法头而崩溃。
+                        if (arcMode) return internLit(n->foldedS);
                         return "\"" + escapeCString(n->foldedS) + "\"";
+                    }
                     if (n->ty == tFloat) return formatDouble(n->foldedF);
                     return std::to_string(n->foldedI) + "LL";
                 }
@@ -958,12 +1313,10 @@ struct CGen {
                 const Ty* et = n->elemTy;
                 std::string v = tmpName("arr");
                 std::string s = "({ lx_arr " + v + " = lx_arr_new(" +
-                                arrEsz(et) + ", " + arrPelem(et) + ");";
+                                arrEsz(et) + ", " + arrPelem(et) + ", " +
+                                arrRelem(et) + ");";
                 for (Expr* el : n->elems) {
-                    std::string ev = expr(el);
-                    if (et && et->kind == TyKind::Float && el->ty == tInt) {
-                        ev = "((double)" + ev + ")";
-                    }
+                    std::string ev = coerceStore(el, et);
                     s += " lx_arr_push_" + arrRT(et) + "(" + v + ", " + ev +
                          ");";
                 }
@@ -977,16 +1330,14 @@ struct CGen {
                 std::string cn = structCName(n->typeName);
                 std::string v = tmpName("st");
                 std::string s = "({ " + cn + "* " + v + " = (" + cn +
-                                "*)lx_struct_new(sizeof(" + cn + "));";
+                                "*)lx_struct_new(sizeof(" + cn + "), " + cn +
+                                "_on_zero);";
                 StructDecl* sd = n->decl;
                 for (auto& kv : n->inits) {
                     int idx = sd ? structFieldIndex(sd, kv.first) : -1;
                     if (idx < 0) continue;
                     const Ty* ft = sd->fields[idx].ty;
-                    std::string fv = expr(kv.second);
-                    if (ft == tFloat && kv.second->ty == tInt) {
-                        fv = "((double)" + fv + ")";
-                    }
+                    std::string fv = coerceStore(kv.second, ft);
                     s += " " + v + "->f_" + kv.first + " = " + fv + ";";
                 }
                 s += " " + v + "; })";
@@ -1003,13 +1354,24 @@ struct CGen {
             }
             case ExprKind::If: {
                 auto* n = static_cast<IfExpr*>(e);
-                std::string a = expr(n->thenVal);
-                std::string b = expr(n->elseVal);
-                if (n->ty == tFloat) {
-                    if (n->thenVal->ty == tInt) a = "((double)" + a + ")";
-                    if (n->elseVal->ty == tInt) b = "((double)" + b + ")";
-                }
+                std::string a = coerceTo(n->thenVal, n->ty);
+                std::string b = coerceTo(n->elseVal, n->ty);
                 return "(" + expr(n->cond) + " ? " + a + " : " + b + ")";
+            }
+            case ExprKind::NoneLit: {
+                // none：类型由 Sema 确定（T?），C 层就是空指针。
+                // 防御：万一 Sema 未设类型，不能拿空指针去 cType 崩溃。
+                if (!e->ty || e->ty->kind == TyKind::Invalid) return "((void*)0)";
+                return "((" + cType(e->ty) + ")0)";
+            }
+            case ExprKind::Try: {
+                // expr?（0.8）：失败就 return none（当前函数必须返回 T?）
+                auto* tr = static_cast<TryExpr*>(e);
+                const Ty* ot = tr->operand->ty;
+                std::string o = tmpName("try");
+                return "({ " + cType(ot) + " " + o + " = " +
+                       expr(tr->operand) + "; if (!" + o + ") return " +
+                       zeroOfA(curRetTy) + "; (*" + o + "); })";
             }
         }
         return "0";
@@ -1030,8 +1392,27 @@ struct CGen {
         if (lt == tString && rt == tString) {
             switch (n->op) {
                 case BinOp::Add:
-                    return "lx_str_concat(" + expr(n->lhs) + ", " + expr(n->rhs) +
-                           ")";
+                    // ARC：拼接产生新串；若某一侧是 owned 临时值，
+                    // 用完即 release（解决 a+b+c 的中间串泄露）。
+                    if (!arcMode)
+                        return "lx_str_concat(" + expr(n->lhs) + ", " +
+                               expr(n->rhs) + ")";
+                    {
+                        std::string L = tmpName("cl");
+                        std::string R = tmpName("cr");
+                        std::string O = tmpName("cc");
+                        bool lOwn = isOwned(n->lhs), rOwn = isOwned(n->rhs);
+                        std::string s = "({ const char* " + L + " = " +
+                                        expr(n->lhs) + "; const char* " + R +
+                                        " = " + expr(n->rhs) +
+                                        "; const char* " + O +
+                                        " = lx_str_concat(" + L + ", " + R +
+                                        ");";
+                        if (rOwn) s += " lx_gc_release((void*)" + R + ");";
+                        if (lOwn) s += " lx_gc_release((void*)" + L + ");";
+                        s += " " + O + "; })";
+                        return s;
+                    }
                 case BinOp::Eq:
                     return "lx_str_eq(" + expr(n->lhs) + ", " + expr(n->rhs) + ")";
                 case BinOp::Ne:
@@ -1118,8 +1499,9 @@ struct CGen {
                 return "((int64_t)(((uint64_t)" + expr(n->lhs) + ") << " +
                        expr(n->rhs) + "))";
             case BinOp::Shr:
-                return "((int64_t)(((uint64_t)" + expr(n->lhs) + ") >> " +
-                       expr(n->rhs) + "))";
+                // 算术右移（有符号），与原生后端的 sar 语义一致（C1，0.8）
+                return "((int64_t)(" + expr(n->lhs) + ") >> " +
+                       expr(n->rhs) + ")";
         }
         return "0";
     }
@@ -1149,7 +1531,11 @@ struct CGen {
                     case TyKind::Bool:
                         return "((int64_t)(" + expr(a) + " ? 1 : 0))";
                     case TyKind::String:
-                        return "lx_str_to_i64(" + expr(a) + ")";
+                        if (c->panicVariant)
+                            return panicUnwrap(
+                                "lx_str_to_i64_opt(" + expr(a) + ")",
+                                TyStore::optionalOf(tInt), "int 解析");
+                        return "lx_str_to_i64_opt(" + expr(a) + ")";
                     default:
                         return "((int64_t)(" + expr(a) + "))";
                 }
@@ -1159,7 +1545,11 @@ struct CGen {
                 Expr* a = c->args[0];
                 switch (a->ty->kind) {
                     case TyKind::String:
-                        return "lx_str_to_f64(" + expr(a) + ")";
+                        if (c->panicVariant)
+                            return panicUnwrap(
+                                "lx_str_to_f64_opt(" + expr(a) + ")",
+                                TyStore::optionalOf(tFloat), "float 解析");
+                        return "lx_str_to_f64_opt(" + expr(a) + ")";
                     case TyKind::Bool:
                         return "((double)(" + expr(a) + " ? 1.0 : 0.0))";
                     default:
@@ -1168,24 +1558,7 @@ struct CGen {
             }
             case Builtin::ToString: {
                 if (c->args.empty()) return "\"\"";
-                Expr* a = c->args[0];
-                if (a->ty && a->ty->kind == TyKind::Array) {
-                    return "lx_arr_to_str(" + expr(a) + ")";
-                }
-                if (a->ty && a->ty->kind == TyKind::Named) {
-                    return structCName(a->ty->name) + "_to_str(" + expr(a) +
-                           ")";
-                }
-                switch (a->ty->kind) {
-                    case TyKind::Int:
-                        return "lx_i64_to_str(" + expr(a) + ")";
-                    case TyKind::Float:
-                        return "lx_f64_to_str(" + expr(a) + ")";
-                    case TyKind::Bool:
-                        return "lx_bool_to_str(" + expr(a) + ")";
-                    default:
-                        return "(" + expr(a) + ")";
-                }
+                return toStrOf(c->args[0]->ty, expr(c->args[0]));
             }
             case Builtin::Assert: {
                 std::string cond = expr(c->args[0]);
@@ -1284,7 +1657,17 @@ struct CGen {
                 return "lx_setenv(" + expr(c->args[0]) + ", " +
                        expr(c->args[1]) + ")";
             case Builtin::FileRead:
-                return "lx_file_read(" + expr(c->args[0]) + ")";
+                if (c->panicVariant) {
+                    // read! 专用：把路径一并带进 panic（0.9，恢复 0.7 的 UX）
+                    std::string pv = tmpName("path");
+                    std::string o = tmpName("pu");
+                    return "({ const char* " + pv + " = " +
+                           expr(c->args[0]) + "; " + cType(TyStore::optionalOf(tString)) +
+                           " " + o + " = lx_read_opt(" + pv + "); if (!" + o +
+                           ") lx_panic_opt_file(\"文件读取\", " + pv + "); (*" + o +
+                           "); })";
+                }
+                return "lx_read_opt(" + expr(c->args[0]) + ")";
             case Builtin::FileExists:
                 return "lx_file_exists(" + expr(c->args[0]) + ")";
             case Builtin::FileWrite:
@@ -1329,22 +1712,7 @@ struct CGen {
                 for (size_t i = 1; i < c->args.size(); i++) {
                     s += ", ";
                     Expr* a = c->args[i];
-                    if (a->ty && a->ty->kind == TyKind::Array) {
-                        s += "lx_arr_to_str(" + expr(a) + ")";
-                    } else if (a->ty && a->ty->kind == TyKind::Named) {
-                        s += structCName(a->ty->name) + "_to_str(" + expr(a) +
-                             ")";
-                    } else if (a->ty == tString) {
-                        s += expr(a);
-                    } else if (a->ty == tInt) {
-                        s += "lx_i64_to_str(" + expr(a) + ")";
-                    } else if (a->ty == tFloat) {
-                        s += "lx_f64_to_str(" + expr(a) + ")";
-                    } else if (a->ty == tBool) {
-                        s += "lx_bool_to_str(" + expr(a) + ")";
-                    } else {
-                        s += expr(a);
-                    }
+                    s += toStrOf(a->ty, expr(a));
                 }
                 s += ", (const char*)0)";
                 return s;
@@ -1362,11 +1730,7 @@ struct CGen {
             //      lx_arr 本身就是堆头指针，直接传值即共享 ----
             case Builtin::ArrPush: {
                 std::string recv = mangle(c->methodRecv);
-                std::string arg = expr(c->args[0]);
-                if (c->methodElem && c->methodElem->kind == TyKind::Float &&
-                    c->args[0]->ty == tInt) {
-                    arg = "((double)" + arg + ")";
-                }
+                std::string arg = coerceStore(c->args[0], c->methodElem);
                 return "((void)lx_arr_push_" + arrRT(c->methodElem) + "(" +
                        recv + ", " + arg + "))";
             }
@@ -1374,11 +1738,7 @@ struct CGen {
                 return "lx_arr_pop_" + arrRT(c->methodElem) + "(" +
                        mangle(c->methodRecv) + ")";
             case Builtin::ArrInsert: {
-                std::string arg = expr(c->args[1]);
-                if (c->methodElem && c->methodElem->kind == TyKind::Float &&
-                    c->args[1]->ty == tInt) {
-                    arg = "((double)" + arg + ")";
-                }
+                std::string arg = coerceStore(c->args[1], c->methodElem);
                 return "((void)lx_arr_insert_" + arrRT(c->methodElem) + "(" +
                        mangle(c->methodRecv) + ", " + expr(c->args[0]) + ", " +
                        arg + "))";
@@ -1412,22 +1772,30 @@ struct CGen {
             if (i) s += ", ";
             Expr* a = c->args[i];
             std::string av = expr(a);
-            // 实参到形参的隐式提升（int -> float）
-            if (c->target && i < c->target->params.size() &&
-                a->ty == tInt && c->target->params[i].ty == tFloat) {
-                av = "((double)" + av + ")";
+            // 实参到形参的隐式转换（int → float / T → T? 装箱）
+            if (c->target && i < c->target->params.size()) {
+                av = coerceTo(a, c->target->params[i].ty);
             }
             s += av;
         }
         s += ")";
+        // 0.8：用户函数的 panic 变体 f!(...)（f 返回 T?，失败即退出）
+        if (c->panicVariant && c->target && c->target->retTy &&
+            c->target->retTy->kind == TyKind::Optional) {
+            return panicUnwrap(s, c->target->retTy, c->target->name);
+        }
         return s;
     }
 
-    // 复合赋值右值：字符串用 concat（C 的 + 是指针算术）
+    // 复合赋值右值：字符串用 concat；int 除法 / 取模走带零检查的运行时（C1，0.8）
     std::string compoundRhs(BinOp op, const std::string& lhs,
                             const std::string& rhs, const Ty* tt) {
         if (tt == tString && op == BinOp::Add)
             return "lx_str_concat(" + lhs + ", " + rhs + ")";
+        if (tt == tInt && op == BinOp::Div)
+            return "lx_idiv(" + lhs + ", " + rhs + ")";
+        if (tt == tInt && op == BinOp::Mod)
+            return "lx_imod(" + lhs + ", " + rhs + ")";
         return "((" + lhs + ") " + binOpText(op) + " " + rhs + ")";
     }
 
@@ -1436,8 +1804,7 @@ struct CGen {
     void assignStmt(AssignStmt* a) {
         Expr* t = a->target;
         const Ty* tt = a->elemTy ? a->elemTy : TyStore::int64Ty();
-        std::string v = expr(a->value);
-        if (tt == tFloat && a->value->ty == tInt) v = "((double)" + v + ")";
+        bool managed = arcMode && isRefTy(tt);
         if (t->kind == ExprKind::Index) {
             // 数组元素：用临时变量保证 base / index 只求值一次
             std::string base = expr(static_cast<IndexExpr*>(t)->base);
@@ -1447,18 +1814,53 @@ struct CGen {
             line("int64_t " + iv + " = " + idx + ";");
             std::string elem =
                 "lx_arr_get_" + arrRT(tt) + "(" + bv + ", " + iv + ")";
-            std::string rhs = v;
-            if (a->compound)
+            std::string rhs;
+            if (a->compound) {
+                std::string v = coerceTo(a->value, tt);
                 rhs = compoundRhs(a->compoundOp, elem, v, tt);
+            } else {
+                rhs = coerceStore(a->value, tt);
+            }
+            // set 会先释放旧元素（ARC），再存入新值（已 retain / 转移）
             line("lx_arr_set_" + arrRT(tt) + "(" + bv + ", " + iv + ", " +
                  rhs + ");");
             return;
         }
-        // Ident / Member：本身就是合法的 C 左值
-        std::string lv = lvalueOf(t);
+        // Ident / Member：Member 先把基址求值到临时指针（避免重复求值）
+        std::string lv;
+        if (t->kind == ExprKind::Member) {
+            auto* m = static_cast<MemberExpr*>(t);
+            std::string bt = tmpName("mb");
+            line(std::string(cType(m->base->ty)) + " " + bt + " = " +
+                 expr(m->base) + ";");
+            lv = bt + "->f_" + m->member;
+        } else {
+            lv = lvalueOf(t);
+        }
+        if (managed) {
+            std::string rhs;
+            if (a->compound) {
+                std::string v = coerceTo(a->value, tt);
+                rhs = compoundRhs(a->compoundOp, lv, v, tt);  // 新串（owned）
+            } else {
+                rhs = coerceStore(a->value, tt);  // owned 转移 / 借用 retain
+            }
+            std::string tv = tmpName("as");
+            // 先算新值再释放旧值，兼容 x = x + ... / x += ...
+            line(std::string(cType(tt)) + " " + tv + " = " + rhs + ";");
+            line("lx_gc_release((void*)" + lv + ");");
+            line(lv + " = " + tv + ";");
+            return;
+        }
+        std::string v = coerceTo(a->value, tt);
         if (a->compound) {
             if (tt == tString && a->compoundOp == BinOp::Add) {
                 line(lv + " = lx_str_concat(" + lv + ", " + v + ");");
+            } else if (tt == tInt && a->compoundOp == BinOp::Div) {
+                // 0.8（C1）：不能直接 /= （除零 SIGFPE + INT64_MIN/-1 溢出）
+                line(lv + " = lx_idiv(" + lv + ", " + v + ");");
+            } else if (tt == tInt && a->compoundOp == BinOp::Mod) {
+                line(lv + " = lx_imod(" + lv + ", " + v + ");");
             } else {
                 line(lv + " " + binOpText(a->compoundOp) + "= " + v + ";");
             }
@@ -1497,18 +1899,19 @@ struct CGen {
             }
             case StmtKind::Let: {
                 auto* let = static_cast<LetStmt*>(s);
+                bool managed = arcMode && isRefTy(let->resolved);
                 std::string decl;
-                if (let->isConst) decl += "const ";
+                if (let->isConst && !managed) decl += "const ";
                 decl += std::string(cType(let->resolved)) + " " +
                         mangle(let->name);
+                if (managed)
+                    decl += " __attribute__((cleanup(lx_gc_releasep)))";
                 if (let->init) {
-                    std::string init = expr(let->init);
-                    if (let->resolved == tFloat && let->init->ty == tInt) {
-                        init = "((double)" + init + ")";
-                    }
-                    decl += " = " + init;
+                    decl += " = " + (managed
+                                         ? coerceStore(let->init, let->resolved)
+                                         : coerceTo(let->init, let->resolved));
                 } else {
-                    decl += " = " + zeroOf(let->resolved);
+                    decl += " = " + zeroOfA(let->resolved);
                 }
                 line(decl + ";");
                 break;
@@ -1526,31 +1929,24 @@ struct CGen {
                     if (c->builtin == Builtin::Print ||
                         c->builtin == Builtin::PrintLn) {
                         for (Expr* a : c->args) {
-                            switch (a->ty->kind) {
-                                case TyKind::Int:
-                                    line("lx_print_i64(" + expr(a) + ");");
-                                    break;
-                                case TyKind::Float:
-                                    line("lx_print_f64(" + expr(a) + ");");
-                                    break;
-                                case TyKind::Bool:
-                                    line("lx_print_bool(" + expr(a) + ");");
-                                    break;
-                                case TyKind::String:
-                                    line("lx_print_str(" + expr(a) + ");");
-                                    break;
-                                case TyKind::Array:
-                                    // 0.5：数组打印成 [1, 2, 3] 形式
-                                    line("lx_arr_print(" + expr(a) + ");");
-                                    break;
-                                case TyKind::Named:
-                                    // struct 打印成 Point { x: 1, y: 2 }（0.7）
-                                    line("lx_print_str(" +
-                                         structCName(a->ty->name) + "_to_str(" +
-                                         expr(a) + "));");
-                                    break;
-                                default:
-                                    break;
+                            // 统一走 toString：可选值输出 some(x) / none（0.8）
+                            std::string s = toStrOf(a->ty, expr(a));
+                            // 0.9.3（A2-8）：toStrOf 对非 string 类型会新建堆串
+                            // （int/float/bool/数组/struct/可选值），打印完必须
+                            // 释放，否则这是最热的泄漏路径。string 类型本身
+                            // 走的是原串（借用），只有 isOwned 的临时串才释放。
+                            bool owns = a->ty && a->ty->kind != TyKind::String &&
+                                        a->ty->kind != TyKind::Bool;
+                            if (arcMode && a->ty &&
+                                a->ty->kind == TyKind::String && isOwned(a))
+                                owns = true;
+                            if (arcMode && owns) {
+                                std::string tv = tmpName("pr");
+                                line("const char* " + tv + " = " + s + ";");
+                                line("lx_print_str(" + tv + ");");
+                                line("lx_gc_release((void*)" + tv + ");");
+                            } else {
+                                line("lx_print_str(" + s + ");");
                             }
                         }
                         if (c->builtin == Builtin::PrintLn) line("lx_print_nl();");
@@ -1602,19 +1998,32 @@ struct CGen {
                 indent++;
                 if (f->iterTy == tString) {
                     // for c in s：逐字节产出单字符 string
-                    line("const char* " + itVar + " = " + expr(f->iterable) +
+                    line("const char* " + itVar +
+                         (arcMode ? " __attribute__((cleanup(lx_gc_releasep)))"
+                                  : "") +
+                         " = " +
+                         (arcMode ? coerceStore(f->iterable, f->iterable->ty)
+                                  : expr(f->iterable)) +
                          ";");
                     line("for (int64_t " + ixVar + " = 0; " + itVar + "[" +
                          ixVar + "] != 0; " + ixVar + " += 1) {");
                     indent++;
                     line("const char* " + mangle(f->var) +
+                         (arcMode ? " __attribute__((cleanup(lx_gc_releasep)))"
+                                  : "") +
                          " = lx_str_char_at(" + itVar + ", " + ixVar + ");");
                     stmt(f->body);
                     indent--;
                     line("}");
                 } else {
                     const Ty* et = f->varTy ? f->varTy : TyStore::int64Ty();
-                    line("lx_arr " + itVar + " = " + expr(f->iterable) + ";");
+                    line("lx_arr " + itVar +
+                         (arcMode ? " __attribute__((cleanup(lx_gc_releasep)))"
+                                  : "") +
+                         " = " +
+                         (arcMode ? coerceStore(f->iterable, f->iterable->ty)
+                                  : expr(f->iterable)) +
+                         ";");
                     // len 快照：迭代中 push/pop 不影响本次遍历（避免无限循环）
                     std::string nVar = tmpName("n");
                     line("int64_t " + nVar + " = " + itVar + "->len;");
@@ -1641,13 +2050,13 @@ struct CGen {
             case StmtKind::Return: {
                 auto* r = static_cast<ReturnStmt*>(s);
                 if (!r->value) {
-                    line("return;");
+                    // 0.8：返回类型是 T? 时，'return;' 返回 none
+                    if (curRetTy->kind == TyKind::Optional)
+                        line("return " + zeroOfA(curRetTy) + ";");
+                    else
+                        line("return;");
                 } else {
-                    std::string v = expr(r->value);
-                    if (curRetTy == tFloat && r->value->ty == tInt) {
-                        v = "((double)" + v + ")";
-                    }
-                    line("return " + v + ";");
+                    line("return " + coerceStore(r->value, curRetTy) + ";");
                 }
                 break;
             }
@@ -1670,7 +2079,7 @@ struct CGen {
         if (forceDefaultReturn) {
             line(std::string("return ") + forceDefaultReturn + ";");
         } else if (fn->retTy != tVoid) {
-            line("return " + zeroOf(fn->retTy) + ";");
+            line("return " + zeroOfA(fn->retTy) + ";");
         }
         indent--;
         line("}");
@@ -1721,6 +2130,10 @@ struct CGen {
         raw(" * ============================================================ */\n");
         raw(kRuntime);
         blank();
+        // ARC 字面量包装区（占位，program() 末尾回填）
+        raw("/*__LUX_LIT_WRAPPERS__*/\n");
+        litAnchor = buf.size() - std::string("/*__LUX_LIT_WRAPPERS__*/\n").size();
+        blank();
 
         // struct 类型定义（0.7）：字段对象，布局 = N*8
         // 先全部前向声明再定义，允许 struct 互相引用（A 的字段是 B*）。
@@ -1742,11 +2155,12 @@ struct CGen {
                 line("};");
             }
             blank();
-            // pelem / to_str 前置声明（嵌套 struct 互相引用）
+            // pelem / to_str / on_zero 前置声明（嵌套 struct 互相引用）
             for (StructDecl* sd : prog->structs) {
                 std::string cn = structCName(sd->name);
                 line("static void " + cn + "_pelem(lx_sb* b, const void* p);");
                 line("static char* " + cn + "_to_str(" + cn + "* o);");
+                line("static void " + cn + "_on_zero(void* p);");
             }
             blank();
             for (StructDecl* sd : prog->structs) {
@@ -1795,6 +2209,17 @@ struct CGen {
                 line(cn + "_pelem(&b, &o);");
                 line("if (!b.p) return lx_str_dup(\"\");");
                 line("return b.p;");
+                indent--;
+                line("}");
+                // ARC：释放 struct 内引用类型的字段（头由 lx_gc_release 统一 free）
+                line("static void " + cn + "_on_zero(void* p) {");
+                indent++;
+                line(cn + "* o = (" + cn + "*)p;");
+                for (const FieldDecl& f : sd->fields) {
+                    if (isRefTy(f.ty))
+                        line("lx_gc_release((void*)o->f_" + f.name + ");");
+                }
+                line("(void)o;");
                 indent--;
                 line("}");
             }
@@ -1878,6 +2303,7 @@ struct CGen {
                          : "int main(void)");
             line("{");
             indent++;
+            if (arcMode) line("lx_gc_enabled = 1;");
             if (hasArgv) {
                 const Param& p = mainFn->params[0];
                 line(cType(p.ty) + " " + mangle(p.name) +
@@ -1887,6 +2313,14 @@ struct CGen {
             line("return 0;");  // C 的 main 必须返回 int
             indent--;
             line("}");
+        }
+
+        // 回填 ARC 字符串字面量的静态不可变对象
+        if (!litDefs.empty()) {
+            const std::string marker = "/*__LUX_LIT_WRAPPERS__*/";
+            std::string w;
+            for (const std::string& d : litDefs) w += d + "\n";
+            buf.replace(litAnchor, marker.size(), w);
         }
     }
 };

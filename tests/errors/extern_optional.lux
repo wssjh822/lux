@@ -1,0 +1,5 @@
+// extern fn 不能收发可选类型（T? 是运行时私有表示，C 侧没有对应 ABI）
+extern fn f(x: int?);
+fn main() {
+    println("x");
+}

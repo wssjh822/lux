@@ -1,0 +1,21 @@
+{
+  "name": "mathx",
+  "version": "0.2.0",
+  "summary": "数论与数值小工具：gcd / lcm / clamp / 素数 / 阶乘 / 幂 / 符号",
+  "description": "纯 Lux 实现的常用数学辅助函数：gcd、lcm、clampf、clampi、is_prime、factorial、count_primes、sign、is_even、is_odd、ipow、digit_sum。无外部依赖。",
+  "main": "lib.lux",
+  "files": [
+    "lib.lux"
+  ],
+  "license": "MIT",
+  "tags": [
+    "math",
+    "number-theory",
+    "utils"
+  ],
+  "authors": [
+    "Lux 社区"
+  ],
+  "lux": ">=0.8.0",
+  "deps": {}
+}

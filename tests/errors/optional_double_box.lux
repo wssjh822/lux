@@ -1,0 +1,5 @@
+// 0.9.2 / B3：可选类型不能叠加（int??）。Sema 直接拒绝，两后端一致。
+fn main() {
+    let x: int?? = 5;
+    println(x);
+}

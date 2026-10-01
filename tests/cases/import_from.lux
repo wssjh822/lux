@@ -1,0 +1,22 @@
+// 0.9.3：from ... import ... 选择性导入 + #import 指令 + #define/#ifdef
+from "./mod/select.lux" import SELECT_TAG, pick;
+#import "math";
+#define SCALE 3
+
+fn main() {
+    println(SELECT_TAG);
+    println(pick(41));
+    println(sqrt(16.0));
+#ifdef SCALE
+    println(SCALE * 2);
+#else
+    println(0);
+#endif
+#ifndef NOPE
+    println("yes");
+#endif
+#undef SCALE
+#ifndef SCALE
+    println("undef-ok");
+#endif
+}

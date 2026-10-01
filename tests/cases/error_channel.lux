@@ -1,0 +1,65 @@
+// 0.8 错误通道：T? / ? 传播 / or 兜底 / ! panic 变体
+import "string";
+
+fn parse(x: string) -> int? {
+    return int(x);
+}
+
+fn twice(x: string) -> int? {
+    let n = int(x)?;
+    return n * 2;
+}
+
+fn lookup(k: string) -> string? {
+    if k == "a" { return "alpha"; }
+    if k == "b" { return "beta"; }
+    return none;
+}
+
+fn chain(k: string) -> int? {
+    let v = lookup(k)?;
+    return int(v)?;
+}
+
+fn main() {
+    // 字符串解析失败 → int?（不再静默返回 0）
+    println(int("42"));
+    println(int("abc"));
+    println(int(""));
+    println(int("12x"));
+    println(int("  7 "));
+
+    // or 兜底（左边是 T?，按左操作数类型分派）
+    println(int("9") or -1);
+    println(int("x") or -1);
+    println(lookup("a") or "fallback");
+    println(lookup("z") or "fallback");
+
+    // ? 传播：失败时整个函数返回 none
+    println(twice("10"));
+    println(twice("nope"));
+    println(chain("a"));
+    println(chain("z"));
+
+    // none 字面量与嵌套可选
+    let n: int? = none;
+    println(n);
+    let nn: int?? = none;
+    println(nn);
+
+    // ! panic 变体（成功路径）
+    println(int!("5") + 1);
+    println(twice!("21"));
+
+    // float? 与格式化
+    println(float("1.5"));
+    println(float("bad"));
+    println(float("2.5") or 0.0);
+    println(format("v={}", int("3") or 0));
+    println(string(int("x")));
+
+    // 隐式装箱：int → int?
+    let boxed: int? = 99;
+    println(boxed);
+    println(boxed or 0);
+}

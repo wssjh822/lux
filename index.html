@@ -164,17 +164,22 @@
     <div class="logo">Lux</div>
     <p class="tagline">
       一门用 C++ 写成的静态类型编程语言，<b>编译为原生可执行文件</b><br>
-      语法现代，<b>运行速度与手写 C 同速</b>；也可用 <b>原生后端</b> 零依赖直出 ELF
+      语法现代，<b>运行速度与手写 C 同速</b>；可选值 <b>T?</b> 让错误处理不再靠魔法值
     </p>
     <div class="cmd"><span>$ </span>luxc hello.lux --run</div>
     <div class="badges">
-      <span class="badge">v0.7.0</span>
+      <span class="badge">v0.9.3</span>
       <span class="badge">静态类型</span>
+      <span class="badge">错误通道 T? / ? / or / !</span>
+      <span class="badge">ARC 引用计数（--arc）</span>
+      <span class="badge">luxc build 项目构建</span>
+      <span class="badge">from … import / #import</span>
       <span class="badge">C 后端（C17）</span>
       <span class="badge">原生后端（--native）</span>
       <span class="badge">struct 结构体</span>
       <span class="badge">数组 + 切片</span>
       <span class="badge">模块系统 + 标准库</span>
+      <span class="badge">语言教程 docs/language.md</span>
       <span class="badge">REPL</span>
       <span class="badge">MIT</span>
     </div>
@@ -271,12 +276,14 @@ $ luxc hello.lux --emit-c
                <span class="cm">原生后端：x86-64 与 aarch64 机器码发射、ELF 布局</span>
   native_rt.lux <span class="cm">原生运行时库（Lux 自身编写，约 100 个 luxrt_* 函数）</span>
   repl.cpp     <span class="cm">交互式 REPL：行编辑、历史、TAB 补全、struct 支持</span>
-  pkgs.cpp     <span class="cm">包管理：luxc add / list / delete</span>
+  pkgs.cpp     <span class="cm">包管理：在线 install / search / publish / login（注册表客户端）</span>
+  json.cpp / sha256.cpp <span class="cm">注册表 JSON 解析 / 包校验哈希</span>
   util.cpp     <span class="cm">诊断渲染（rustc 风格 + 错误码）、文件读写、字符串转义</span>
   main.cpp     <span class="cm">luxc 驱动：串起流水线并调用 C 编译器 / 原生后端</span>
-<span class="d">tests/</span>       <span class="cm">143 项回归测试：行为 / 诊断 / 双后端差分 / 包管理 / REPL</span>
+<span class="d">server/</span>      <span class="cm">包注册表服务端：index.php 网页 + lux.php API + lib.php（账号体系）</span>
+<span class="d">tests/</span>       <span class="cm">180+ 项回归测试：行为 / 诊断 / 双后端差分 / 包管理（含在线注册表）/ REPL + CI 矩阵</span>
 <span class="d">bench/</span>       <span class="cm">与 C、Python 的性能对照实现</span>
-<span class="d">docs/</span>        <span class="cm">grammar.md / design.md / stability.md（1.0 冻结）/ arc.md</span>
+<span class="d">docs/</span>        <span class="cm">language.md（教程） / grammar.md / design.md / stability.md / arc.md</span>
     </div>
   </section>
 
@@ -351,9 +358,44 @@ $ luxc hello.lux --emit-c
         <p><code>a[i] += v</code>、<code>grid[i][j] = v</code>、<code>p.x *= 2</code>、<code>arr[i].x += 1</code>；左值子表达式只求值一次。</p>
       </div>
       <div class="card">
+        <span class="ic">?</span>
+        <h3>可选类型 T? <span style="color:var(--gold2)">0.8 新增</span></h3>
+        <p>返回值可能缺失 / 失败就写成 <code>int?</code>；<code>none</code> 是空值，<code>T</code> 自动装箱成 <code>T?</code>，反向必须显式解包。</p>
+      </div>
+      <div class="card">
+        <span class="ic">↗</span>
+        <h3>错误传播 <code>?</code> <span style="color:var(--gold2)">0.8 新增</span></h3>
+        <p><code>let t = read(p)?;</code> —— 失败时当前函数直接返回 <code>none</code>，成功时解包出值；把错误沿调用链上抛。</p>
+      </div>
+      <div class="card">
+        <span class="ic">‖</span>
+        <h3>兜底表达式 <code>or</code> <span style="color:var(--gold2)">0.8 新增</span></h3>
+        <p><code>read(p) or "default"</code>、<code>int(s) or 0</code>；按左操作数类型分派：左边是 <code>bool</code> 时仍是逻辑或。</p>
+      </div>
+      <div class="card">
+        <span class="ic">!</span>
+        <h3>panic 变体 <code>name!</code> <span style="color:var(--gold2)">0.8 新增</span></h3>
+        <p><code>int!("42")</code> / <code>read!("a.txt")</code>：失败即退出，脚本里少写一堆分支；<code>int</code> / <code>read</code> 不再静默吞错。</p>
+      </div>
+      <div class="card">
         <span class="ic">⌘</span>
         <h3>原生代码生成后端 <span style="color:var(--gold2)">0.6 新增</span></h3>
         <p><code>luxc --native</code> 直出本机架构（x86-64 / aarch64）Linux ELF，不调用 C 编译器、不链接 libc；运行时全部由 Lux 自身实现。</p>
+      </div>
+      <div class="card">
+        <span class="ic">⬇</span>
+        <h3>在线包管理 <span style="color:var(--gold2)">0.9 新增</span></h3>
+        <p><code>luxc install</code> 从注册表下载安装并自动解析依赖；<code>login</code> / <code>publish</code> / <code>unpublish</code> 带账号体系。官方包：<code>mathx</code> / <code>strx</code> / <code>numx</code> / <code>arrx</code> / <code>jsonx</code>。网页端在 <a href="https://lux.xfes.top/lux/">lux.xfes.top/lux</a>。</p>
+      </div>
+      <div class="card">
+        <span class="ic">⚙</span>
+        <h3>项目构建 <span style="color:var(--gold2)">0.9.3 新增</span></h3>
+        <p><code>luxc build .</code> 读取 <code>LuxBuildFile</code>（类似 <code>make</code>）：一键构建 / 运行 / 测试 / 清理，支持 <code>backend</code> / <code>arc</code> / <code>opt</code> / <code>testdir</code> 等配置，面向更大项目。</p>
+      </div>
+      <div class="card">
+        <span class="ic">⇄</span>
+        <h3>导入系统 <span style="color:var(--gold2)">0.9.3 新增</span></h3>
+        <p><code>from "mod" import a, b;</code> 选择性导入，<code>#import "mod";</code> 预处理写法，以及 <code>#define</code> / <code>#ifdef</code> 条件编译。</p>
       </div>
     </div>
   </section>
@@ -429,10 +471,12 @@ x += <span class="n">5</span>;  s += <span class="s">"!"</span>;  i++;  j--;
 <span class="c">// 调用 C 库函数</span>
 <span class="k">extern fn</span> <span class="f">cbrt</span>(x: <span class="t">float</span>) -&gt; <span class="t">float</span>;
 
-<span class="c"># 包管理</span>
-$ luxc add ./mypkg       <span class="c"># 安装到 ~/.lux/packages/</span>
-$ luxc list              <span class="c"># 列出已安装的包</span>
-$ luxc delete mypkg      <span class="c"># 卸载</span></code></pre>
+<span class="c"># 包管理（0.9 在线注册表）</span>
+$ luxc install mathx     <span class="c"># 下载安装 + 自动装依赖</span>
+$ luxc login             <span class="c"># 登录后才能发布（上传需账号）</span>
+$ luxc publish ./mypkg   <span class="c"># 发布到注册表</span>
+$ luxc unpublish mypkg   <span class="c"># 删除自己的包</span>
+$ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code></pre>
     <pre style="margin-top:22px"><code><span class="c">// 0.7：struct 结构体</span>
 <span class="k">struct</span> <span class="t">Point</span> {
     <span class="k">let</span> x: <span class="t">int</span>;
@@ -452,6 +496,22 @@ $ luxc delete mypkg      <span class="c"># 卸载</span></code></pre>
 
     <span class="k">let</span> raw = <span class="f">r</span><span class="s">"C:\path\no\escape"</span>;    <span class="c">// 0.7：原始字符串</span>
     <span class="k">let</span> big = <span class="n">inf</span>;                     <span class="c">// 0.7：inf / nan 字面量</span>
+}</code></pre>
+    <pre style="margin-top:22px"><code><span class="c">// 0.8：错误通道 —— 可选类型 / ? 传播 / or 兜底 / ! panic</span>
+<span class="k">import</span> <span class="s">"file"</span>;
+<span class="k">import</span> <span class="s">"string"</span>;
+
+<span class="k">fn</span> <span class="f">load_port</span>(path: <span class="t">string</span>) -&gt; <span class="t">int?</span> {
+    <span class="k">let</span> text = <span class="f">read</span>(path)<span class="k">?</span>;              <span class="c">// 失败向上传播</span>
+    <span class="k">return</span> <span class="f">int</span>(text)<span class="k">?</span>;                    <span class="c">// 解析失败也传播</span>
+}
+
+<span class="k">fn</span> <span class="f">main</span>(argv: <span class="t">string[]</span>) {
+    <span class="k">let</span> p = <span class="f">load_port</span>(<span class="s">"port.txt"</span>);
+    <span class="k">println</span>(p);                          <span class="c">// some(8080) / none</span>
+    <span class="k">let</span> port = p <span class="k">or</span> <span class="n">3000</span>;               <span class="c">// 兜底默认值</span>
+    <span class="k">println</span>(<span class="s">"listen "</span> + <span class="f">string</span>(port));
+    <span class="k">println</span>(<span class="f">int!</span>(<span class="s">"42"</span>) + <span class="n">1</span>);            <span class="c">// !：失败即 panic</span>
 }</code></pre>
   </section>
 
@@ -491,13 +551,14 @@ $ luxc delete mypkg      <span class="c"># 卸载</span></code></pre>
     <p class="sub">以下取舍是刻意为之 —— 把不确定的东西留在后面，先把确定的部分做对。</p>
     <div class="road">
       <div>
-        <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">当前限制（0.7）</h3>
+        <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">当前限制（0.9）</h3>
         <ul class="li">
-          <li class="warn"><b>不会自动释放内存</b> —— 字符串拼接、数组扩容、struct 构造都会持续占用；ARC 是 0.7.x / 0.8 的主题（设计草案见 <code>docs/arc.md</code>）</li>
+          <li class="warn"><b>内存默认不自动回收</b> —— 不带 <code>--arc</code> 时字符串拼接、数组扩容、<b>可选值装箱</b>、struct 构造都会持续占用；
+            <b>0.9.3 修复了 ARC 折叠串缺陷并回收打印临时串</b>；原生后端 free list、<code>T?</code> 装箱回收与 ARC 默认开启仍待完成（见 <code>docs/arc.md</code>）</li>
           <li class="warn">数组与 struct 都是引用语义，<b>不支持 <code>==</code> 比较</b>（请逐个比较元素 / 字段）</li>
           <li class="warn"><code>len()</code> / <code>find</code> / <code>substr</code> / <code>chars</code> / 字符串 for-in 按 UTF-8 <b>字节</b>计，不是字符数</li>
-          <li class="warn">空数组 <code>[]</code> 作为函数实参无法推断元素类型（请先声明带类型的变量）</li>
-          <li class="warn">原生后端在<b>溢出 / 下溢 / 极端指数</b>附近的浮点数学与 libm 有末位差异（常规范围精度良好）</li>
+          <li class="warn">原生后端 <code>cos</code> / <code>tan</code> / <code>asin</code> / <code>atan</code> / <code>atan2</code> 在<b>末位</b>与 libm 可能不同（大数格式化 bug 已在 0.8 修正）</li>
+          <li class="warn">没有高阶函数 / <code>fn</code> 类型（<code>sort</code> / <code>map</code> / <code>filter</code>）与 <code>static let</code> 全局可变变量</li>
           <li class="warn">标识符只支持 ASCII；C 后端需系统装有 C 编译器（原生后端不需要）</li>
           <li class="warn">只支持 POSIX 平台（Linux / macOS），Windows 请用 WSL / MSYS2</li>
         </ul>
@@ -519,9 +580,20 @@ $ luxc delete mypkg      <span class="c"># 卸载</span></code></pre>
           <li class="done"><b><code>struct</code> 结构体：声明 / 构造 / 成员读写 / 嵌套 / struct 数组</b> ✓ 0.7 已完成</li>
           <li class="done"><b>if 表达式、原始字符串、<code>nan</code> / <code>inf</code>、<code>main(argv)</code></b> ✓ 0.7 已完成</li>
           <li class="done"><b>通用左值复合赋值（<code>a[i] += v</code> / <code>p.x += v</code>）</b> ✓ 0.7 已完成</li>
-          <li>自动内存管理（ARC / 引用计数）— 0.7.x / 0.8</li>
-          <li>错误通道 <code>T?</code> / <code>?</code> / <code>or</code> — 0.8</li>
-          <li>高阶函数与 <code>fn</code> 类型（sort / map / filter）— 0.8</li>
+          <li class="done"><b>错误通道：<code>T?</code> / <code>?</code> 传播 / <code>or</code> 兜底 / <code>name!</code> panic，标准库迁移</b> ✓ 0.8 已完成</li>
+          <li class="done"><b>C 层欠账（<code>/=</code> <code>%=</code> 除零、<code>&gt;&gt;</code> 算术右移、<code>f([])</code>、标识符撞名）</b> ✓ 0.8 已完成</li>
+          <li class="done"><b>三个原生后端潜伏 bug（aarch64 浮点数组 / 文件路径 / 大数格式化）</b> ✓ 0.8 已完成</li>
+          <li class="done"><b>CI + 双后端差分矩阵 + ASan/UBSan + fuzzing 冒烟</b> ✓ 0.8 已完成</li>
+          <li class="done"><b>在线包管理：注册表下载 / 校验 / 依赖 / 版本 / 搜索 / 发布</b> ✓ 0.9 已完成</li>
+          <li class="done"><b>注册表账号体系：登录 / 上传 / 修改 / 删除自己的包 + 网页界面</b> ✓ 0.9.1 已完成</li>
+          <li class="done"><b>ARC 引用计数（<code>--arc</code>，C 后端）：1e6 次拼接峰值内存 117MB→11MB</b> ✓ 0.9.2 已完成</li>
+          <li class="done"><b>语言教程 <code>docs/language.md</code>（面向人与 AI）+ 建议.txt 审阅修复 + 注册表加固</b> ✓ 0.9.2 已完成</li>
+          <li class="done"><b>项目构建 <code>luxc build</code> + <code>LuxBuildFile</code>（构建 / 运行 / 测试 / 清理）</b> ✓ 0.9.3 已完成</li>
+          <li class="done"><b>导入系统：<code>from … import …</code> / <code>#import</code> / <code>#define</code> / <code>#ifdef</code></b> ✓ 0.9.3 已完成</li>
+          <li class="done"><b>ARC 正确性（折叠串 / 打印临时串 / 原生未初始化 string）+ 自带库扩展</b> ✓ 0.9.3 已完成</li>
+          <li>原生后端 ARC（free list）、<code>T?</code> 装箱回收与 ARC 默认开启
+          <li>高阶函数与 <code>fn</code> 类型（sort / map / filter）— 不进 1.0，留 1.x</li>
+          <li>aarch64 原生数学末位对齐 — 待校准</li>
           <li>枚举与模式匹配、泛型 — 1.x</li>
         </ul>
       </div>
@@ -529,13 +601,14 @@ $ luxc delete mypkg      <span class="c"># 卸载</span></code></pre>
   </section>
 
   <footer>
-    <p><span class="lx">Lux</span> v0.7.0 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
+    <p><span class="lx">Lux</span> v0.9.3 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
     <p style="margin-top:8px">
       完整文档见 <a href="README.md">README.md</a> ·
+      <a href="docs/language.md">语言教程</a> ·
       <a href="docs/grammar.md">文法定义</a> ·
       <a href="docs/design.md">架构与扩展指南</a> ·
       <a href="docs/stability.md">稳定性说明</a> ·
-      <a href="docs/arc.md">ARC 草案</a>
+      <a href="docs/arc.md">ARC 设计</a>
     </p>
   </footer>
 

@@ -1,0 +1,5 @@
+// read! 失败：panic 必须带上是哪个文件
+import "file";
+fn main() {
+    println(read!("__lux_no_such_file__.txt"));
+}

@@ -1,0 +1,4 @@
+fn f(x: string) -> int {
+    return int(x)?;
+}
+fn main() { println(f("1")); }

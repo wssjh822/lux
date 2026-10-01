@@ -1,0 +1,17 @@
+struct P { let x: int; let y: int; }
+fn sum5(a: P, b: P, c: P, d: P, e: P) -> int {
+    return a.x + b.x + c.x + d.x + e.x;
+}
+fn main() {
+    println(sum5(P{x:1,y:0}, P{x:2,y:0}, P{x:3,y:0}, P{x:4,y:0}, P{x:5,y:0}));
+    let a = P{x:1,y:1};
+    let b = P{x:2,y:2};
+    let c = P{x:3,y:3};
+    let d = P{x:4,y:4};
+    let e = P{x:5,y:5};
+    println(a.x + b.x + c.x + d.x + e.x);
+    a.y = b.y + c.y;
+    println(a);
+    println(P{x: a.x + b.x + c.x, y: d.y * 2});
+    println([P{x:1,y:2}, P{x:3,y:4}]);
+}

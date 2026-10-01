@@ -1,7 +1,8 @@
 # Lux 文法定义
 
-本文法描述 Lux 0.7 的完整语法。记号沿用扩展巴科斯范式（EBNF）：
-`*` 表示重复零次或多次，`?` 表示可选，`|` 表示多选一，终结符用引号括起。
+本文法描述 Lux 0.9 的完整语法（涵盖 0.9.x；1.0 只冻结、不再新增语法）。记号沿用扩展
+巴科斯范式（EBNF）：`*` 表示重复零次或多次，`?` 表示可选，`|` 表示多选一，
+终结符用引号括起。
 
 ---
 
@@ -31,14 +32,17 @@ ident := ('a'..'z' | 'A'..'Z' | '_') ('a'..'z' | 'A'..'Z' | '0'..'9' | '_')*
 fn      let     const   return  if      else
 elif    while   for     loop    in      break
 continue        repeat  struct
-true    false   and     or      not     nan     inf
+true    false   and     or      not     nan     inf     none
 import  extern  as
 int     float   bool    string  void
 ```
 
+（`from` 是上下文关键字，不作为保留字；见 §2.1 选择性导入。）
+
 `elif` 是 `else if` 的别名；`repeat n {}` 是 `for` 区间的语法糖；
 `struct` 声明具名类型（0.7）；`nan` / `inf` 是浮点字面量（0.7）；
-`import` 与 `extern` 只能在顶层出现；`as` 用于给 import 起别名。
+`none` 是可选类型的空值字面量（0.8）；`import` 与 `extern` 只能在顶层出现；
+`as` 用于给 import 起别名。
 
 ### 1.4 整数字面量
 
@@ -76,7 +80,8 @@ stringLiteral := '"' (普通字符 | 转义序列)* '"'
                       | 'U' 十六进制数字×8 )
 ```
 
-字符串是 UTF-8 编码，不允许跨行。
+字符串是 UTF-8 编码，不允许跨行。`\xNN` 写出的是**码点**而非原始字节：
+`"\xFF"` 编码成两字节 `C3 BF`，不是单字节 `0xFF`。
 
 原始字符串（0.7）不做任何转义处理，内容原样保留：
 
@@ -92,6 +97,7 @@ rawStringLiteral := 'r' '"' 任意字符* '"'
 == != <  <= >  >=
 && || !  &  |  ^  ~  << >>
 ++ -- += -= *= /= %= &= |= ^= <<= >>=
+?  !(后缀)
 ```
 
 `[` `]` 从 0.5 起用于数组：类型写法（`[int]` / `int[]`）、数组字面量
@@ -99,6 +105,10 @@ rawStringLiteral := 'r' '"' 任意字符* '"'
 `.` 自 0.7 起同时用于 struct 成员访问（`p.x`），模块限定访问（`mod.fn`）保持不变。
 `++` / `--` 只能以语句形式出现（`x++;`）。复合赋值（`+=` 等）为独立左值语义，
 左值子表达式只求值一次（0.7 起可用于下标 / 成员左值）。
+
+`?`（0.8）有且只有两个固定位置：类型后缀 `T?`（可选类型）与表达式后缀
+`expr?`（错误传播）。`!`（0.8）额外用作函数调用后缀：`name!(...)` 是
+panic 变体（见 §8）；前缀 `!` 仍然是一元逻辑非，二者不冲突。
 
 ---
 
@@ -111,6 +121,8 @@ program     := topLevel*
 topLevel    := importDecl | externDecl | funcDecl | globalConst | structDecl
 
 importDecl  := 'import' stringLiteral ( 'as' IDENT )? ';'
+             | 'from' stringLiteral 'import' ( '*' | IDENT ( ',' IDENT )* ) ';'   // 0.9.3
+             | '#import' stringLiteral ';'?                                       // 0.9.3（预处理）
 externDecl  := 'extern' 'fn' IDENT '(' paramList? ')' ( '->' type )? ';'
 
 structDecl  := 'struct' IDENT '{' fieldDecl* '}'          // 0.7
@@ -126,14 +138,18 @@ literal     := intLiteral | floatLiteral | stringLiteral | 'true' | 'false'
 funcDecl    := 'fn' IDENT '(' paramList? ')' ( '->' type )? block
 paramList   := param ( ',' param )*
 param       := IDENT ':' type
-type        := baseType ( '[]' )*          // int[]、int[][]（后缀写法）
-             | ( '[]' )* baseType ( '[]' )*  // [int]、[[int]]（前缀写法，可混用）
+type        := '[' type ']'                 // 前缀写法 [T]（单层）
+             | baseType suffix*
+suffix      := '[' ']' | '?'                // 数组 / 可选，从左到右依次绑定
 baseType    := 'int' | 'float' | 'bool' | 'string' | 'void'
              | IDENT                       // struct 具名类型（0.7）
 ```
 
 `void` 只能作为函数返回类型，不能出现在变量 / 参数 / 数组元素位置。
-数组的前缀写法 `[T]` 与后缀写法 `T[]` 完全等价，`[]` 可以叠加以构造嵌套数组。
+数组的前缀写法 `[T]` 与后缀写法 `T[]` 等价，`[]` 可以叠加以构造嵌套数组。
+`?`（0.8）把类型变成可选类型 `T?`，可嵌套（`int??`）；`T?` 不能作为数组元素
+类型：`int?[]` 会被拒绝，想要“可能为 none 的数组”请写 `int[]?`（后缀从左到右
+依次绑定：`int[]?` 是“可选数组”，而 `int?[]` 是非法数组元素类型）。
 
 全局常量的初始值必须是**常量表达式**（字面量、字面量之间的算术 / 位运算 /
 字符串拼接，或引用之前声明的全局常量）—— 它需要编译成 C 的 `static const`，
@@ -153,6 +169,17 @@ baseType    := 'int' | 'float' | 'bool' | 'string' | 'void'
 `别名.成员` 访问。任何已 import 的模块都支持 `模块名.成员` 限定访问。
 同一文件只加载一次，循环 import 安全。`extern fn` 只声明 C 函数
 （不生成函数体），生成的 C 里直接引用原符号名。
+
+**选择性导入（0.9.3）**：`from "mod" import a, b;` 只把 `a`、`b` 注入当前
+命名空间，模块里的其他成员不会被裸名访问（但仍可用 `mod.other` 限定访问）。
+`from "mod" import *;` 等价于默认导入。`from` 是上下文关键字：它只在顶层
+`from "路径" import` 形态里生效，仍可作为普通标识符使用。
+
+**预处理指令（0.9.3）**：在词法分析前逐行处理 `#` 开头的指令，行号保持不变。
+支持 `#import` / `#include`（等价于 `import`）、`#define NAME [值]`（对象式宏）、
+`#undef`、`#ifdef` / `#ifndef` / `#if` / `#elif` / `#else` / `#endif`、`#error`。
+宏在普通代码行里做整词展开（跳过字符串字面量与 `//` 注释）；`#if` 支持整数、
+`defined(NAME)`、`!` / `&&` / `||` 与括号。
 
 ### 2.2 语句
 
@@ -232,20 +259,21 @@ postfixSuffix := '[' expr ']'                       // 0.5 下标：a[i]、m[i][
                | '[' expr? ('..' | '..=') expr? ']' // 0.6 切片：a[lo..hi]、a[lo..=hi]，
                                                     // 端点可省略（a[..hi] / a[lo..] / a[..]）
                | '.' IDENT                          // 0.7 struct 成员：p.x、a[i].x
+               | '?'                                // 0.8 错误传播：expr?
 
 primary     := intLiteral
              | floatLiteral
              | stringLiteral
              | rawStringLiteral
-             | 'true' | 'false' | 'nan' | 'inf'
+             | 'true' | 'false' | 'nan' | 'inf' | 'none'   // none：0.8 可选空值
              | '[' argList? ','? ']'          // 0.5 数组字面量（支持尾逗号）
              | IDENT '{' fieldInit ( ',' fieldInit )* ','? '}'  // 0.7 struct 字面量
              | 'if' expr '{' expr '}' 'else' '{' expr '}'      // 0.7 if 表达式
              | IDENT ( '.' IDENT )+           // 成员访问 / 模块限定访问
              | IDENT
              | IDENT ( '.' IDENT ) '(' argList? ')'  // 0.5 数组方法 a.push(x) 等
-             | IDENT '(' argList? ')'         // 函数调用
-             | ('int' | 'float' | 'string') '(' expr ')'   // 类型转换
+             | IDENT ( '.' IDENT )? '!' '(' argList? ')'  // 0.8 panic 变体 f!(...) / read!(...)
+             | ('int' | 'float' | 'string') ( '!' )? '(' expr ')'   // 类型转换（int! 为 panic 版）
              | '(' expr ')'
 
 fieldInit   := IDENT ':' expr
@@ -291,8 +319,20 @@ struct 字面量（`while x { ... }` 中的 `x` 是普通标识符）。
 | 12 | `(` `)` 分组、函数调用 | — | — | — |
 | 13 | `a[i]`（后缀下标） | 左 | 数组×int → 元素类型；string×int → string | 元素类型 / string |
 | 13 | `p.x`（后缀成员，0.7） | 左 | struct → 字段类型 | 字段类型 |
+| 13 | `expr?`（后缀传播，0.8） | 左 | `T?` → `T`（所在函数须返回 `U?`） | `T` |
+| 13 | `f!(...)`（panic 变体，0.8） | 左 | `T?` 函数 → `T` | `T` |
 
 数值混合规则：`int` 和 `float` 参与同一个运算时，`int` 自动提升为 `float`，结果是 `float`。
+移位 `<<` / `>>` 的位移量**按 64 取模**（`x << 64` 等价于 `x << 0`，负数位移按补码取模），
+两个后端一致；不要依赖“位移超宽就归零”的直觉。
+
+**`or` 的分派规则（0.8，A3.1 方案 a）**：`or` 关键字按**左操作数类型**分派——
+左操作数为 `bool` 时按级别 1 的逻辑或解释；为 `T?` 时按兜底解释（失败取右侧，
+右侧需可转换为 `T`，结果类型为 `T`）。`||` 永远是逻辑或，不参与分派。
+
+`or` 是左结合的，而 `a? or b?` 的结果类型是 `T`，所以 **`or` 不能链式兜底**：
+`a? or b? or c` 里第二个 `or` 的左侧已是 `T` 而不是 `T?`，会被当成逻辑或而报错。
+需要多层兜底时请嵌套：`a? or (b? or c)`，或显示解包后再判断。
 
 复合赋值（`+=` 等）与 `++` / `--` 不是表达式运算符，只能出现在语句位置：
 `lhs op= e` 按上表取对应运算的优先级与类型规则，且 `lhs` 只求值一次；
@@ -304,7 +344,9 @@ struct 字面量（`while x { ... }` 中的 `x` 是普通标识符）。
 
 ### 4.1 隐式转换
 
-只有一条：`int → float`。其余转换必须显式写出。
+只有两条：`int → float`；`T → T?`（0.8 自动装箱）。其余转换必须显式写出。
+特别地 **`T? → T` 不是隐式转换**：必须用 `?` 传播、`or` 兜底或 `!` panic 解包，
+否则错误通道会泄漏。
 
 ### 4.2 各运算符的类型约束
 
@@ -315,7 +357,7 @@ struct 字面量（`while x { ... }` 中的 `x` 是普通标识符）。
 | `-` `*` `/` | int/float | int/float | 提升后的类型 |
 | `%` | int | int | int |
 | `<` `<=` `>` `>=` | 数值 或 string | 同左 | bool |
-| `==` `!=` | 同类型，或数值混合 | 同左 | bool（**数组操作数被禁止**） |
+| `==` `!=` | 同类型，或数值混合 | 同左 | bool（**数组操作数被禁止；`T?` 也被禁止**，需先用 `?` / `or` / `!` 解包） |
 | `&&` `\|\|` | bool | bool | bool |
 | `&` `\|` `^` `<<` `>>` | int | int | int |
 | 一元 `-` | int/float | — | 同类型 |
@@ -380,3 +422,49 @@ struct 字面量（`while x { ... }` 中的 `x` 是普通标识符）。
 - 构造时字段必须全部给出且不重复；未知字段报错。
 - 字段访问链必须是左值才能赋值；`const` struct 不可修改字段。
 - struct 不支持 `==` / `!=`；可作为数组元素、嵌套、打印。
+- 不支持无初始化的 struct 变量声明（`let p: Point;` 报错；需要空值请写 `Point?`）。
+
+---
+
+## 8. 错误通道（0.8）
+
+### 8.1 类型
+
+```ebnf
+optionalType := type '?'        // int? / string? / Point? / int??（可嵌套）
+```
+
+- `T?` 表示“可能缺失 / 失败的 `T`”。表示层统一为**指向堆槽的指针，`none` = 空指针**；
+  两个后端都用单个 8 字节槽传递。`T?` 不能作为数组元素类型。
+- `T` 可以隐式转成 `T?`（自动装箱）；`T?` **不能**隐式转回 `T`。
+- `none` 是 `T?` 的空值字面量，类型完全由上下文决定；没有可选上下文时报错。
+- `return;`（不带值）在返回类型为 `T?` 的函数里等价于 `return none;`。
+
+### 8.2 三种解包方式
+
+| 形式 | 语义 | 适用场景 |
+| --- | --- | --- |
+| `expr?` | 传播：`expr` 为 `none` 时当前函数立即返回 `none`；成功时得到 `T` | 库代码 / 调用链上抛 |
+| `lhs or rhs` | 兜底：`lhs` 为 `none` 时取 `rhs`（`rhs` 需能转成 `T`） | 需要一个默认值 |
+| `name!(...)` / `f!(...)` | panic：为 `none` 时打印错误并退出（脚本友好） | 脚本 / 确定不会失败 |
+
+约束：
+- `expr?` 的 `expr` 必须是 `T?`，且**所在函数的返回类型必须是 `U?`**（否则报定向错误）。
+- `or` 的左侧必须是 `T?`（否则按逻辑或解释，要求两侧 `bool`）。
+- `!` 后缀只能用于可能失败的内建（`int` / `float` / `read`）或返回 `T?` 的用户函数。
+
+### 8.3 标准库中的错误通道
+
+| 函数 | 签名 | 失败行为 |
+| --- | --- | --- |
+| `int(x)` | 数值/bool → `int`；string → `int?` | 解析失败返回 `none` |
+| `float(x)` | 数值/bool → `float`；string → `float?` | 解析失败返回 `none` |
+| `read(path)` | → `string?` | 打开失败返回 `none` |
+| `int!` / `float!` / `read!` | 对应 panic 变体 | 失败即 panic（退出码 1） |
+
+其余标准库函数保持原值语义（`write` / `append` / `remove` / `rename` / `exists`
+返回 `bool`，`system` 返回退出码，`env` 缺失返回 `""`）。
+
+### 8.4 打印
+
+`print` / `println` / `string` / `format` 直接接受 `T?`，输出 `some(x)` 或 `none`。

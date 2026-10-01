@@ -44,7 +44,7 @@
 | aarch64 | `native_emit_arm64.hpp` 的 `Arm64` / `EM_AARCH64` | 标量 FP/SIMD | x0 / d0，`svc #0` |
 
 `native_body.inc` 只调用一组语义化方法（`push`/`pop`/`opRR`/`movrm`/
-`floatCompare`/`rawSyscall`…），不出现任何裸机器码，因此同一份代码生成
+`floatCompare`/`rawSyscall`…），不直接拼接机器码字节，因此同一份代码生成
 逻辑可同时服务两种架构；`native_emit.hpp` 在 `#if defined(__aarch64__)`
 处切换。要点：
 
@@ -337,6 +337,43 @@ typedef struct lx_arr* lx_arr;
 
 ---
 
+### 2.9 错误通道（0.8）
+
+**类型**：`TyKind::Optional`，复用 `elem` 字段（`T?` 的 `elem` = `T`），
+`TyStore::optionalOf` intern 化后指针相等依然成立。`tyName` 输出 `int?`。
+
+**表示**：`T?` 在**两个后端**都统一为“指向堆槽的指针，NULL = none”：
+
+- C 后端：`cType(T?) = cType(T) + "*"`；装箱用语句表达式
+  `({ T* o = (T*)lx_opt_alloc(sizeof(T)); *o = v; o; })`，解包 `(*o)`。
+- 原生后端：与所有值一样是 8 字节槽；装箱调 `luxrt_opt_box(v)`，解包 `[o]`。
+
+选择指针而非双字 `{ok,val}` 的原因：原生后端所有表达式都是单 8 字节槽，
+多字返回值会牵动调用约定 / `countSlots` / 所有值路径。
+
+**三种解包**：
+
+| 形式 | C 后端 | 原生后端 |
+| --- | --- | --- |
+| `expr?` | `({ T* o = expr; if (!o) return 0; (*o); })` | `test rax; jne ok; xor rax,rax; frameLeave; ok: mov rax,[rax]` |
+| `lhs or rhs` | `({ T* o = lhs; o ? (*o) : (rhs); })` | 分支 + 解包 + 惰性求值 rhs |
+| `f!(...)` | `({ T* o = f(...); if (!o) lx_panic_opt("f"); (*o); })` | `test rax; ... luxrt_panic_opt` |
+
+`?` 的早返回用 `return 0;` / `frameLeave` 实现，语义上就是“从当前函数返回
+`none`”；`frameLeave` 会重置栈指针，所以表达式里尚未清理的临时值会被一并丢弃。
+
+**装箱发生在隐式转换点**：`coerceTo`（C）/ `evalCoerced`（原生）在
+`let` 初始化、赋值、`return`、传参、struct 字段、数组元素、`if` 分支处统一处理
+`int→float` 与 `T→T?`。
+
+**打印**：`toStrOf`（C）/ `optToStrTop`（原生）把可选值渲染为 `some(x)` / `none`；
+其中 `string` 元素不加引号（与普通 `string()` 一致，区别于 struct 字段）。
+
+**为什么不用 `named("Result")`**：可选类型是语言原语而非库类型，放进 TyKind
+后 intern 化 / 比较 / 诊断都自然延续，无需引入新的 struct 机制。
+
+---
+
 ## 3. 加一个新语法特性：清单
 
 以"加入 `unless cond {}`（if 的反义）"为例，需要改动 4 处：
@@ -389,7 +426,7 @@ typedef struct lx_arr* lx_arr;
 
 ```cpp
 enum class TyKind { Invalid, Int, Float, Bool, String, Void,
-                    Fn, Array, Tuple, Named };
+                    Fn, Array, Tuple, Named, Optional };
 
 struct Ty {
     TyKind kind;
@@ -408,17 +445,16 @@ struct Ty {
 
 1. **数组/切片**：✅ **0.5 / 0.6 已落地**——数组语法 `[1,2,3]` / `a[i]` /
    `a[i]=v` / `len(a)` / 方法调用，类型走 `arrayOf(elem)`，运行时 `lx_arr`
-   堆头指针（暂无引用计数，靠进程退出回收，见 2.7）；切片 `a[lo..hi]` /
-   `a[lo..=hi]` 已双后端一致（复制语义）。**剩余部分**：引用计数、
-   `map` / `filter` / `sort` 高阶方法。
+   堆头指针（0.9.2 起带引用计数头，`--arc` 下自动回收；默认仍靠进程退出
+   回收）；切片 `a[lo..hi]` / `a[lo..=hi]` 已双后端一致（复制语义）。**剩余部分**：
+   原生后端 free list、可选装箱回收、`map` / `filter` / `sort` 高阶方法。
 2. **struct + 成员访问**：✅ **0.7 已落地**（见 2.8）——类型 `named("Point")`，
    `.` 成员、构造、嵌套、struct 数组、打印、双后端差分均通过。
-3. **错误通道**：类型走 `tupleOf({T, err})` 或专门的 `Result` Named 类型，
-   配上 `T?` 可选值语法与 `?` 传播符；`read()` / `int("abc")` 等
-   从"运行时 panic / 静默 0"迁移到统一失败语义。设计草案见 `docs/stability.md`
-   与 `docs/arc.md`。
-4. **高阶函数 / 泛型**：类型走 `fnOf(ret, params)`，`sort(arr, cmp)`、
-   `map/filter` 都靠它。
+3. **错误通道**：✅ **0.8 已落地**（见 2.9）——类型走新增的 `TyKind::Optional`
+   （复用 `elem` 字段）而非 `tupleOf` / `Result`，`T?` / `?` 传播 / `or` 兜底 /
+   `name!` panic 均已双后端一致；`read()` / `int("abc")` 已迁移到统一失败语义。
+4. **高阶函数 / 泛型**：类型走 `fnOf(ret, params)`；`sort(arr, cmp)`、
+   `map/filter` 都靠它。**拍板不进 1.0**（见 `docs/stability.md` §6.2），留到 1.x。
 
 ## 7. 诊断信息
 
@@ -432,7 +468,8 @@ error[E0003]: 变量 'x' 的初始值类型不匹配：这里是 'string' 类型
    |                  ^
 ```
 
-错误码约定：`E0001` 词法、`E0002` 语法、`E0003` 语义、`E0004` 模块/IO；
+错误码约定：`E0001` 词法、`E0002` 语法、`E0003` 语义、`E0004` 模块/IO、
+`E0005` struct 函数返回落穿（0.9.0 新增）；
 `W1001` 未使用变量/参数、`W1002` 表达式结果未使用、`W1003` 函数末尾缺
 return、`W1004` extern fn 与运行时符号冲突。新增诊断先在
 `DiagCode`（lux.hpp）里登记。
@@ -452,10 +489,12 @@ make test
 
 | 层 | 位置 | 校验内容 |
 | --- | --- | --- |
-| 行为测试 | `tests/cases/*.lux` | 编译运行后与 `.expected` 逐行比对（含 0.5 的 `arrays` / `for_in` / `string_ops` / `return_paths`） |
-| 诊断测试 | `tests/errors/*.lux` | `.err`：必须编译失败且诊断含关键字；`.warn`：必须编译成功且输出含警告关键字（0.5 新增 warn 模式） |
+| 行为测试 | `tests/cases/*.lux` | 编译运行后与 `.expected` 逐行比对（含 `arrays` / `for_in` / `string_ops` / `return_paths` / `main_argv` / `math_edges` / `arc_stress`） |
+| 诊断测试 | `tests/errors/*.lux` | `.err`：必须编译失败且诊断含关键字；`.warn`：必须编译成功且输出含警告关键字 |
+| 原生后端差分 | `run_tests.sh` 第 2.5 节 | 每个行为用例再跑一遇 `--native`，与 C 后端输出逐字节对比 |
+| ARC | `run_tests.sh` 第 2.6 节 | 每个行为用例再跑一遇 `--arc`（MALLOC_CHECK_ 抽查）+ churn 内存回归 |
 | 冒烟测试 | `examples/*.lux` | 必须能顺利编译通过 |
-| 包管理 | `run_tests.sh` 第 4 节 | add / 重复 add 报错 / import / delete（`LUX_HOME` 指向临时目录隔离） |
+| 包管理 | `run_tests.sh` 后续节 | add / 重复 add 报错 / import / delete / 在线注册表 / PHP 账号链路 |
 | REPL | `run_tests.sh` 第 3 节 | 管道模式逐行求值与错误诊断 |
 
 新增用例时，先写好 `.lux` 并**人工核对一遍输出**，再生成 `.expected`，
@@ -480,13 +519,18 @@ make test
 
 按重要性排列，详见 README 的路线图：
 
-1. **数组/切片/struct**：已基本落地，剩引用计数与高阶方法。
-2. **自动内存管理（ARC）**：目前字符串拼接 / 数组扩容 / struct 分配的结果
-   都不释放。落地需要把 `string` 的 C 表示从 `const char*` 换成带引用计数的
-   结构体，并在 Codegen 的赋值 / 传参 / 返回处插入 retain/release；
-   原生后端还要配套尺寸分级 free list（bump 分配器不能单独回收）。
-   设计草案见 `docs/arc.md`。
-3. **错误通道**：`T?` / `?` / `or` 与 `Result`；赶在 1.0 冻结前完成
-   （语义迁移是破坏性的）。
+1. **错误通道**：✅ **0.8 已落地**（见 2.9）。剩余：`find` 等函数的可选变体、
+   错误消息携带（当前 `T?` 只携带 ok/值，不携带错误描述）。
+2. **自动内存管理（ARC）**：✅ **0.9.2 已落地 C 后端**（`--arc`，实验性，见
+   2.7 与 `docs/stability.md` §6.1）——堆对象加 `{refs, on_zero}` 头、字符串
+   字面量改为静态不可变对象、Codegen 在局部变量作用域 / 赋值 / 返回 /
+   数组增删改 / struct 字段 / 嵌套拼接处插入 retain/release。**0.9.3 修复**
+   折叠字符串常量的无头指针缺陷并回收打印临时串。**剩余**：
+   原生后端尺寸分级 free list、`T?` 装箱回收、默认开启。
+3. **高阶函数 / `fn` 类型**：`fn(T,...) -> R` 类型与 `sort` / `map` / `filter`；
+   类型表已有 `TyKind::Fn` 备用。**不进 1.0**，留到 1.x。
 4. **原生后端**：`codegen.cpp` 目前是唯一依赖 C 编译器的环节。
    抽象出一个 `Backend` 接口后，可以并列实现 x86-64 汇编或 LLVM IR 后端。
+5. **aarch64 数学末位对齐（C5）**：`sin` / `log` / `pow` / `sqrt` 等已与 libm
+   一致，但 `cos` / `tan` / `asin` / `atan` / `atan2` 在末位仍可能不同；
+   大数浮点格式化（`bigE ≥ 0`）已在 0.8 修正。

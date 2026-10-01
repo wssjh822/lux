@@ -4,7 +4,7 @@ import "file";
 fn main() {
     println(write("__lux_test_tmp.txt", "hello"));
     println(append("__lux_test_tmp.txt", " world"));
-    println(read("__lux_test_tmp.txt"));
+    println(read!("__lux_test_tmp.txt"));
     println(exists("__lux_test_tmp.txt"));
     println(exists("__lux_no_such_file.txt"));
     println(remove("__lux_test_tmp.txt"));

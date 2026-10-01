@@ -1,0 +1,13 @@
+{
+  "name": "jsonx",
+  "version": "1.0.1",
+  "summary": "专业 JSON 处理：解析 / 生成 / 美化 / 文件读写，支持完整转义与 \\u 代理对",
+  "description": "纯 Lux 实现的 JSON 库。解析 JSON 文本或文件为 Json 树（对象用 keys[]/vals[] 并行数组），支持全部转义序列与 \\uXXXX 代理对、整数 64 位溢出检测、错误行列定位；可紧凑或两空格缩进生成标准 JSON；提供 get/at/getPath/has/keys/size、类型判定与转换、以及 readJson/writeJson。C 后端与原生后端行为一致，无外部依赖。",
+  "main": "lib.lux",
+  "files": ["lib.lux"],
+  "license": "MIT",
+  "tags": ["json", "parser", "serialization", "data", "utils"],
+  "authors": ["Lux 社区"],
+  "lux": ">=0.9.0",
+  "deps": {}
+}

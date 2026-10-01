@@ -1,0 +1,122 @@
+// ============================================================
+//  arrx —— Lux 官方包：数组小工具
+//  安装： luxc install arrx
+//  使用： import "arrx";
+//
+//  数组在 Lux 里是引用语义；本包所有函数都返回新数组或纯读取，
+//  不修改传入的数组。空数组上的 min / max 会 assert 失败（见文档）。
+// ============================================================
+import "string";
+
+// 反转 int 数组（返回新数组）
+fn arr_reverse_int(a: int[]) -> int[] {
+    let out: int[] = [];
+    let i = len(a) - 1;
+    while i >= 0 {
+        out.push(a[i]);
+        i = i - 1;
+    }
+    return out;
+}
+
+// 反转 string 数组（返回新数组）
+fn arr_reverse_str(a: string[]) -> string[] {
+    let out: string[] = [];
+    let i = len(a) - 1;
+    while i >= 0 {
+        out.push(a[i]);
+        i = i - 1;
+    }
+    return out;
+}
+
+// int 数组求和
+fn arr_sum_int(a: int[]) -> int {
+    let s = 0;
+    let i = 0;
+    while i < len(a) {
+        s = s + a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+// float 数组求和
+fn arr_sum_float(a: float[]) -> float {
+    let s = 0.0;
+    let i = 0;
+    while i < len(a) {
+        s = s + a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+// int 数组最小值（空数组 assert 失败）
+fn arr_min_int(a: int[]) -> int {
+    assert(len(a) > 0, "arr_min_int: 数组不能为空");
+    let m = a[0];
+    let i = 1;
+    while i < len(a) {
+        if a[i] < m { m = a[i]; }
+        i = i + 1;
+    }
+    return m;
+}
+
+// int 数组最大值（空数组 assert 失败）
+fn arr_max_int(a: int[]) -> int {
+    assert(len(a) > 0, "arr_max_int: 数组不能为空");
+    let m = a[0];
+    let i = 1;
+    while i < len(a) {
+        if a[i] > m { m = a[i]; }
+        i = i + 1;
+    }
+    return m;
+}
+
+// int 数组是否包含 v
+fn arr_contains_int(a: int[], v: int) -> bool {
+    let i = 0;
+    while i < len(a) {
+        if a[i] == v { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// int 数组里 v 首次出现的下标；找不到返回 -1
+fn arr_index_of_int(a: int[], v: int) -> int {
+    let i = 0;
+    while i < len(a) {
+        if a[i] == v { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// string 数组是否包含 v
+fn arr_contains_str(a: string[], v: string) -> bool {
+    let i = 0;
+    while i < len(a) {
+        if a[i] == v { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// string 数组里 v 首次出现的下标；找不到返回 -1
+fn arr_index_of_str(a: string[], v: string) -> int {
+    let i = 0;
+    while i < len(a) {
+        if a[i] == v { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 用分隔符连接 string 数组
+fn arr_join(a: string[], sep: string) -> string {
+    return join(a, sep);
+}

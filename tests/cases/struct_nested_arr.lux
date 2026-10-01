@@ -1,0 +1,17 @@
+// struct 的多层嵌套数组打印：两后端必须逐字一致（0.9 修复原生后端
+// 把 Point 字段当整数打印的分歧）
+struct Point { x: int; y: int; }
+
+fn make(n: int) -> Point {
+    return Point { x: n, y: n * 2 };
+}
+
+fn main() {
+    let grid: Point[][] = [[make(1), make(2)], [make(3)]];
+    println(grid);
+    println(string(grid));
+    let cube: Point[][][] = [[[make(4)]]];
+    println(cube);
+    let xs: int[][] = [[1, 2], [3]];
+    println(xs);
+}

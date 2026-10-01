@@ -7,7 +7,7 @@
 # =============================================================================
 
 # 版本号单源化：经 -DLUX_VERSION 编译期注入 luxc（README / 文档同步手工更新）
-LUX_VERSION ?= 0.7.0
+LUX_VERSION ?= 0.9.3
 
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter

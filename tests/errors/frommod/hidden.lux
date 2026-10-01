@@ -1,0 +1,5 @@
+const HIDDEN: string = "hidden";
+
+fn secret(x: int) -> int {
+    return x * 7;
+}

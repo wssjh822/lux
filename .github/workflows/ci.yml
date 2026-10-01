@@ -1,0 +1,82 @@
+name: CI
+
+# 0.8（E1）：每次 push / PR 都跑构建 + 全量回归 + 双后端差分矩阵。
+# 差分体系从“本地自觉”升级为“制度”：C 后端生成的程序与原生后端
+# 直出的 ELF 必须逐字节一致（tests/run_tests.sh 里的“差分”用例）。
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: x86-64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build luxc
+        run: make
+      - name: Version
+        run: ./build/luxc --version
+      - name: Regression + dual-backend differential
+        run: make test
+      - name: Compile examples (C backend)
+        run: |
+          for f in examples/*.lux; do ./build/luxc "$f" -o /tmp/ex_bin; done
+      - name: Lex/parse fuzzing (short smoke)
+        run: LUX_FUZZ_ITERS=200 ./tests/fuzz_lexparse.sh
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with sanitizers
+        run: |
+          make CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Wno-unused-parameter \
+            -fsanitize=address,undefined -fno-omit-frame-pointer"
+      - name: Run test suite under sanitizers
+        run: |
+          ASAN_OPTIONS=detect_leaks=0 ./tests/run_tests.sh
+
+  asan-generated-c:
+    name: ASan on generated C
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - name: Compile behaviour cases with ASan and run
+        run: |
+          set -e
+          for f in tests/cases/*.lux; do
+            name=$(basename "$f" .lux)
+            [ -f "tests/cases/$name.expected" ] || continue
+            (cd tests/cases && ../../build/luxc "$name.lux" \
+               -o /tmp/asan_$name \
+               -C "-fsanitize=address,undefined" -C "-g" 2>/dev/null) || continue
+            (cd tests/cases && ASAN_OPTIONS=detect_leaks=0 /tmp/asan_$name >/dev/null 2>&1) || {
+              echo "ASan failure: $name"; exit 1; }
+          done
+      - name: Compile behaviour cases with ASan + --arc and run
+        # 0.9.3（A1）：ARC 的折叠串 / 打印临时串缺陷只有 ASan 能一秒现形，
+        # 所以 ASan 矩阵必须同时跑一遍 --arc 维度。
+        run: |
+          set -e
+          for f in tests/cases/*.lux; do
+            name=$(basename "$f" .lux)
+            [ -f "tests/cases/$name.expected" ] || continue
+            (cd tests/cases && ../../build/luxc --arc "$name.lux" \
+               -o /tmp/asanarc_$name \
+               -C "-fsanitize=address,undefined" -C "-g" 2>/dev/null) || continue
+            (cd tests/cases && ASAN_OPTIONS=detect_leaks=0 /tmp/asanarc_$name >/dev/null 2>&1) || {
+              echo "ASan --arc failure: $name"; exit 1; }
+          done

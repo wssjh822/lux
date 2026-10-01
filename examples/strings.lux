@@ -53,9 +53,9 @@ fn main() {
     println("圆周率 ≈ " + string(3.14159));
     println("开关 = " + string(true));
 
-    let parsed = int("1000") + 23;
+    let parsed = int!("1000") + 23;
     println(parsed);
-    println(float("2.5") * 4.0);
+    println(float!("2.5") * 4.0);
 
     // 转义字符
     println("第一行\n第二行");

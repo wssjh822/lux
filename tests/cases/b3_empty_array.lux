@@ -1,0 +1,21 @@
+// 0.8（B3）：空数组字面量 [] 作为函数实参，靠形参类型推断元素类型
+fn total(xs: int[]) -> int {
+    let s = 0;
+    for x in xs { s += x; }
+    return s;
+}
+fn names(ns: string[]) -> int { return len(ns); }
+fn avg(xs: float[]) -> float {
+    if len(xs) == 0 { return 0.0; }
+    let s = 0.0;
+    for x in xs { s += x; }
+    return s / float(len(xs));
+}
+fn main() {
+    println(total([]));
+    println(total([1, 2, 3]));
+    println(names([]));
+    println(names(["a", "b"]));
+    println(avg([]));
+    println(avg([1, 2, 3]));
+}

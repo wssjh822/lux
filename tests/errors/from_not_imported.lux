@@ -1,0 +1,7 @@
+// from ... import 只注入列出的成员：secret 未导入，裸名调用必须报错
+from "./frommod/hidden.lux" import HIDDEN;
+
+fn main() {
+    println(HIDDEN);
+    println(secret(2));
+}

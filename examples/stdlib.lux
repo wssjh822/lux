@@ -27,6 +27,6 @@ fn main() {
     let path = "/tmp/lux_stdlib_demo.txt";
     println("写入成功: " + string(write(path, "hello, lux")));
     println("追加成功: " + string(append(path, "!")));
-    println("文件内容: " + read(path));
+    println("文件内容: " + read!(path));
     println("文件存在: " + string(exists(path)));
 }

@@ -263,9 +263,19 @@ void ModuleLoader::processImport(const ImportDecl* imp,
                     "'）");
 }
 
-// 把模块注册进 ModuleInfo：默认导入注入全局命名空间，别名导入只登记映射
+// 把模块注册进 ModuleInfo：默认导入注入全局命名空间，别名导入只登记映射，
+// from ... import a, b 只把列出的成员注入全局命名空间（0.9.3）。
 void ModuleLoader::registerModule(const std::string& mod, const ImportDecl* imp) {
     modules.imported.insert(mod);
+    if (imp->selective) {
+        if (imp->star) {
+            modules.flat.insert(mod);  // from "mod" import * 等价于默认导入
+            return;
+        }
+        auto& set = modules.selected[mod];
+        for (const std::string& n : imp->names) set.insert(n);
+        return;
+    }
     if (imp->alias.empty()) {
         modules.flat.insert(mod);
         return;

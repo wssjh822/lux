@@ -32,7 +32,7 @@ namespace lux {
 namespace {
 
 #ifndef LUX_VERSION
-#define LUX_VERSION "0.7.0"
+#define LUX_VERSION "0.8.0"
 #endif
 
 const std::string kReplVersion = std::string("Lux ") + LUX_VERSION + " REPL";
@@ -109,6 +109,7 @@ struct Completions {
             "for", "loop", "in", "break", "continue", "repeat", "true",
             "false", "and", "or", "not", "import", "as", "extern", "int",
             "float", "bool", "string", "void", "struct", "nan", "inf",
+            "none",
             "println", "print", "len",
             "input", "assert", "exit", "abs", "sqrt", "pow", "floor", "ceil",
             "round", "sin", "cos", "tan", "asin", "acos", "atan", "log",

@@ -1,0 +1,45 @@
+// 返回路径分析防御（0.9.2 / A4）：这些函数看似会落穿，实际每条路径都 return。
+// 若 stmtAlwaysReturns 出现假阴性，这里会编译报 E0005；假阳性则可能落穿 UB。
+struct Pt { x: int; y: int; }
+
+fn nestedLoop(n: int) -> int {
+    // 外层 loop 里只有内层 for 的 break，不会跳出外层 → 必然返回
+    loop {
+        for i in 0..n {
+            if i > 100 { break; }
+        }
+        return n + 1;
+    }
+}
+
+fn condBreak(n: int) -> int {
+    // while true 里的 break 是浅层 → 循环本身不是必然返回，但后续 return 兜住
+    while true {
+        if n > 0 { break; }
+        return 0;
+    }
+    return 1;
+}
+
+fn deep(a: int) -> Pt {
+    if a > 0 {
+        if a > 10 { return Pt { x: 1, y: 1 }; } else { return Pt { x: 2, y: 2 }; }
+    } else {
+        if a < -10 { return Pt { x: 3, y: 3 }; } else { return Pt { x: 4, y: 4 }; }
+    }
+}
+
+fn orEarly(x: int?) -> int {
+    let v = x or 7;
+    return v;
+}
+
+fn main() {
+    println(nestedLoop(3));
+    println(condBreak(5));
+    println(condBreak(-5));
+    println(deep(20).x);
+    println(deep(0).y);
+    println(orEarly(int("abc")));
+    println(orEarly(int("9")));
+}

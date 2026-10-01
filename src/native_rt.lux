@@ -79,6 +79,18 @@ fn luxrt_panic_msg(msg: string) {
     __syscall(kSysExitGroup, 1);
 }
 
+// 切片越界：文案与 stability.md §3 冻结表逐字对齐（含数字）
+fn luxrt_panic_slice(lo: int, hi: int, n: int) {
+    luxrt_panic_msg("切片范围越界：起点 " + luxrt_i64_to_str(lo) +
+                    "，终点 " + luxrt_i64_to_str(hi) +
+                    "，长度 " + luxrt_i64_to_str(n));
+}
+
+// 文件读取失败（read!）：把路径一并报出来
+fn luxrt_panic_opt_file(what: string, path: string) {
+    luxrt_panic_msg(what + " 失败：无法读取 '" + path + "'");
+}
+
 // 越界统一文案："%s越界：下标 N，但长度只有 M（下标从 0 开始）"
 fn luxrt_bounds_fail(what: string, i: int, n: int) {
     luxrt_panic_msg(what + "越界：下标 " + luxrt_i64_to_str(i) +
@@ -130,9 +142,8 @@ fn luxrt_print_bool(v: bool) {
 // ---------------------------------------------------------------------------
 fn luxrt_assert_at(cond: bool, msg: string, line: int) {
     if cond { return; }
-    luxrt_write_str(2, "lux: 断言失败 (第 " + luxrt_i64_to_str(line) +
-                       " 行): " + msg + "\n");
-    __syscall(kSysExitGroup, 1);
+    luxrt_panic_msg("assert 失败：" + msg + "（第 " +
+                    luxrt_i64_to_str(line) + " 行）");
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +708,7 @@ fn luxrt_arr_pop(a: int[]) -> int {
 // hi 为排他上界；lo<0 / hi>len / lo>hi 一律 panic（与下标访问同风格）。
 fn luxrt_arr_slice(a: int[], lo: int, hi: int) -> int[] {
     let n = __peek64(a, 0);
-    if lo < 0 || hi > n || lo > hi { luxrt_panic_msg("切片范围越界"); }
+    if lo < 0 || hi > n || lo > hi { luxrt_panic_slice(lo, hi, n); }
     let cnt = hi - lo;
     let r = luxrt_arr_new(__peek64(a, 24));
     if cnt > 0 {
@@ -711,7 +722,7 @@ fn luxrt_arr_slice(a: int[], lo: int, hi: int) -> int[] {
 // s[lo..hi)：复制语义字符串切片（0.6 新增），边界规则与数组一致。
 fn luxrt_str_slice(s: string, lo: int, hi: int) -> string {
     let n = __peek64(s, 0);
-    if lo < 0 || hi > n || lo > hi { luxrt_panic_msg("切片范围越界"); }
+    if lo < 0 || hi > n || lo > hi { luxrt_panic_slice(lo, hi, n); }
     return luxrt_str_from_bytes(s, lo, hi - lo);
 }
 
@@ -1075,7 +1086,10 @@ fn luxrt_f64_to_str(v: float) -> string {
         luxrt_big_shl(bn, bigE);
         let digits = luxrt_big_digits(bn);
         let nd = len(digits);
-        return luxrt_fmt_g(neg, digits, nd + bigE, bigE, m);
+        // 值 = N（N = M×2^bigE），小数点就在所有数字之后：xp = nd
+        // （旧代码写成 nd + bigE，把指数重复计入，大数（≥~4.5e15）
+        //  打印出的指数会多出 bigE——C12，0.8 修正）
+        return luxrt_fmt_g(neg, digits, nd, bigE, m);
     }
     // bigE < 0：N = M × 5^|E|，值 = N / 10^|E|
     let e2 = 0 - bigE;
@@ -1384,7 +1398,7 @@ fn luxrt_load_env_blob() -> int {
     }
 
     // 2) 回退：读 /proc/self/environ
-    let fd = __sys_open(__sptr("/proc/self/environ"), kO_RDONLY);
+    let fd = __sys_open(__sptr("/proc/self/environ") + 8, kO_RDONLY);
     if fd < 0 {
         __poke64(kSlotEnvBlob, 0, -1);  // 标记读取失败，避免反复重试
         return -1;
@@ -1584,7 +1598,7 @@ fn luxrt_file_fail(op: string, path: string) {
 }
 
 fn luxrt_file_read(path: string) -> string {
-    let fd = __sys_open(__sptr(path), kO_RDONLY);
+    let fd = __sys_open(__sptr(path) + 8, kO_RDONLY);
     if fd < 0 { luxrt_file_fail("读取", path); }
     let sb = __bump_alloc(256);
     if __syscall(kSysFstat, fd, sb) < 0 { luxrt_file_fail("读取", path); }
@@ -1604,14 +1618,14 @@ fn luxrt_file_read(path: string) -> string {
 }
 
 fn luxrt_file_exists(path: string) -> bool {
-    let fd = __sys_open(__sptr(path), kO_RDONLY);
+    let fd = __sys_open(__sptr(path) + 8, kO_RDONLY);
     if fd < 0 { return false; }
     __syscall(kSysClose, fd);
     return true;
 }
 
 fn luxrt_file_write(path: string, data: string) -> bool {
-    let fd = __sys_open(__sptr(path), kO_WRONLY_TRUNC);
+    let fd = __sys_open(__sptr(path) + 8, kO_WRONLY_TRUNC);
     if fd < 0 { return false; }
     let n = __peek64(data, 0);
     let w = 0;
@@ -1627,7 +1641,7 @@ fn luxrt_file_write(path: string, data: string) -> bool {
 }
 
 fn luxrt_file_append(path: string, data: string) -> bool {
-    let fd = __sys_open(__sptr(path), kO_WRONLY_APPEND);
+    let fd = __sys_open(__sptr(path) + 8, kO_WRONLY_APPEND);
     if fd < 0 { return false; }
     let n = __peek64(data, 0);
     let w = 0;
@@ -1643,11 +1657,11 @@ fn luxrt_file_append(path: string, data: string) -> bool {
 }
 
 fn luxrt_file_remove(path: string) -> bool {
-    return __sys_unlink(__sptr(path)) == 0;
+    return __sys_unlink(__sptr(path) + 8) == 0;
 }
 
 fn luxrt_file_rename(from: string, to: string) -> bool {
-    return __sys_rename(__sptr(from), __sptr(to)) == 0;
+    return __sys_rename(__sptr(from) + 8, __sptr(to) + 8) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1675,9 +1689,15 @@ fn luxrt_math_floorf(x: float) -> float {
     return t;
 }
 
-// 2^k（k 为整数，|k| < 1023）
+// 2^k（k 为整数）。正常范围 [−1022, 1023] 直接拼指数位；
+// 次正规区 [−1074, −1023] 用最小次正规 2^−1074 左移得到；
+// 更小下溢为 0，更大上溢为 +inf（0.9.2 修 exp 在极端输入下产出垃圾）。
 fn luxrt_math_pow2i(k: int) -> float {
-    return __f_from((k + 1023) << 52);
+    let r = 0.0;
+    if k > 1023 { r = 1.0 / 0.0; }
+    else if k >= -1022 { r = __f_from((k + 1023) << 52); }
+    else if k >= -1074 { r = __f_from(1 << (k + 1074)); }
+    return r;
 }
 
 // log2(x)：x = m·2^e，m∈[√2/2,√2)，log2(x)=e+ln(m)/ln2；
@@ -1854,4 +1874,143 @@ fn luxrt_math_fmod(a: float, b: float) -> float {
 
 fn luxrt_math_hypot(a: float, b: float) -> float {
     return sqrt(a * a + b * b);
+}
+
+// ---------------------------------------------------------------------------
+//  可选值（0.8 错误通道）
+//  T? 在机器层统一是一个 8 字节槽里的指针：0 = none，否则指向存放 T 的堆槽。
+//  codegen 的装箱 / 解包都直接调这里的函数。
+// ---------------------------------------------------------------------------
+fn luxrt_opt_box(v: int) -> int {
+    let p = __bump_alloc(8);
+    __poke64(p, 0, v);
+    return p;
+}
+
+fn luxrt_panic_opt(what: string) {
+    luxrt_panic_msg(what + " 失败：值为 none");
+}
+
+fn luxrt_is_digit(c: int) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+// 字符串是否是一个完整的 i64（与 C 后端 strtoll + 全串消费 + 溢出检查一致）
+fn luxrt_i64_ok(s: string) -> bool {
+    let n = __peek64(s, 0);
+    let i = 0;
+    while i < n && luxrt_isspace(__peek8u(s, 8 + i)) { i = i + 1; }
+    let neg = false;
+    if i < n && __peek8u(s, 8 + i) == 45 { neg = true; }
+    if i < n && (__peek8u(s, 8 + i) == 43 || __peek8u(s, 8 + i) == 45) {
+        i = i + 1;
+    }
+    let hiLim = 922337203685477580;
+    let hiLast = 8;
+    if !neg { hiLast = 7; }
+    let acc = 0;
+    let digits = 0;
+    let sat = false;
+    while i < n && luxrt_is_digit(__peek8u(s, 8 + i)) {
+        let d = __peek8u(s, 8 + i) - 48;
+        if !sat {
+            if acc > hiLim || (acc == hiLim && d > hiLast) { sat = true; }
+            else { acc = acc * 10 + d; }
+        }
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 { return false; }
+    if sat { return false; }
+    return i == n;
+}
+
+fn luxrt_match_ci(s: string, i: int, w: string) -> int {
+    let sl = __peek64(s, 0);
+    let wl = __peek64(w, 0);
+    if i + wl > sl { return -1; }
+    let k = 0;
+    while k < wl {
+        let a = __peek8u(s, 8 + i + k);
+        if a >= 65 && a <= 90 { a = a + 32; }
+        if a != __peek8u(w, 8 + k) { return -1; }
+        k = k + 1;
+    }
+    return wl;
+}
+
+// 字符串是否是一个完整的 float（与 C 后端 strtod + 全串消费一致）
+fn luxrt_f64_ok(s: string) -> bool {
+    let n = __peek64(s, 0);
+    let i = 0;
+    while i < n && luxrt_isspace(__peek8u(s, 8 + i)) { i = i + 1; }
+    if i < n && (__peek8u(s, 8 + i) == 43 || __peek8u(s, 8 + i) == 45) {
+        i = i + 1;
+    }
+    let m = luxrt_match_ci(s, i, "infinity");
+    if m > 0 { return i + m == n; }
+    m = luxrt_match_ci(s, i, "inf");
+    if m > 0 { return i + m == n; }
+    m = luxrt_match_ci(s, i, "nan");
+    if m > 0 { return i + m == n; }
+    let intDigits = 0;
+    while i < n && luxrt_is_digit(__peek8u(s, 8 + i)) {
+        i = i + 1;
+        intDigits = intDigits + 1;
+    }
+    let fracDigits = 0;
+    if i < n && __peek8u(s, 8 + i) == 46 {
+        i = i + 1;
+        while i < n && luxrt_is_digit(__peek8u(s, 8 + i)) {
+            i = i + 1;
+            fracDigits = fracDigits + 1;
+        }
+    }
+    if intDigits + fracDigits == 0 { return false; }
+    if i < n && (__peek8u(s, 8 + i) == 101 || __peek8u(s, 8 + i) == 69) {
+        i = i + 1;
+        if i < n && (__peek8u(s, 8 + i) == 43 || __peek8u(s, 8 + i) == 45) {
+            i = i + 1;
+        }
+        let ed = 0;
+        while i < n && luxrt_is_digit(__peek8u(s, 8 + i)) {
+            i = i + 1;
+            ed = ed + 1;
+        }
+        if ed == 0 { return false; }
+    }
+    return i == n;
+}
+
+fn luxrt_str_to_i64_opt(s: string) -> int? {
+    if !luxrt_i64_ok(s) { return none; }
+    return luxrt_str_to_i64(s);
+}
+
+fn luxrt_str_to_f64_opt(s: string) -> float? {
+    if !luxrt_f64_ok(s) { return none; }
+    return luxrt_str_to_f64(s);
+}
+
+fn luxrt_read_opt(path: string) -> string? {
+    let fd = __sys_open(__sptr(path) + 8, kO_RDONLY);
+    if fd < 0 { return none; }
+    let sb = __bump_alloc(256);
+    if __syscall(kSysFstat, fd, sb) < 0 {
+        __syscall(kSysClose, fd);
+        return none;
+    }
+    let sz = __peek64(sb, 48);
+    let buf = __bump_alloc(8 + sz + 1);
+    let got = 0;
+    loop {
+        let r = __syscall(kSysRead, fd, buf + 8 + got, sz - got);
+        if r <= 0 { break; }
+        got = got + r;
+        if got >= sz { break; }
+    }
+    __syscall(kSysClose, fd);
+    __poke8(buf, 8 + got, 0);
+    __poke64(buf, 0, got);
+    return __sval(buf);
 }

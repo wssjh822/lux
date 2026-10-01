@@ -1,0 +1,11 @@
+// argv：argv[0] 是程序名（同 C 约定），其余参数逐个传入。
+// 运行参数来自同名的 main_argv.args（测试脚本读取后传给程序）。
+import "string";
+
+fn main(argv: string[]) {
+    println(len(argv));
+    println(endswith(argv[0], "main_argv"));
+    println(argv[1]);
+    println(argv[2]);
+    println(argv[3]);
+}

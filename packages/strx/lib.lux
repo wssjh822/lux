@@ -1,0 +1,110 @@
+// ============================================================
+//  strx —— Lux 官方包示例：字符串小工具
+//  安装： luxc install strx
+//  使用： import "strx";
+// ============================================================
+import "string";
+
+// 反转字符串（按字节；ASCII 安全，含多字节字符时请改用别的方案）
+fn reverse(s: string) -> string {
+    let cs = chars(s);
+    let out = "";
+    let i = len(cs) - 1;
+    while i >= 0 {
+        out = out + cs[i];
+        i = i - 1;
+    }
+    return out;
+}
+
+// 把 s 重复 n 次（n <= 0 返回空串）
+fn repeat_str(s: string, n: int) -> string {
+    let out = "";
+    let i = 0;
+    while i < n {
+        out = out + s;
+        i = i + 1;
+    }
+    return out;
+}
+
+// 左侧补 fill 直到达到 width（fill 为空串时直接返回，避免死循环）
+fn pad_left(s: string, width: int, fill: string) -> string {
+    if len(fill) == 0 { return s; }
+    let out = s;
+    while len(out) < width {
+        out = fill + out;
+    }
+    return out;
+}
+
+// 右侧补 fill 直到达到 width（fill 为空串时直接返回，避免死循环）
+fn pad_right(s: string, width: int, fill: string) -> string {
+    if len(fill) == 0 { return s; }
+    let out = s;
+    while len(out) < width {
+        out = out + fill;
+    }
+    return out;
+}
+
+// 首字符大写（按字节切分，ASCII 友好）
+fn capitalize(s: string) -> string {
+    if len(s) == 0 { return s; }
+    return upper(substr(s, 0, 1)) + substr(s, 1, len(s) - 1);
+}
+
+// 统计子串出现次数（不允许空 needle，避免死循环）
+fn count_sub(s: string, needle: string) -> int {
+    if len(needle) == 0 { return 0; }
+    let n = 0;
+    let i = 0;
+    while i < len(s) {
+        if startswith(substr(s, i, len(s) - i), needle) {
+            n = n + 1;
+            i = i + len(needle);
+        } else {
+            i = i + 1;
+        }
+    }
+    return n;
+}
+
+// 空串判定
+fn is_empty(s: string) -> bool {
+    return len(s) == 0;
+}
+
+// 子串首次出现的字节下标；找不到返回 -1（find 的语义化别名）
+fn index_of(s: string, sub: string) -> int {
+    return find(s, sub);
+}
+
+// 内部辅助：单个字符是否为 ASCII 空白
+fn strx_is_space(c: string) -> bool {
+    return c == " " || c == "\t" || c == "\n" || c == "\r";
+}
+
+// 去掉开头的空白
+fn trim_left(s: string) -> string {
+    let i = 0;
+    while i < len(s) && strx_is_space(s[i]) {
+        i = i + 1;
+    }
+    return substr(s, i, len(s) - i);
+}
+
+// 去掉结尾的空白
+fn trim_right(s: string) -> string {
+    let j = len(s);
+    while j > 0 && strx_is_space(s[j - 1]) {
+        j = j - 1;
+    }
+    return substr(s, 0, j);
+}
+
+// 替换全部 old 为 new（old 为空时原样返回，避免死循环）
+fn replace_all(s: string, old: string, new: string) -> string {
+    if len(old) == 0 { return s; }
+    return replace(s, old, new);
+}

@@ -1,0 +1,19 @@
+import "math";
+
+// 数学临界值：两个后端各跑一遍，收敛到 6 位小数以屏蔽实现末位差异。
+// 原生后端是自研级数（见 docs/stability.md 的浮点说明），libm 是另一套；
+// 误差应只在小数点后第 6 位以下，量级 / 符号 / inf 必须一致。
+fn q(x: float) -> string {
+    return string(round(x * 1000000.0) / 1000000.0);
+}
+
+fn main() {
+    println(q(asin(0.99999)));
+    println(q(asin(-0.99999)));
+    println(q(acos(0.99999)));
+    println(q(log(1e-300)));
+    println(q(log(1e300)));
+    println(q(pow(1e300, 2.0)));
+    println(q(exp(-745.0)));
+    println(q(exp(710.0)));
+}
