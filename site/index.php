@@ -14,7 +14,7 @@ function e(?string $s): string {
 $ROOT = __DIR__;
 
 // ---- 读取下载清单（失败回退） ------------------------------------------------
-$latest     = '1.0.0';
+$latest     = '1.1.0';
 $luxDl      = [];
 $serverDl   = [];
 $dlFile     = $ROOT . '/lux/downloads/downloads.json';
@@ -265,7 +265,8 @@ $year = date('Y');
       语法现代简洁（<code>fn</code> / <code>let</code> / 类型后置），
       既可翻译成 C 交给 gcc 优化，也能<b>直出本机架构的 Linux ELF</b>，
       运行时系统全部由 Lux 自身实现；<b>ARC 引用计数自动回收内存</b>。
-      语言、标准库、错误通道、构建与包管理均已在 <b>1.0 正式版</b>冻结。
+      语言、标准库、错误通道、构建与包管理均已在 <b>1.0 正式版</b>冻结；
+      <b>1.1</b> 让具名函数成为可传递的值（<code>fn</code> 类型），并带来 <code>sort</code> / <code>map</code> / <code>filter</code>。
     </p>
     <div class="cta">
       <a class="btn primary" href="/lux/">

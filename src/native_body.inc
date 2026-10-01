@@ -45,6 +45,7 @@ struct NativeGen {
     std::vector<std::vector<Var>> scopes;
     int frameSize = 0;
     std::vector<int> breakLbl, contLbl;
+    std::vector<int> breakScope, contScope;  // 1.1：break/continue 时要释放到的作用域深度
     bool inRuntime = false;
     bool mainHasArgv_ = false;
     const Ty* curRet = nullptr;
@@ -53,6 +54,19 @@ struct NativeGen {
     std::string curFnKey;
     std::string curSourceName;
     std::unordered_map<std::string, StructDecl*> structs_;  // struct 名 -> 声明（0.7）
+
+    // 数组元素种类编码（与 native_rt.lux 的 kEk* 一致；1.1 map/filter 用）
+    static int ekOf(const Ty* t) {
+        if (!t) return 0;
+        switch (t->kind) {
+            case TyKind::Float: return 1;
+            case TyKind::Bool: return 2;
+            case TyKind::String: return 3;
+            case TyKind::Array: return 4;
+            case TyKind::Named: return 5;
+            default: return 0;
+        }
+    }
 
     // ---- 数据段 ----
     // 0.9.4（P0-1）：字符串字面量也带 32 字节计数头（refs = -1 的静态不可变
@@ -242,8 +256,8 @@ struct NativeGen {
         c.call32(symLabel("luxrt_release"));
         addRspImm(8);
         c.pop(RAX);
-        c.mov64i(RAX, 0);
-        c.movmr(RBP, slot, RAX);
+        // 1.1：置零用 movmi，不能用 RAX 中转（调用方可能正用 RAX 持有返回值）
+        c.movmi(RBP, slot, 0);
     }
     // 让 [rbp+slot] 自持一份引用（跨语句存活的值用）
     void retainLocal(int slot) {
@@ -263,6 +277,14 @@ struct NativeGen {
     }
     void pushArcScope() { arcLocals.emplace_back(); }
     void popArcScope() { if (!arcLocals.empty()) arcLocals.pop_back(); }
+    // 1.1：只发射释放、不改变编译期作用域栈（供 break/continue/return 的
+    // 提前离开路径用——不能 pop，否则正常路径的块出口释放会丢失）
+    void emitReleaseDownTo(int from) {
+        if (!arcOn) return;
+        for (int i = (int)arcLocals.size() - 1; i >= from; i--) {
+            for (int slot : arcLocals[i]) releaseLocal(slot);
+        }
+    }
     void noteArcLocal(int slot) {
         if (arcOn && !arcLocals.empty()) arcLocals.back().push_back(slot);
     }
@@ -1327,6 +1349,13 @@ struct NativeGen {
                 c.call32(symLabel("luxrt_arr_clear"));
                 addRspImm(8);
                 return;
+            case Builtin::ArrSort:
+                // 1.1：a.sort(cmp) —— 运行时按 8 字节槽泛化排序
+                pushVarRef(e->methodRecv);
+                evalExpr(e->args[0]);
+                c.call32(symLabel("luxrt_sort"));
+                addRspImm(16);
+                return;
             default:
                 err(e->loc, "编译器内部错误：未知数组方法");
                 pushImm(0);
@@ -1941,6 +1970,48 @@ struct NativeGen {
                 c.call32(symLabel("luxrt_last_error"));
                 c.push(RAX);
                 return;
+            case Builtin::ByteAt:
+                evalExpr(args[0]);
+                evalExpr(args[1]);
+                c.call32(symLabel("luxrt_str_byte_at"));
+                addRspImm(16);
+                c.push(RAX);
+                return;
+            case Builtin::Bytes:
+                evalExpr(args[0]);
+                c.call32(symLabel("luxrt_str_bytes"));
+                addRspImm(8);
+                c.push(RAX);
+                return;
+            case Builtin::ListDir:
+                evalExpr(args[0]);
+                c.call32(symLabel("luxrt_list_dir"));
+                addRspImm(8);
+                c.push(RAX);
+                return;
+            case Builtin::Map:
+                evalExpr(args[0]);
+                pushImm(ekOf(e->ty->elem));
+                evalExpr(args[1]);
+                c.call32(symLabel("luxrt_map"));
+                addRspImm(24);
+                c.push(RAX);
+                return;
+            case Builtin::Filter:
+                evalExpr(args[0]);
+                evalExpr(args[1]);
+                c.call32(symLabel("luxrt_filter"));
+                addRspImm(16);
+                c.push(RAX);
+                return;
+            case Builtin::MapOpt:
+                evalExpr(args[0]);
+                pushImm(ekOf(e->ty->elem->elem));
+                evalExpr(args[1]);
+                c.call32(symLabel("luxrt_map_opt"));
+                addRspImm(24);
+                c.push(RAX);
+                return;
             case Builtin::StrReplace:
                 evalExpr(args[0]); evalExpr(args[1]); evalExpr(args[2]);
                 c.call32(symLabel("luxrt_str_replace"));
@@ -2251,6 +2322,27 @@ struct NativeGen {
             case Builtin::IntrSValA:
                 evalExpr(args[0]);  // 透传：先求值参数，其值压栈即结果（1 参数 1 槽）
                 return;
+            case Builtin::IntrCall1: {
+                // __call1(p, a)：间接调用 1 参函数（1.1）
+                evalExpr(args[1]);   // a 留在栈顶作实参
+                evalExpr(args[0]);   // p
+                c.pop(RAX);
+                c.callReg(RAX);
+                addRspImm(8);
+                c.push(RAX);
+                return;
+            }
+            case Builtin::IntrCall2: {
+                // __call2(p, a, b)：间接调用 2 参函数（1.1）
+                evalExpr(args[1]);   // a
+                evalExpr(args[2]);   // b
+                evalExpr(args[0]);   // p
+                c.pop(RAX);
+                c.callReg(RAX);
+                addRspImm(16);
+                c.push(RAX);
+                return;
+            }
 
             default:
                 err(e->loc, "编译器内部错误：未知特权内建");
@@ -2533,9 +2625,16 @@ struct NativeGen {
                 c.jcc32(CJe, lend);
                 breakLbl.push_back(lend);
                 contLbl.push_back(lcond);
+                {
+                    int osc = (int)arcLocals.size();
+                    breakScope.push_back(osc);
+                    contScope.push_back(osc);
+                }
                 genStmt(w->body);
                 breakLbl.pop_back();
                 contLbl.pop_back();
+                breakScope.pop_back();
+                contScope.pop_back();
                 c.jmp32(lcond);
                 c.bind(lend);
                 return;
@@ -2547,9 +2646,16 @@ struct NativeGen {
                 c.bind(lcond);
                 breakLbl.push_back(lend);
                 contLbl.push_back(lcond);
+                {
+                    int osc = (int)arcLocals.size();
+                    breakScope.push_back(osc);
+                    contScope.push_back(osc);
+                }
                 genStmt(l->body);
                 breakLbl.pop_back();
                 contLbl.pop_back();
+                breakScope.pop_back();
+                contScope.pop_back();
                 c.jmp32(lcond);
                 c.bind(lend);
                 return;
@@ -2560,10 +2666,13 @@ struct NativeGen {
                 return;
 
             case StmtKind::Break:
+                // 1.1：提前离开块时释放块内声明的引用型局部（arc.md §2.4）
+                if (!breakScope.empty()) emitReleaseDownTo(breakScope.back());
                 c.jmp32(breakLbl.back());
                 return;
 
             case StmtKind::Continue:
+                if (!contScope.empty()) emitReleaseDownTo(contScope.back());
                 c.jmp32(contLbl.back());
                 return;
 
@@ -2586,6 +2695,8 @@ struct NativeGen {
                     c.zeroReg(RAX);
                     emitFnExit(true, false);
                 }
+                // 1.1：return 前释放所有引用型局部（返回值已在上一步 retain）
+                emitReleaseDownTo(0);
                 c.frameLeave();  // mov rsp,rbp / pop rbp / ret（arm64 恢复 x29,x30）
                 return;
             }
@@ -2614,9 +2725,13 @@ struct NativeGen {
             c.jcc32(f->inclusive ? CJg : CJge, lend);
             breakLbl.push_back(lend);
             contLbl.push_back(lcont);
+            breakScope.push_back(arcMark);
+            contScope.push_back(arcMark + 1);
             genStmt(f->body);
             breakLbl.pop_back();
             contLbl.pop_back();
+            breakScope.pop_back();
+            contScope.pop_back();
             c.bind(lcont);                        // continue 落到自增
             incMem(RBP, vslot);                   // i += 1
             c.jmp32(lcond);
@@ -2681,9 +2796,13 @@ struct NativeGen {
         }
         breakLbl.push_back(lend);
         contLbl.push_back(lcont);
+        breakScope.push_back(arcMark2);
+        contScope.push_back(arcMark2 + 1);
         genStmt(f->body);
         breakLbl.pop_back();
         contLbl.pop_back();
+        breakScope.pop_back();
+        contScope.pop_back();
         c.bind(lcont);
         incMem(RBP, ixslot);
         c.jmp32(lcond);

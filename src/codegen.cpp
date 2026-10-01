@@ -44,6 +44,7 @@ const char* kRuntime = R"CLUX_RUNTIME(
 #include <errno.h>
 #include <time.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 static inline void lx_panic(const char* msg) {
     /* 先冲刷 stdout：panic 前已打印的内容不因块缓冲丢失，
@@ -722,6 +723,22 @@ static lx_arr lx_str_chars(const char* s) {
     return a;
 }
 
+/* 1.1：字节视角原语 */
+static inline int64_t lx_str_byte_at(const char* s, int64_t i) {
+    int64_t n = (int64_t)strlen(s);
+    if (i < 0 || i >= n) lx_str_bounds_fail(i, n);
+    return (int64_t)(unsigned char)s[i];
+}
+static lx_arr lx_str_bytes(const char* s) {
+    int64_t n = (int64_t)strlen(s);
+    lx_arr a = lx_arr_new((int64_t)sizeof(int64_t), lx_pe_i64, 0);
+    lx_arr_reserve(a, n);
+    for (int64_t i = 0; i < n; i++)
+        ((int64_t*)a->data)[i] = (int64_t)(unsigned char)s[i];
+    a->len = n;
+    return a;
+}
+
 static char* lx_str_join(lx_arr a, const char* sep) {
     lx_sb b = {0, 0, 0};
     for (int64_t i = 0; i < a->len; i++) {
@@ -931,6 +948,26 @@ static inline bool lx_file_remove(const char* path) {
 
 static inline bool lx_file_rename(const char* from, const char* to) {
     return rename(from, to) == 0;
+}
+
+/* 1.1：list_dir(path) -> string[]?（失败返回 NULL = none） */
+static lx_arr* lx_list_dir(const char* path) {
+    DIR* d = opendir(path);
+    if (!d) {
+        lx_set_error("list_dir 失败：无法打开目录");
+        return NULL;
+    }
+    lx_arr a = lx_arr_new((int64_t)sizeof(char*), lx_pe_str, lx_gc_releasep);
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        lx_arr_push_str(a, lx_str_dup(ent->d_name));
+    }
+    closedir(d);
+    lx_arr* p = (lx_arr*)lx_opt_alloc(sizeof(lx_arr), lx_gc_releasep);
+    *p = a;
+    return p;
 }
 /* ----------------------- Lux 运行时结束 ----------------------- */
 )CLUX_RUNTIME";
@@ -1289,6 +1326,9 @@ struct CGen {
                     case Builtin::StrSplit:
                     case Builtin::StrChars:
                     case Builtin::StrJoin:
+                    case Builtin::Bytes:
+                    case Builtin::Map:
+                    case Builtin::Filter:
                         return true;
                     case Builtin::ArrPop:
                     case Builtin::ArrRemove:
@@ -1967,6 +2007,13 @@ struct CGen {
                        expr(c->args[1]) + ")";
             case Builtin::LastError:
                 return "lx_last_error()";
+            case Builtin::ByteAt:
+                return "lx_str_byte_at(" + expr(c->args[0]) + ", " +
+                       expr(c->args[1]) + ")";
+            case Builtin::Bytes:
+                return "lx_str_bytes(" + expr(c->args[0]) + ")";
+            case Builtin::ListDir:
+                return "lx_list_dir(" + expr(c->args[0]) + ")";
             case Builtin::StrReplace:
                 return "lx_str_replace(" + expr(c->args[0]) + ", " +
                        expr(c->args[1]) + ", " + expr(c->args[2]) + ")";
@@ -2022,6 +2069,78 @@ struct CGen {
                        mangle(c->methodRecv) + ", " + expr(c->args[0]) + ")";
             case Builtin::ArrClear:
                 return "((void)lx_arr_clear(" + mangle(c->methodRecv) + "))";
+            case Builtin::ArrSort: {
+                // 1.1：a.sort(cmp) —— 原地插入排序（按元素类型用 memcpy 交换）
+                const Ty* T = c->methodElem;
+                std::string recv = mangle(c->methodRecv);
+                std::string cmp = expr(c->args[0]);
+                std::string ct = cType(T);
+                return "({ lx_arr __sa = " + recv +
+                       "; int64_t __sn = __sa->len; char* __sd = (char*)__sa->data;"
+                       " int64_t __se = __sa->esz;"
+                       " for (int64_t __si = 1; __si < __sn; __si++) {"
+                       " int64_t __sj = __si;"
+                       " while (__sj > 0) {"
+                       " void* __pj = __sd + (size_t)(__sj-1)*(size_t)__se;"
+                       " void* __pi = __sd + (size_t)__sj*(size_t)__se;"
+                       " " + ct + " __x = *(" + ct + "*)__pj;"
+                       " " + ct + " __y = *(" + ct + "*)__pi;"
+                       " if ((" + cmp + ")(__x, __y) <= 0) break;"
+                       " unsigned char __st[16];"
+                       " memcpy(__st, __pj, (size_t)__se);"
+                       " memcpy(__pj, __pi, (size_t)__se);"
+                       " memcpy(__pi, __st, (size_t)__se);"
+                       " __sj--; } } (void)0; })";
+            }
+            case Builtin::Map: {
+                // 1.1：map(a, f) —— 调用点展开，输出数组元素由 R 在编译期确定
+                const Ty* T = c->args[0]->ty->elem;
+                const Ty* R = c->args[1]->ty->elem;
+                std::string av = expr(c->args[0]);
+                std::string fv = expr(c->args[1]);
+                return "({ lx_arr __ma = " + av + "; lx_arr __mo = lx_arr_new(" +
+                       arrEsz(R) + ", " + arrPelem(R) + ", " + arrRelem(R) +
+                       "); for (int64_t __mi = 0; __mi < __ma->len; __mi++) {"
+                       " " + cType(T) + " __mx = *(" + cType(T) +
+                       "*)((char*)__ma->data + (size_t)__mi*(size_t)__ma->esz);"
+                       " " + cType(R) + " __mr = (" + fv + ")(__mx);"
+                       " lx_arr_push_" + arrRT(R) + "(__mo, __mr); } __mo; })";
+            }
+            case Builtin::Filter: {
+                // 1.1：filter(a, f) —— 保留 f 为真的元素
+                const Ty* T = c->args[0]->ty->elem;
+                std::string av = expr(c->args[0]);
+                std::string fv = expr(c->args[1]);
+                std::string push = isRefTy(T)
+                    ? "lx_arr_push_" + arrRT(T) + "(__mo, (" + cType(T) + ")lx_gc_retain((void*)__mx))"
+                    : "lx_arr_push_" + arrRT(T) + "(__mo, __mx)";
+                return "({ lx_arr __fa = " + av + "; lx_arr __mo = lx_arr_new(" +
+                       arrEsz(T) + ", " + arrPelem(T) + ", " + arrRelem(T) +
+                       "); for (int64_t __mi = 0; __mi < __fa->len; __mi++) {"
+                       " " + cType(T) + " __mx = *(" + cType(T) +
+                       "*)((char*)__fa->data + (size_t)__mi*(size_t)__fa->esz);"
+                       " if ((" + fv + ")(__mx)) { " + push + "; } } __mo; })";
+            }
+            case Builtin::MapOpt: {
+                // 1.1：map_opt(a, f) -> R[]?（任一失败 → none）
+                const Ty* T = c->args[0]->ty->elem;
+                const Ty* R = c->args[1]->ty->elem->elem;
+                std::string av = expr(c->args[0]);
+                std::string fv = expr(c->args[1]);
+                return "({ lx_arr __oa = " + av + "; lx_arr __mo = lx_arr_new(" +
+                       arrEsz(R) + ", " + arrPelem(R) + ", " + arrRelem(R) +
+                       "); bool __ok = true; for (int64_t __mi = 0; __mi < __oa->len; __mi++) {"
+                       " " + cType(T) + " __mx = *(" + cType(T) +
+                       "*)((char*)__oa->data + (size_t)__mi*(size_t)__oa->esz);"
+                       " " + cType(c->args[1]->ty->elem) + " __opt = (" + fv + ")(__mx);"
+                       " if (!__opt) { __ok = false; break; }"
+                       " " + cType(R) + " __mr = *__opt;"
+                       " lx_arr_push_" + arrRT(R) + "(__mo, __mr); }"
+                       " lx_arr* __res;"
+                       " if (!__ok) { lx_gc_release((void*)__mo); __res = (lx_arr*)0; }"
+                       " else { lx_arr* __os = (lx_arr*)lx_opt_alloc(sizeof(lx_arr), lx_gc_releasep);"
+                       " *__os = __mo; __res = __os; } __res; })";
+            }
             default:
                 // __ 系内建（intrinsic）只由原生后端内联实现：
                 // 直接在生成的 C 流里插一行 #error，让 gcc/clang

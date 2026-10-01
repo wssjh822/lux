@@ -386,12 +386,21 @@ enum class Builtin {
     StrChars,      // chars(s)            : string[]（逐字节单字符，0.5 新增）
     StrJoin,       // join(arr, sep)      : string（0.5 新增）
     LastError,     // last_error()        : string（0.9.4：最近一次标准库失败的说明）
+    // ---- 字节视角原语（1.1）----
+    ByteAt,        // byte_at(s, i)       : int（第 i 个字节的值 0..255；越界 panic）
+    Bytes,         // bytes(s)            : int[]（每个字节的值）
+    ListDir,       // list_dir(path)      : string[]?（目录项名字；失败 none）
     // ---- 数组方法（a.push(x) 形式；Sema 校验接收者，0.5 新增） ----
     ArrPush,       // a.push(v)           : void
     ArrPop,        // a.pop()             : 元素类型
     ArrInsert,     // a.insert(i, v)      : void
     ArrRemove,     // a.remove(i)         : 元素类型
     ArrClear,      // a.clear()           : void
+    ArrSort,       // a.sort(cmp)         : void（1.1：原地排序，cmp: fn(T,T)->int）
+    // ---- 高阶三件套（1.1：无泛型，按调用点展开）----
+    Map,           // map(a, f)           : R[]（f: fn(T)->R）
+    Filter,        // filter(a, f)        : T[]（f: fn(T)->bool）
+    MapOpt,        // map_opt(a, f)       : R[]?（f: fn(T)->R?，任一失败整体 none）
     // ---- 原生后端特权内建（__ 前缀，0.6；仅 native 后端支持，运行时库专用，
     //      Sema 不检查参数个数与类型，返回类型除注明外均为 int） ----
     IntrSyscall,   // __syscall(nr, a1..a6)          : 系统调用
@@ -416,6 +425,8 @@ enum class Builtin {
     IntrSPtr,      // __sptr(s) -> int               : 任意指针值透传为 int
     IntrSVal,      // __sval(p) -> string            : int 指针透传为 string
     IntrSValA,     // __sval_a(p) -> int[]           : int 指针透传为数组
+    IntrCall1,     // __call1(p, a) -> int           : 间接调用 1 参函数（1.1）
+    IntrCall2,     // __call2(p, a, b) -> int        : 间接调用 2 参函数（1.1）
 };
 
 struct Expr {

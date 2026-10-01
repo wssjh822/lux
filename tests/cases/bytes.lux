@@ -1,0 +1,9 @@
+// 1.1：字节视角原语 byte_at / bytes
+fn main() {
+    let s = "Lux";
+    println(len(s));
+    println(byte_at(s, 0));
+    println(byte_at(s, 2));
+    println(bytes(s));
+    println(bytes(""));
+}

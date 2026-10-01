@@ -1,0 +1,27 @@
+fn make(n: int) -> string { return "v" + string(n); }
+fn f(xs: int[]) -> string {
+    for x in xs {
+        let s: string = make(x);
+        if x == 3 { return s; }
+    }
+    return "";
+}
+fn main() {
+    let xs: int[] = [1, 2, 3, 4];
+    println(f(xs));
+    for x in xs {
+        let s: string = make(x);
+        if x == 2 { continue; }
+        if x == 4 { break; }
+        println(s);
+    }
+    let i = 0;
+    while i < 3 {
+        let s: string = make(i);
+        i = i + 1;
+        if i == 2 { continue; }
+        if i == 3 { break; }
+        println(s);
+    }
+    println("done");
+}

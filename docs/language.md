@@ -1,6 +1,6 @@
 # Lux 语言教程（面向人与 AI）
 
-> 版本：Lux 1.0.0。目标读者是**第一次接触 Lux 的程序员**，以及**需要生成
+> 版本：Lux 1.1.0。目标读者是**第一次接触 Lux 的程序员**，以及**需要生成
 > Lux 代码的 AI**。读完本文你应当能独立写出正确的 Lux 程序。
 >
 > 配套文档：
@@ -322,8 +322,8 @@ fn fact(n: int) -> int {        // 递归
 ```
 
 - 参数必须写类型；返回类型用 `-> T`，省略即 `void`。
-- **没有默认参数、可变参数、重载、泛型、闭包、函数类型**（1.0 仍不包含，
-  `fn` 类型 / 高阶函数留到 1.x）。
+- **没有默认参数、可变参数、重载、泛型、闭包**（1.1 起有 `fn` 函数类型，
+  但只能引用**具名函数**，没有 lambda / 捕获；泛型留到 1.x）。
 - 没有“表达式体”箭头函数，函数体总是 `{ }` 块。
 - 非 `void` 函数的每条路径都必须 `return`（struct 返回类型漏掉路径是硬错误
   `E0005`）；编译器也会对疑似漏 return 给 `W1003` 警告。
@@ -340,7 +340,33 @@ fn main() {
 ```
 
 `extern fn` 只声明、不生成函数体；返回/参数里的 `string` 按 `const char*`
-**借用**传递，没有所有权转移（与 ARC 无关）。
+**借用**传递，没有所有权转移（与 ARC 无关）。`extern fn` **不能作为值**。
+
+### 6.2 函数作为值：`fn` 类型（1.1）
+
+函数类型写作 `fn(T, ...) -> R`，可作局部变量、参数、返回值：
+
+```lux
+fn add(x: int, y: int) -> int { return x + y; }
+
+fn apply(op: fn(int, int) -> int, a: int, b: int) -> int {
+    return op(a, b);
+}
+
+fn main() {
+    println(apply(add, 3, 4));            // 7
+    let f: fn(int, int) -> int = add;      // 具名函数取地址
+    println(f(10, 20));                    // 30
+    println(apply(f, 1, 2));               // 3（函数值可再作参数）
+}
+```
+
+函数值是 **8 字节地址槽**（C 函数指针 / 原生代码地址），**不产生堆对象**。
+约束：
+
+- 只能引用**具名函数**，**不能**内联定义（没有 lambda / 闭包 / 捕获）。
+- `extern fn` 不能作为值；`main` 不能作为值。
+- `get()(x)`（对返回函数的调用结果再调用）不支持，先 `let g = get(); g(x);`。
 
 ---
 
@@ -456,6 +482,8 @@ fn main() {
 | `float(x)` | `float` / `float?` | 解析失败 → `none` |
 | `read(path)` | `string?` | 打不开 → `none` |
 | `find_opt(s, sub)` | `int?` | 找不到 → `none`（0.9.4） |
+| `byte_at(s, i)` | `int` | 第 `i` 个字节的值 0..255（1.1） |
+| `bytes(s)` | `int[]` | 每个字节的值（1.1） |
 | `int!` / `float!` / `read!` | 对应 `T` | 失败 → panic |
 
 `print`/`println`/`string`/`format` 可以直接打印 `T?`，输出 `some(x)` 或 `none`。
@@ -599,10 +627,11 @@ luxc unpublish mypkg 1.0.0
 | 函数 | 说明 |
 | --- | --- |
 | `print(x...)` / `println(x...)` | 输出（可多个参数，自动转字符串） |
+| `byte_at(s, i)` / `bytes(s)` | 字节值 / 字节数组（1.1） |
+| `map` / `filter` / `map_opt` | 高阶映射 / 过滤 / 可选映射（1.1，见 §6.2） |
 | `string(x)` | 转字符串 |
 | `int(x)` / `float(x)` | 转数值；字符串版返回 `T?` |
 | `find_opt(s, sub)` | 子串字节下标 `int?`；找不到返回 `none`（0.9.4） |
-| `last_error()` | 最近一次标准库失败的说明（0.9.4） |
 | `len(x)` | 字符串字节数 / 数组元素数 |
 | `assert(cond)` / `assert(cond, msg)` | 不成立则 panic |
 | `exit(code)` | 退出 |
@@ -708,7 +737,7 @@ let ok = lower(name) == "lux";
 3. **数组/struct 是引用**：想复制请用切片或手动构造新对象。
 4. **切片是复制**，与引用语义相反（这是刻意的）。
 5. **字符串不可变**，字节为单位；中文一个字 3 字节。
-6. **没有 map / 泛型 / fn 类型 / 异常 / 类继承**。用一个 `struct Foo { kind: int; ... }`
+6. **没有 map / 泛型 / 异常 / 类继承**（1.1 起数组有 `sort` / `map` / `filter` / `map_opt`）。用一个 `struct Foo { kind: int; ... }`
    加 `int` 标签模拟联合类型。
 7. **`or` 不能链式兜底**，要加括号。
 8. **`repeat n` 只求值一次**；`while` 每次重算条件。
@@ -738,12 +767,14 @@ lux: （如果是递归函数，也可能是调用层数过深导致栈溢出）
 
 ## 15. 给 AI 的约束清单（生成 Lux 代码前必读）
 
-1. 目标版本 **1.0.0**；只使用本文与 `docs/grammar.md` 里出现的语法。
-2. **不要**使用：泛型、`map`/`set`、`fn` 类型、闭包/lambda、`class`/继承、
+1. 目标版本 **1.1.0**；只使用本文与 `docs/grammar.md` 里出现的语法。
+2. **不要**使用：泛型、`map<K,V>`/`set`、闭包/lambda、`class`/继承、
    `interface`/trait、异常、`switch`/`match`、`for (;;)`、`do/while`、
    可变全局变量、无符号整数、`++x` 表达式、字符串插值、`null`（用 `none`）、
    命名参数、默认参数、可变参数、运算符重载。宏只支持 `#define NAME 值`
    这种对象式宏（不支持函数式宏）。
+   `fn` 类型只能引用**具名函数**（`let f: fn(int) -> int = inc;`），
+   不能内联定义函数值。
 3. 每个程序都要有 `fn main()`（或 `fn main(argv: string[])`）。
 4. 条件用 `bool`；`&&`/`||` 两侧必须 `bool`。
 5. 失败用 `T?`：`int("x")` 返回 `int?`；用 `or` 兜底或 `!` panic；

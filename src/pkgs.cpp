@@ -304,12 +304,24 @@ std::string withFtpCreds(std::string url) {
     return "ftp://" + user + ":" + pass + "@" + rest;
 }
 
-// 用 curl 下载到文件；quiet=false 时把 curl 错误透传给用户
+// 用 curl 下载到文件；quiet=false 且在终端上时显示进度条
 bool fetchToFile(const std::string& rawUrl, const std::string& path,
                  bool quiet, std::string& err) {
     std::string url = withFtpCreds(rawUrl);
-    std::string cmd = "curl -fsSL --connect-timeout 20 --retry 2 -o " +
+    bool showBar = !quiet && isatty(STDERR_FILENO) == 1;
+    std::string cmd = std::string(showBar ? "curl -fL --progress-bar"
+                                          : "curl -fsSL") +
+                      " --connect-timeout 20 --retry 2 -o " +
                       shellQuote(path) + " " + shellQuote(url);
+    if (showBar) {
+        // 不捕获输出，让 curl 的进度条直接画在终端上
+        int rc = std::system(cmd.c_str());
+        if (rc != 0) {
+            err = "下载失败（" + rawUrl + "）";
+            return false;
+        }
+        return true;
+    }
     std::string out;
     int rc = runCapture(cmd, out);
     if (rc != 0) {
@@ -1021,28 +1033,39 @@ bool installIndexEntry(const IndexEntry& e, bool force, std::string& name,
         return false;
     }
     std::string target = packagesDir() + "/" + e.name;
-    if (isDir(target) && !force) {
-        // 已安装：版本相同则直接成功（幂等），否则提示升级
+    if (isDir(target)) {
+        // 已安装：版本相同直接成功（幂等）；不同版本则仅在 force 下覆盖
         PkgInfo info = readInstalled(e.name, target);
         if (!e.version.empty() && info.version == e.version) {
             name = e.name;
             return true;
         }
-        err = "包 '" + e.name + "' 已安装" +
-              (info.version.empty() ? "" : "（版本 " + info.version + "）") +
-              "，注册表最新为 " + e.version +
-              "；用 luxc upgrade " + e.name + " 升级，或加 --force 覆盖";
-        return false;
+        if (!force) {
+            err = "包 '" + e.name + "' 已安装" +
+                  (info.version.empty() ? "" : "（版本 " + info.version + "）") +
+                  "，注册表最新为 " + e.version +
+                  "；用 luxc upgrade " + e.name + " 升级，或加 --force 覆盖";
+            return false;
+        }
+        // force：按注册表版本覆盖安装（依赖解析时用它自动升级旧版本）
     }
 
-    // 先装依赖
+    // 先装依赖（依赖已装旧版本时按约束自动升级；force=true 让版本不一致时覆盖）
     inProgress.insert(e.name);
+    std::vector<std::string> depSpecs;
     for (const auto& dep : e.deps) {
         std::string depSpec = dep.first;
         if (!dep.second.empty() && dep.second != "*")
             depSpec += "@" + dep.second;
+        depSpecs.push_back(depSpec);
+    }
+    for (size_t di = 0; di < depSpecs.size(); di++) {
+        const std::string& depSpec = depSpecs[di];
+        std::printf("  依赖 [%zu/%zu] %s\n", di + 1, depSpecs.size(),
+                    depSpec.c_str());
+        std::fflush(stdout);
         std::string depName, derr;
-        if (!installRegistryName(depSpec, false, depName, derr, inProgress)) {
+        if (!installRegistryName(depSpec, true, depName, derr, inProgress)) {
             err = "安装依赖 '" + depSpec + "' 失败：" + derr;
             inProgress.erase(e.name);
             return false;

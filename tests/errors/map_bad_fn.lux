@@ -1,0 +1,5 @@
+fn inc(x: float) -> float { return x + 1.0; }
+fn main() {
+    let a: int[] = [1, 2, 3];
+    println(map(a, inc));
+}

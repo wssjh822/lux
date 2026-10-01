@@ -1,0 +1,7 @@
+// 1.1：list_dir 失败路径（确定性输出，不依赖目录内容）
+import "file";
+fn main() {
+    let d = list_dir("/no/such/dir/lux-1.1");
+    println(d or []);
+    println(last_error());
+}

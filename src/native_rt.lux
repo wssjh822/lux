@@ -39,8 +39,10 @@ const kSysUnlink = 87;
 const kSysRename = 82;
 const kSysClockGettime = 228;
 const kSysExitGroup = 231;
+const kSysGetdents64 = 217;
 
 const kO_RDONLY = 0;
+const kO_DIRECTORY = 65536;
 const kO_WRONLY_TRUNC = 577;    // O_WRONLY | O_CREAT | O_TRUNC
 const kO_WRONLY_APPEND = 1089;  // O_WRONLY | O_CREAT | O_APPEND
 const kClockRealtime = 0;
@@ -630,6 +632,53 @@ fn luxrt_str_chars(s: string) -> int[] {
     return a;
 }
 
+// 1.1：字节视角原语
+fn luxrt_str_byte_at(s: string, i: int) -> int {
+    let n = __peek64(s, 0);
+    if i < 0 || i >= n { luxrt_panic_str_oob(s, i); }
+    return __peek8u(s, 8 + i);
+}
+
+fn luxrt_str_bytes(s: string) -> int[] {
+    let a = luxrt_arr_new(kEkInt);
+    let n = __peek64(s, 0);
+    for i in 0..n { luxrt_arr_push(a, __peek8u(s, 8 + i)); }
+    return a;
+}
+
+// 1.1：list_dir(path) -> string[]?（X86-64 编号；arm64 由编译器改写）
+fn luxrt_list_dir(path: string) -> int {
+    let fd = __sys_open(__sptr(path) + 8, kO_RDONLY | kO_DIRECTORY);
+    if fd < 0 {
+        luxrt_set_error("list_dir 失败：无法打开目录");
+        return 0;
+    }
+    let a = luxrt_arr_new(kEkStr);
+    let buf = luxrt_data_alloc(16384);
+    loop {
+        let n = __syscall(kSysGetdents64, fd, buf, 16384);
+        if n <= 0 { break; }
+        let off = 0;
+        while off < n {
+            let reclen = __peek8u(buf, off + 16) + __peek8u(buf, off + 17) * 256;
+            if reclen <= 0 { break; }
+            let namep = buf + off + 19;
+            let nlen = 0;
+            while __peek8u(namep, nlen) != 0 { nlen = nlen + 1; }
+            let dot = nlen == 1 && __peek8u(namep, 0) == 46;
+            let dotdot = nlen == 2 && __peek8u(namep, 0) == 46 &&
+                         __peek8u(namep, 1) == 46;
+            if !dot && !dotdot {
+                luxrt_arr_push(a, __sptr(luxrt_str_from_ptr(namep, nlen)));
+            }
+            off = off + reclen;
+        }
+    }
+    __syscall(kSysClose, fd);
+    luxrt_free(buf);
+    return luxrt_opt_box(__sptr(a), kDescOpt);
+}
+
 fn luxrt_str_join(arr: int[], sep: string) -> string {
     let n = len(arr);
     let acc = "";
@@ -889,6 +938,51 @@ fn luxrt_arr_push(a: int[], v: int) {
     luxrt_arr_reserve(a, lenv + 1);
     luxrt_arr_put(a, lenv, v);
     __poke64(a, 0, lenv + 1);
+}
+
+// ---------------------------------------------------------------------------
+//  高阶三件套（1.1）：排序 / 映射 / 过滤。函数以代码地址（int）传入，
+//  经 __call1 / __call2 间接调用；元素统一 8 字节槽，与具体类型无关。
+// ---------------------------------------------------------------------------
+fn luxrt_sort(a: int[], cmp: int) {
+    let n = len(a);
+    let i = 1;
+    while i < n {
+        let j = i;
+        while j > 0 {
+            if __call2(cmp, a[j - 1], a[j]) <= 0 { break; }
+            let t = a[j - 1];
+            a[j - 1] = a[j];
+            a[j] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn luxrt_map(a: int[], ek: int, f: int) -> int[] {
+    let out = luxrt_arr_new(ek);
+    let n = len(a);
+    for i in 0..n { luxrt_arr_push(out, __call1(f, a[i])); }
+    return out;
+}
+
+fn luxrt_filter(a: int[], f: int) -> int[] {
+    let out = luxrt_arr_new(__peek64(a, 24));
+    let n = len(a);
+    for i in 0..n { if __call1(f, a[i]) != 0 { luxrt_arr_push(out, a[i]); } }
+    return out;
+}
+
+fn luxrt_map_opt(a: int[], ek: int, f: int) -> int {
+    let out = luxrt_arr_new(ek);
+    let n = len(a);
+    for i in 0..n {
+        let r = __call1(f, a[i]);
+        if r == 0 { luxrt_arr_release_elems(__sptr(out)); return 0; }
+        luxrt_arr_push(out, __peek64(r, 0));
+    }
+    return luxrt_opt_box(__sptr(out), kDescOpt);
 }
 
 // struct 字段对象（0.7）：n 字节零初始化，返回裸指针（int）。

@@ -47,6 +47,8 @@ static bool patchArm64SyscallNumbers(Program* rt, Diags& diags) {
         {"kSysWait4",        260},
         {"kSysClockGettime", 113},
         {"kSysExitGroup",     94},
+        {"kSysGetdents64",    61},
+        {"kO_DIRECTORY",   16384},
     };
     bool matched[sizeof(mapping) / sizeof(mapping[0])] = {false};
     for (GlobalConstDecl* gc : rt->consts) {

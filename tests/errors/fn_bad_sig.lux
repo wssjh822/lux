@@ -1,0 +1,5 @@
+fn add(x: int, y: int) -> int { return x + y; }
+fn main() {
+    let f: fn(int) -> int = add;
+    println(f(1));
+}

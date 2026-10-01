@@ -1,0 +1,29 @@
+// 1.1：sort / map / filter / map_opt（无泛型，按调用点展开）
+fn inc(x: int) -> int { return x + 1; }
+fn is_even(x: int) -> bool { return x % 2 == 0; }
+fn parse_pos(x: int) -> int? { if x <= 0 { return none; } return x; }
+fn cmp_int(a: int, b: int) -> int { return a - b; }
+fn cmp_str(a: string, b: string) -> int {
+    if a < b { return 0 - 1; }
+    if a > b { return 1; }
+    return 0;
+}
+fn dbl(x: string) -> string { return x + x; }
+
+fn main() {
+    let a: int[] = [3, 1, 2];
+    println(map(a, inc));
+    println(filter(a, is_even));
+    println(map_opt(a, parse_pos));
+    let e: int[] = [1, -2, 3];
+    println(map_opt(e, parse_pos));
+    a.sort(cmp_int);
+    println(a);
+    let s: string[] = ["pear", "apple", "fig"];
+    s.sort(cmp_str);
+    println(s);
+    println(map(s, dbl));
+    let empty: int[] = [];
+    println(map(empty, inc));
+    println(filter(empty, is_even));
+}

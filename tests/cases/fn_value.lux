@@ -1,0 +1,18 @@
+// 1.1：fn 类型（具名函数作为值）+ 双后端间接调用
+fn add(x: int, y: int) -> int { return x + y; }
+fn mul(x: int, y: int) -> int { return x * y; }
+
+fn apply(op: fn(int, int) -> int, a: int, b: int) -> int {
+    return op(a, b);
+}
+
+fn main() {
+    println(apply(add, 3, 4));
+    println(apply(mul, 3, 4));
+    let f: fn(int, int) -> int = add;
+    println(f(10, 20));
+    let g = f;
+    println(g(7, 8));
+    let tbl: fn(int, int) -> int = mul;
+    println(apply(tbl, 5, 6));
+}

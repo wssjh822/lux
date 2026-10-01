@@ -79,6 +79,12 @@ const std::unordered_map<std::string, Builtin>& builtinTable() {
         {"join", Builtin::StrJoin},
         // 全局错误通道（0.9.4）：无 import 即可用
         {"last_error", Builtin::LastError},
+        {"byte_at", Builtin::ByteAt},
+        {"bytes", Builtin::Bytes},
+        {"list_dir", Builtin::ListDir},
+        {"map", Builtin::Map},
+        {"filter", Builtin::Filter},
+        {"map_opt", Builtin::MapOpt},
         // 数组方法（a.push 等）不在此表：它们只经"变量.方法"路径解析，
         // 避免与用户自定义的 push / pop 等函数名冲突。
     };
@@ -127,6 +133,7 @@ const char* builtinModule(Builtin b) {
         case Builtin::FileExists:
         case Builtin::FileRemove:
         case Builtin::FileRename:
+        case Builtin::ListDir:
             return "file";
         case Builtin::StrContains:
         case Builtin::StrStartsWith:
@@ -314,6 +321,15 @@ struct Analyzer {
         std::vector<const Ty*> ps;
         for (const Param& p : fn->params) ps.push_back(p.ty);
         return tyName(TyStore::fnOf(fn->retTy, std::move(ps)));
+    }
+
+    // 取具名函数的真实 fn 类型（供 map/filter/map_opt 给函数名实参作 hint）
+    const Ty* fnTypeOfName(const std::string& name) {
+        auto it = funcs.find(name);
+        if (it == funcs.end() || it->second->isExtern) return nullptr;
+        std::vector<const Ty*> ps;
+        for (const Param& p : it->second->params) ps.push_back(p.ty);
+        return TyStore::fnOf(it->second->retTy, std::move(ps));
     }
 
     // ---------------- 赋值左值检查（0.7） ----------------
@@ -1157,6 +1173,13 @@ struct Analyzer {
             VarInfo* recv = findVar(prefix);
             if (recv && recv->ty && recv->ty->kind == TyKind::Array) {
                 recv->used = true;
+                // sort（1.1）：比较器是函数名，用 fn(T,T)->int 作 hint 解析
+                if (member == "sort" && c->args.size() == 1) {
+                    const Ty* hint = TyStore::fnOf(
+                        tInt, {recv->ty->elem, recv->ty->elem});
+                    return checkArrayMethod(c, recv, member,
+                                           {checkExpr(c->args[0], hint)});
+                }
                 return checkArrayMethod(c, recv, member, checkArgsNoHint(c));
             }
             if (recv && recv->ty && recv->ty->kind != TyKind::Invalid) {
@@ -1264,6 +1287,8 @@ struct Analyzer {
                 {"__sptr", Builtin::IntrSPtr},
                 {"__sval", Builtin::IntrSVal},
                 {"__sval_a", Builtin::IntrSValA},
+                {"__call1", Builtin::IntrCall1},
+                {"__call2", Builtin::IntrCall2},
             };
             auto iit = intrinsics.find(c->callee);
             if (iit != intrinsics.end()) {
@@ -1286,6 +1311,7 @@ struct Analyzer {
                         {"__f_to_i", {1, 1}},     {"__rand_next", {0, 0}},
                         {"__seed_set", {1, 1}},   {"__sptr", {1, 1}},
                         {"__sval", {1, 1}},       {"__sval_a", {1, 1}},
+                        {"__call1", {2, 2}},      {"__call2", {3, 3}},
                     };
                 auto ait = arity.find(c->callee);
                 if (ait != arity.end()) {
@@ -1350,6 +1376,20 @@ struct Analyzer {
                         "\"（或者 import \"" + mod + "\" as 别名 后用限定访问）");
                 c->ty = tInvalid;
                 return tInvalid;
+            }
+            // 高阶三件套（1.1）：第二个参数是函数名，需要用它的真实签名作 hint
+            if (c->builtin == Builtin::Map || c->builtin == Builtin::Filter ||
+                c->builtin == Builtin::MapOpt) {
+                std::vector<const Ty*> tys;
+                tys.push_back(checkExpr(c->args[0]));
+                const Ty* hint = nullptr;
+                if (c->args.size() > 1 &&
+                    c->args[1]->kind == ExprKind::Ident) {
+                    hint = fnTypeOfName(
+                        static_cast<IdentExpr*>(c->args[1])->name);
+                }
+                tys.push_back(checkExpr(c->args[1], hint));
+                return checkBuiltinCall(c, tys);
             }
             return checkBuiltinCall(c, checkArgsNoHint(c));
         }
@@ -1421,7 +1461,7 @@ struct Analyzer {
         const Ty* elem = arrTy->elem;
         auto isMutating = [&]() {
             return method == "push" || method == "pop" || method == "insert" ||
-                   method == "remove" || method == "clear";
+                   method == "remove" || method == "clear" || method == "sort";
         };
         if (recv->isConst && isMutating()) {
             err(c->calleeLoc,
@@ -1497,9 +1537,26 @@ struct Analyzer {
             needArgs(0);
             return tVoid;
         }
+        if (method == "sort") {
+            // 1.1：a.sort(cmp)，cmp: fn(T, T) -> int（原地排序）
+            c->builtin = Builtin::ArrSort;
+            c->ty = tVoid;
+            if (needArgs(1)) {
+                const Ty* ft = argTys[0];
+                if (ft != tInvalid &&
+                    (ft->kind != TyKind::Fn || ft->members.size() != 2 ||
+                     ft->members[0] != elem || ft->members[1] != elem ||
+                     ft->elem != tInt)) {
+                    err(c->args[0]->loc,
+                        "sort 的比较器必须是 fn(" + tyName(elem) + ", " +
+                            tyName(elem) + ") -> int");
+                }
+            }
+            return tVoid;
+        }
         err(c->calleeLoc, "数组没有 '" + method +
                                       "' 方法（可用：push / pop / insert / "
-                                      "remove / clear）");
+                                      "remove / clear / sort）");
         c->ty = tInvalid;
         return tInvalid;
     }
@@ -1887,6 +1944,128 @@ struct Analyzer {
                 c->ty = tString;
                 if (!arity(0)) return tInvalid;
                 return tString;
+            }
+
+            case Builtin::ByteAt: {
+                // 1.1：byte_at(s, i) -> int（第 i 个字节的值 0..255）
+                c->ty = tInt;
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tString)
+                    typeError(c->args[0]->loc, argTys[0], tString,
+                              "byte_at() 的第一个参数必须是 string");
+                if (argTys[1] != tInvalid && argTys[1] != tInt)
+                    typeError(c->args[1]->loc, argTys[1], tInt,
+                              "byte_at() 的第二个参数必须是 int");
+                return tInt;
+            }
+
+            case Builtin::Bytes: {
+                // 1.1：bytes(s) -> int[]
+                c->ty = TyStore::arrayOf(tInt);
+                if (!arity(1)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tString)
+                    typeError(c->args[0]->loc, argTys[0], tString,
+                              "bytes() 的参数必须是 string");
+                return c->ty;
+            }
+
+            case Builtin::ListDir: {
+                // 1.1：list_dir(path) -> string[]?
+                c->ty = TyStore::optionalOf(TyStore::arrayOf(tString));
+                if (!arity(1)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tString)
+                    typeError(c->args[0]->loc, argTys[0], tString,
+                              "list_dir() 的参数必须是 string");
+                return c->ty;
+            }
+
+            case Builtin::Map: {
+                // 1.1：map(a, f) -> R[]，f: fn(T)->R
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0]->kind != TyKind::Array) {
+                    typeError(c->args[0]->loc, argTys[0], nullptr,
+                              "map() 的第一个参数必须是数组");
+                    return tInvalid;
+                }
+                if (argTys[0] == tInvalid || argTys[1] == tInvalid) return tInvalid;
+                const Ty* ft = argTys[1];
+                if (ft->kind != TyKind::Fn || ft->members.size() != 1) {
+                    err(c->args[1]->loc,
+                        "map() 的第二个参数必须是单参函数值 fn(T) -> R");
+                    return tInvalid;
+                }
+                if (ft->members[0] != argTys[0]->elem) {
+                    typeError(c->args[1]->loc, ft->members[0], argTys[0]->elem,
+                              "map() 的函数参数类型必须等于数组元素类型");
+                    return tInvalid;
+                }
+                if (!ft->elem || ft->elem->kind == TyKind::Void) {
+                    err(c->args[1]->loc, "map() 的函数不能返回 void");
+                    return tInvalid;
+                }
+                if (ft->elem->kind == TyKind::Optional) {
+                    err(c->args[1]->loc,
+                        "map() 的函数不能返回可选类型；用 map_opt() 处理失败");
+                    return tInvalid;
+                }
+                c->ty = TyStore::arrayOf(ft->elem);
+                return c->ty;
+            }
+
+            case Builtin::Filter: {
+                // 1.1：filter(a, f) -> T[]，f: fn(T)->bool
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0]->kind != TyKind::Array) {
+                    typeError(c->args[0]->loc, argTys[0], nullptr,
+                              "filter() 的第一个参数必须是数组");
+                    return tInvalid;
+                }
+                if (argTys[0] == tInvalid || argTys[1] == tInvalid) return tInvalid;
+                const Ty* ft = argTys[1];
+                if (ft->kind != TyKind::Fn || ft->members.size() != 1) {
+                    err(c->args[1]->loc,
+                        "filter() 的第二个参数必须是单参函数值 fn(T) -> bool");
+                    return tInvalid;
+                }
+                if (ft->members[0] != argTys[0]->elem) {
+                    typeError(c->args[1]->loc, ft->members[0], argTys[0]->elem,
+                              "filter() 的函数参数类型必须等于数组元素类型");
+                    return tInvalid;
+                }
+                if (ft->elem != tBool)
+                    typeError(c->args[1]->loc, ft->elem, tBool,
+                              "filter() 的函数必须返回 bool");
+                c->ty = TyStore::arrayOf(argTys[0]->elem);
+                return c->ty;
+            }
+
+            case Builtin::MapOpt: {
+                // 1.1：map_opt(a, f) -> R[]?，f: fn(T)->R?
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0]->kind != TyKind::Array) {
+                    typeError(c->args[0]->loc, argTys[0], nullptr,
+                              "map_opt() 的第一个参数必须是数组");
+                    return tInvalid;
+                }
+                if (argTys[0] == tInvalid || argTys[1] == tInvalid) return tInvalid;
+                const Ty* ft = argTys[1];
+                if (ft->kind != TyKind::Fn || ft->members.size() != 1) {
+                    err(c->args[1]->loc,
+                        "map_opt() 的第二个参数必须是单参函数值 fn(T) -> R?");
+                    return tInvalid;
+                }
+                if (ft->members[0] != argTys[0]->elem) {
+                    typeError(c->args[1]->loc, ft->members[0], argTys[0]->elem,
+                              "map_opt() 的函数参数类型必须等于数组元素类型");
+                    return tInvalid;
+                }
+                if (!ft->elem || ft->elem->kind != TyKind::Optional) {
+                    err(c->args[1]->loc,
+                        "map_opt() 的函数必须返回可选类型 R?");
+                    return tInvalid;
+                }
+                c->ty = TyStore::optionalOf(TyStore::arrayOf(ft->elem->elem));
+                return c->ty;
             }
 
             case Builtin::StrReplace: {

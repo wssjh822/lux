@@ -168,7 +168,7 @@
     </p>
     <div class="cmd"><span>$ </span>luxc hello.lux --run</div>
     <div class="badges">
-      <span class="badge">v1.0.0 正式版</span>
+      <span class="badge">v1.1.0</span>
       <span class="badge">静态类型</span>
       <span class="badge">错误通道 T? / ? / or / !</span>
       <span class="badge">ARC 引用计数（默认开启）</span>
@@ -321,6 +321,21 @@ $ luxc hello.lux --emit-c
         <span class="ic">❖</span>
         <h3>生成的代码零警告</h3>
         <p>所有示例生成的 C 在 <code>-Wall -Wextra</code> 下都是 0 警告 —— 中间产物也是干净的。</p>
+      </div>
+      <div class="card">
+        <span class="ic">λ</span>
+        <h3>函数成为值 <span style="color:var(--gold2)">1.1 新增</span></h3>
+        <p><code>fn(int, int) -&gt; int</code> 函数类型：具名函数可作参数 / 变量传递（<code>apply(op, a, b)</code>）。函数值就是一个 8 字节地址槽，不产生堆对象、不碰 ARC；无闭包 / lambda。</p>
+      </div>
+      <div class="card">
+        <span class="ic">⌗</span>
+        <h3>高阶三件套 <span style="color:var(--gold2)">1.1 新增</span></h3>
+        <p>无泛型下按调用点展开：<code>map(a, f)</code> / <code>filter(a, f)</code> / <code>map_opt(a, f)</code> 与原地 <code>a.sort(cmp)</code>，输出数组的类型在编译期确定。</p>
+      </div>
+      <div class="card">
+        <span class="ic">␦</span>
+        <h3>字节原语与 list_dir <span style="color:var(--gold2)">1.1 新增</span></h3>
+        <p><code>byte_at(s, i)</code> / <code>bytes(s)</code> 直读字节；<code>list_dir(path) -&gt; string[]?</code> 列举目录（原生走 <code>getdents64</code>）。</p>
       </div>
       <div class="card">
         <span class="ic">▦</span>
@@ -612,6 +627,8 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
           <li class="done"><b>错误消息携带 <code>last_error()</code> + <code>find_opt()</code> 可选变体</b> ✓ 0.9.4 已完成</li>
           <li class="done"><b>回归全绿 227/227（含双后端逐字节差分 + churn 内存回归）</b> ✓ 0.9.4 已完成</li>
           <li class="done"><b>Lux 1.0.0 正式版：语言 / 标准库 / 错误通道 / 构建 / 包管理 / ARC 全部冻结</b> ✓ 1.0 已完成</li>
+          <li class="done"><b>Lux 1.1.0：<code>fn</code> 函数类型（函数成为值）+ <code>sort</code> / <code>map</code> / <code>filter</code> / <code>map_opt</code> + 字节原语 / <code>list_dir</code> + 原生 ARC 提前退出修复 + REPL 彩色 / 下载器进度条</b> ✓ 1.1 已完成</li>
+          <li>闭包 / lambda — 不进 1.1，留 1.2+</li>
           <li>高阶函数与 <code>fn</code> 类型（sort / map / filter）— 不进 1.0，留 1.x</li>
           <li>aarch64 原生数学末位对齐 — 待有 aarch64 机器的版本校准</li>
           <li>枚举与模式匹配、泛型 — 1.x</li>
@@ -621,7 +638,7 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
   </section>
 
   <footer>
-    <p><span class="lx">Lux</span> v1.0.0 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
+    <p><span class="lx">Lux</span> v1.1.0 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
     <p style="margin-top:8px">
       完整文档见 <a href="README.md">README.md</a> ·
       <a href="docs/language.md">语言教程</a> ·

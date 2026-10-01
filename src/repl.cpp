@@ -83,6 +83,71 @@ bool isIdentChar(char c) {
            (c >= '0' && c <= '9') || c == '_';
 }
 
+// -----------------------------------------------------------------------------
+//  语法着色（仅 TTY；ANSI 色彩不改变可见宽度，光标计算仍用原始 buf）
+// -----------------------------------------------------------------------------
+bool g_color = false;
+#define LX_RST  "\x1b[0m"
+#define LX_KW   "\x1b[1;38;5;215m"   // 关键字
+#define LX_TY   "\x1b[38;5;81m"      // 类型
+#define LX_STR  "\x1b[38;5;114m"     // 字符串
+#define LX_NUM  "\x1b[38;5;176m"     // 数字
+#define LX_CMT  "\x1b[38;5;243m"     // 注释
+#define LX_PROMPT "\x1b[1;38;5;215m" // 提示符
+
+std::string highlight(const std::string& s) {
+    if (!g_color || s.empty()) return s;
+    static const char* kws[] = {
+        "fn", "let", "const", "return", "if", "else", "elif", "while",
+        "for", "loop", "in", "break", "continue", "repeat", "true",
+        "false", "and", "or", "not", "import", "as", "extern", "struct",
+        "none", "nan", "inf", "from"};
+    static const char* tys[] = {"int", "float", "bool", "string", "void"};
+    std::string out;
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        char c = s[i];
+        if (c == '/' && i + 1 < n && s[i + 1] == '/') {
+            out += LX_CMT; out.append(s, i, n - i); out += LX_RST;
+            break;
+        }
+        if (c == '"') {
+            size_t j = i + 1;
+            while (j < n && s[j] != '"') {
+                if (s[j] == '\\' && j + 1 < n) j++;
+                j++;
+            }
+            if (j < n) j++;
+            out += LX_STR; out.append(s, i, j - i); out += LX_RST;
+            i = j;
+            continue;
+        }
+        if (c >= '0' && c <= '9') {
+            size_t j = i;
+            while (j < n && (isIdentChar(s[j]) || s[j] == '.')) j++;
+            out += LX_NUM; out.append(s, i, j - i); out += LX_RST;
+            i = j;
+            continue;
+        }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+            size_t j = i;
+            while (j < n && isIdentChar(s[j])) j++;
+            std::string w = s.substr(i, j - i);
+            const char* col = nullptr;
+            for (const char* k : kws) if (w == k) { col = LX_KW; break; }
+            if (!col) for (const char* t : tys) if (w == t) { col = LX_TY; break; }
+            if (col) out += col;
+            out += w;
+            if (col) out += LX_RST;
+            i = j;
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    return out;
+}
+
 // 读取直到 CSI 终结字节，返回终结字节（例如 'A' / '~'）
 char readCsiFinal(int fd) {
     for (;;) {
@@ -119,7 +184,9 @@ struct Completions {
             "exists", "remove", "rename", "contains", "startswith",
             "endswith", "find", "replace", "trim", "upper", "lower", "substr",
             "format", "split", "chars", "join",
-            "push", "pop", "insert", "clear",
+            "push", "pop", "insert", "remove", "clear", "sort",
+            "map", "filter", "map_opt", "find_opt", "last_error",
+            "byte_at", "bytes", "list_dir",
             ".help", ".clear", ".exit", ".quit",
         };
     }
@@ -196,7 +263,10 @@ void doCompletion(std::string& buf, size_t& cur, const Completions& comp,
     // 列出候选
     std::fprintf(stdout, "\x1b[1G\x1b[K");
     for (size_t i = 0; i < matches.size(); i++) {
-        std::fprintf(stdout, "%s%s", i ? "  " : "", matches[i].c_str());
+        if (i) std::fputs("  ", stdout);
+        if (g_color) std::fputs("\x1b[38;5;81m", stdout);
+        std::fputs(matches[i].c_str(), stdout);
+        if (g_color) std::fputs("\x1b[0m", stdout);
     }
     std::fprintf(stdout, "\n");
     listed = true;
@@ -248,7 +318,11 @@ std::optional<std::string> readLineInteractive(const std::string& prompt,
         } else {
             std::fprintf(stdout, "\x1b[1G");
         }
-        std::fprintf(stdout, "\x1b[K%s%s", prompt.c_str(), buf.c_str());
+        std::fprintf(stdout, "\x1b[K%s%s\x1b[0m",
+                     g_color ? LX_PROMPT : "",
+                     (g_color ? (prompt + LX_RST).c_str() : prompt.c_str()));
+        std::string hl = highlight(buf);
+        std::fputs(hl.c_str(), stdout);
         lastWidth = displayWidth(prompt, prompt.size()) +
                     displayWidth(buf, buf.size());
         if (cur < buf.size()) {
@@ -655,8 +729,14 @@ int runRepl() {
     History hist(histPath);
 
     if (tty) {
-        std::printf("%s —— 输入表达式立即求值（.help 帮助 / .exit 退出）\n",
-                    kReplVersion.c_str());
+        g_color = (std::getenv("NO_COLOR") == nullptr) && isatty(STDOUT_FILENO);
+        if (g_color)
+            std::printf("\x1b[1;38;5;215m%s\x1b[0m —— 输入表达式立即求值"
+                        "（.help 帮助 / .exit 退出）\n",
+                        kReplVersion.c_str());
+        else
+            std::printf("%s —— 输入表达式立即求值（.help 帮助 / .exit 退出）\n",
+                        kReplVersion.c_str());
         TermRaw raw;
         if (!raw.enter()) {
             std::fprintf(stderr, "repl: 无法切换到终端原始模式\n");
