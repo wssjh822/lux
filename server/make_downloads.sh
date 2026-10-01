@@ -41,7 +41,7 @@ tar -cf - -C "$ROOT" \
     --exclude='./bench/primes_lux' --exclude='./bench/primes_lux_native' \
     --exclude='./bench/primes_c' --exclude='./bench/primes_nat_noarc' \
     Makefile README.md CHANGELOG.md LICENSE logo.svg index.html .gitignore \
-    src docs examples tests packages server bench .github \
+    src docs examples tests packages server site bench .github \
     | tar -xf - -C "$STAGE/lux"
 ( cd "$STAGE" && zip -qr "$OUT/lux-$VER.zip" lux )
 rm -rf "$STAGE"

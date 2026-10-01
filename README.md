@@ -966,6 +966,7 @@ lux/
 ├── examples/                示例程序
 ├── packages/                官方包源码（mathx / strx / numx / arrx / jsonx）
 ├── server/                  注册表服务端（index.php 网页 + lux.php API + lib.php + 部署/打包脚本）
+├── site/                    lux.xfes.top 站点根首页源码（index.php，动态读注册表）
 ├── bench/                   性能对比（C / Python 对照实现）
 ├── tests/
 │   ├── cases/               行为测试（.lux + .expected，含切片 / struct / 双后端差分）
