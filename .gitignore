@@ -25,6 +25,9 @@ server/packages/
 # bench 里的 C 对照实现是手写的，要保留
 !bench/primes_hand.c
 
+# 个人草稿，不随仓库发布
+建议.txt
+
 # 编辑器 / 系统
 .vscode/
 .idea/
