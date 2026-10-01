@@ -1,11 +1,12 @@
 <?php
 // =============================================================================
-//  index.php : Lux 包注册表 —— 网页界面（0.9.2）
+//  index.php : Lux 包注册表 —— 网页界面（0.9.3）
 //
 //  在线登录 / 注册 / 浏览 / 搜索 / 上传 / 修改 / 删除自己的包；
 //  也可查看与下载别人的包。上传需要账号，且只能改删自己发布的包。
 //
-//  另提供：包管理系统源码下载、Lux 各版本源码下载。
+//  上传支持：直接传 .tar.gz / 上传具体文件由站点打包 / 更新包在旧版本上叠加。
+//  另提供：包管理系统源码下载、Lux 各版本源码下载、意见反馈。
 // =============================================================================
 declare(strict_types=1);
 require __DIR__ . '/lib.php';
@@ -71,6 +72,11 @@ $user = current_user();
 //  POST 处理
 // -----------------------------------------------------------------------------
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    // 表单超过 post_max_size 时 PHP 会清空 POST/FILES，给出可读提示
+    if (empty($_POST) && empty($_FILES) && (int)($_SERVER['CONTENT_LENGTH'] ?? 0) > 0) {
+        flash('上传内容超过服务器限制（post_max_size = ' . ini_get('post_max_size') . '）', 'err');
+        redirect('?p=upload');
+    }
     $do = (string)($_POST['do'] ?? '');
     check_csrf();
 
@@ -98,6 +104,34 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
         redirect('?p=home');
     }
 
+    // 意见反馈：任何人可提交（免登录）
+    if ($do === 'feedback') {
+        $err = '';
+        $item = feedback_add((string)($_POST['type'] ?? ''),
+                             (string)($_POST['content'] ?? ''),
+                             (string)($_POST['contact'] ?? ''),
+                             $user['name'] ?? '', $err);
+        if (!$item) { flash($err, 'err'); redirect('?p=feedback'); }
+        flash('感谢反馈！已收到，编号 ' . $item['id'] . '。');
+        redirect('?p=feedback');
+    }
+    if ($do === 'feedback_status' || $do === 'feedback_delete') {
+        if (!$user || empty($user['admin'])) {
+            flash('只有管理员可以处理反馈', 'err');
+            redirect('?p=feedback');
+        }
+        $id = (string)($_POST['id'] ?? '');
+        if ($do === 'feedback_status') {
+            $status = ((string)($_POST['status'] ?? 'done')) === 'open' ? 'open' : 'done';
+            feedback_set_status($id, $status);
+            flash($status === 'done' ? '已标记为已处理' : '已重新打开');
+        } else {
+            feedback_delete($id);
+            flash('已删除该条反馈');
+        }
+        redirect('?p=feedback');
+    }
+
     if (!$user) { flash('请先登录', 'err'); redirect('?p=login'); }
 
     if ($do === 'upload') {
@@ -115,11 +149,19 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
             'authors'     => lines_to_array($_POST['authors'] ?? ''),
             'deps'        => deps_from_text($_POST['deps'] ?? ''),
         ];
+        $base = trim((string)($_POST['base_version'] ?? ''));
+        $provide = (string)($_POST['provide'] ?? 'archive');
         $err = '';
-        $saved = pkg_store_upload($_FILES['archive'] ?? [], $meta, $user['name'],
-                                  !empty($user['admin']), $err);
-        if (!$saved) { flash($err, 'err'); redirect('?p=upload'); }
-        flash('已发布 ' . $saved['name'] . '@' . $saved['version']);
+        if ($provide === 'files') {
+            $saved = pkg_store_files($_FILES['files'] ?? [], $meta, $user['name'],
+                                     !empty($user['admin']), $base, $err);
+        } else {
+            $saved = pkg_store_upload($_FILES['archive'] ?? [], $meta, $user['name'],
+                                      !empty($user['admin']), $err,
+                                      $base !== '' ? $base : null);
+        }
+        if (!$saved) { flash($err, 'err'); redirect('?p=upload&name=' . urlencode($meta['name'])); }
+        flash(($base !== '' ? '已发布更新包 ' : '已发布 ') . $saved['name'] . '@' . $saved['version']);
         redirect('?p=pkg&name=' . urlencode($saved['name']));
     }
 
@@ -190,7 +232,7 @@ function page_title(string $p): string {
         'home' => '首页', 'browse' => '浏览包', 'pkg' => '包详情',
         'downloads' => '下载', 'login' => '登录', 'register' => '注册',
         'dashboard' => '我的包', 'upload' => '上传包', 'edit' => '编辑包',
-        'about' => '关于',
+        'feedback' => '意见反馈', 'about' => '关于',
     ][$p] ?? '首页';
 }
 
@@ -281,7 +323,33 @@ footer{border-top:1px solid var(--line);color:var(--muted);font-size:13px;paddin
 .dl:last-child{border-bottom:0}
 .dl .t{font-weight:600}
 .dl .d{color:var(--muted);font-size:13px}
-@media(max-width:640px){.form .row{grid-template-columns:1fr}.hero h1{font-size:30px}}
+.seg{display:flex;flex-wrap:wrap;gap:8px}
+.seg input{position:absolute;opacity:0;width:0;height:0}
+.seg label{display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border:1px solid var(--line);
+  border-radius:10px;background:var(--panel2);font-size:13.5px;color:var(--muted);cursor:pointer;
+  transition:border-color .15s,color .15s,background .15s}
+.seg input:checked+label{border-color:var(--accent);color:var(--fg);background:rgba(124,92,255,.14);font-weight:600}
+.seg input:focus-visible+label{outline:2px solid var(--accent2);outline-offset:2px}
+.hidden{display:none!important}
+.drop{border:1.5px dashed var(--line);border-radius:12px;padding:26px 18px;text-align:center;
+  color:var(--muted);background:var(--panel2);cursor:pointer;transition:border-color .15s,color .15s}
+.drop.over,.drop:hover{border-color:var(--accent);color:var(--fg)}
+.drop input[type=file]{display:none}
+.filelist{margin-top:10px;max-height:230px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+.filelist .row{display:flex;justify-content:space-between;gap:10px;padding:7px 12px;
+  border-bottom:1px solid var(--line);font-size:13px}
+.filelist .row:last-child{border-bottom:0}
+.filelist .row .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.filelist .row .s{color:var(--muted);white-space:nowrap}
+.fb{border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:10px 0;background:var(--panel2)}
+.fb .head{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--muted);flex-wrap:wrap}
+.fb .body{margin-top:8px;white-space:pre-wrap;word-break:break-word}
+.badge{font-size:12px;border-radius:999px;padding:2px 9px;border:1px solid var(--line)}
+.badge.open{color:var(--gold);border-color:#4a4020}
+.badge.done{color:var(--ok);border-color:#214a33}
+.badge.type{color:var(--accent2);border-color:#274a66}
+@media(max-width:640px){.form .row{grid-template-columns:1fr}.hero h1{font-size:30px}
+  .seg label{flex:1 1 100%;justify-content:center}}
 </style>
 </head>
 <body>
@@ -289,6 +357,7 @@ footer{border-top:1px solid var(--line);color:var(--muted);font-size:13px;paddin
   <a class="brand" href="?p=home"><span class="dot">λ</span> Lux 包注册表</a>
   <a class="link" href="?p=browse">浏览</a>
   <a class="link" href="?p=downloads">下载</a>
+  <a class="link" href="?p=feedback">反馈</a>
   <a class="link" href="?p=about">关于</a>
   <span class="spacer"></span>
   <?php if ($user): ?>
@@ -315,7 +384,8 @@ function render_foot(): void { ?>
 <footer>
   <div class="wrap">
     Lux 包注册表 v<?= h(LUX_VERSION) ?> · 上传需注册账号，只能修改 / 删除自己的包 ·
-    API：<code>lux.php</code> · <a href="?p=downloads">源码下载</a>
+    API：<code>lux.php</code> · <a href="?p=downloads">源码下载</a> ·
+    <a href="?p=feedback">意见反馈</a>
   </div>
 </footer>
 </body></html>
@@ -335,6 +405,40 @@ function render_pkg_card(array $p): void { ?>
         <span class="tag">#<?= h($t) ?></span>
       <?php endforeach; ?>
     </div>
+  </div>
+<?php }
+
+function render_feedback_item(array $f, bool $admin): void {
+    $done = ($f['status'] ?? 'open') === 'done'; ?>
+  <div class="fb">
+    <div class="head">
+      <span class="badge type"><?= h($f['type'] ?? '其他') ?></span>
+      <span class="badge <?= $done ? 'done' : 'open' ?>"><?= $done ? '已处理' : '待处理' ?></span>
+      <span><?= h(substr((string)($f['time'] ?? ''), 0, 16)) ?></span>
+      <span><?= h(!empty($f['user']) ? '@' . $f['user'] : '匿名') ?></span>
+      <?php if (!empty($f['id'])): ?><code style="font-size:12px">#<?= h($f['id']) ?></code><?php endif; ?>
+    </div>
+    <div class="body"><?= h($f['content'] ?? '') ?></div>
+    <?php if (!empty($f['contact'])): ?>
+      <div class="hint">联系方式：<?= h($f['contact']) ?></div>
+    <?php endif; ?>
+    <?php if ($admin): ?>
+      <div style="margin-top:10px;display:flex;gap:8px">
+        <form method="post" style="display:inline">
+          <input type="hidden" name="csrf" value="<?= h(csrf()) ?>">
+          <input type="hidden" name="do" value="feedback_status">
+          <input type="hidden" name="id" value="<?= h($f['id'] ?? '') ?>">
+          <input type="hidden" name="status" value="<?= $done ? 'open' : 'done' ?>">
+          <button class="btn small" type="submit"><?= $done ? '重新打开' : '标记已处理' ?></button>
+        </form>
+        <form method="post" style="display:inline" onsubmit="return confirm('删除这条反馈？')">
+          <input type="hidden" name="csrf" value="<?= h(csrf()) ?>">
+          <input type="hidden" name="do" value="feedback_delete">
+          <input type="hidden" name="id" value="<?= h($f['id'] ?? '') ?>">
+          <button class="btn danger small" type="submit">删除</button>
+        </form>
+      </div>
+    <?php endif; ?>
   </div>
 <?php }
 
@@ -427,7 +531,8 @@ case 'pkg':
       <?php endforeach; ?></ul>
     <?php endif; ?>
     <?php if ($user && (($latestP['owner'] ?? '') === $user['name'] || !empty($user['admin']))): ?>
-      <div style="margin-top:18px;display:flex;gap:10px">
+      <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap">
+        <a class="btn primary" href="?p=upload&amp;release=update&amp;name=<?= urlencode($name) ?>&amp;base=<?= urlencode($latestP['version']) ?>">发布更新包</a>
         <a class="btn" href="?p=edit&amp;name=<?= urlencode($name) ?>&amp;version=<?= urlencode($latestP['version']) ?>">编辑元数据</a>
         <form method="post" onsubmit="return confirm('删除整个包 <?= h($name) ?>？')">
           <input type="hidden" name="csrf" value="<?= h(csrf()) ?>">
@@ -473,7 +578,12 @@ case 'dashboard':
   if (!$user) { echo '<div class="empty">请先<a href="?p=login">登录</a>。</div>'; break; }
   $mine = array_values(array_filter($all, fn($p) => ($p['owner'] ?? '') === $user['name'])); ?>
   <h2 class="section">我的包（<?= h($user['name']) ?>）</h2>
-  <p><a class="btn primary" href="?p=upload">+ 上传新包</a></p>
+  <p>
+    <a class="btn primary" href="?p=upload">+ 上传新包</a>
+    <?php if (!empty($user['admin'])): ?>
+      <a class="btn" href="?p=feedback">查看 / 处理反馈</a>
+    <?php endif; ?>
+  </p>
   <?php if (!$mine): ?>
     <div class="empty">你还没有发布过包。</div>
   <?php else: ?>
@@ -502,19 +612,71 @@ case 'dashboard':
   break;
 
 case 'upload':
-  if (!$user) { echo '<div class="empty">请先<a href="?p=login">登录</a>后再上传。</div>'; break; } ?>
+  if (!$user) { echo '<div class="empty">请先<a href="?p=login">登录</a>后再上传。</div>'; break; }
+  $prefName = (string)($_GET['name'] ?? '');
+  $prefBase = (string)($_GET['base'] ?? '');
+  $prefRelease = (string)($_GET['release'] ?? 'full'); ?>
   <div class="breadcrumb"><a href="?p=dashboard">我的包</a> / 上传</div>
   <div class="panel">
-    <h2 style="margin-top:0">上传新包 <span class="pill">需登录</span></h2>
-    <p class="hint">先在本地用 <code>luxc publish</code> 或 <code>tar -czf pkg.tar.gz -C 包目录 .</code>
-       打出 <code>.tar.gz</code> 归档，再连同元数据一起上传。归档需包含 <code>lux.json</code>。</p>
-    <form class="form" method="post" enctype="multipart/form-data">
+    <h2 style="margin-top:0">上传 / 更新包 <span class="pill">需登录</span></h2>
+    <p class="hint">两种提供方式：<b>直接上传 .tar.gz 压缩包</b>（本地用 <code>luxc publish</code> 或
+       <code>tar -czf pkg.tar.gz -C 包目录 .</code> 打好），或<b>上传具体文件</b>由站点自动打包。
+       <b>更新包</b>只需提供改动 / 新增的文件，服务端会在所选基础版本上叠加生成新版本。
+       归档上限 16 MB，单个文件 8 MB。</p>
+    <form class="form" method="post" enctype="multipart/form-data" id="upload-form">
       <input type="hidden" name="csrf" value="<?= h(csrf()) ?>">
       <input type="hidden" name="do" value="upload">
       <div class="row">
-        <div><label>包名 *</label><input name="name" required placeholder="mypkg"></div>
+        <div><label>包名 *</label><input name="name" id="f-name" required value="<?= h($prefName) ?>" placeholder="mypkg"></div>
         <div><label>版本 *</label><input name="version" required placeholder="0.1.0"></div>
       </div>
+
+      <div>
+        <label>发布类型</label>
+        <div class="seg">
+          <input type="radio" id="rel-full" name="release" value="full" <?= $prefRelease !== 'update' ? 'checked' : '' ?>>
+          <label for="rel-full">完整包</label>
+          <input type="radio" id="rel-update" name="release" value="update" <?= $prefRelease === 'update' ? 'checked' : '' ?>>
+          <label for="rel-update">更新包（在已有版本上叠加）</label>
+        </div>
+      </div>
+      <div id="base-row" class="<?= $prefRelease === 'update' ? '' : 'hidden' ?>">
+        <label>基础版本 *</label>
+        <select name="base_version" id="f-base">
+          <option value="<?= h($prefBase) ?>"><?= $prefBase !== '' ? h($prefBase) : '（输入包名后自动加载版本）' ?></option>
+        </select>
+        <div class="hint">合并规则：基础版本的文件保持不变，本次上传的同名文件覆盖、新文件追加。
+           请确认包名已发布过该版本。</div>
+      </div>
+
+      <div>
+        <label>提供方式</label>
+        <div class="seg">
+          <input type="radio" id="prov-archive" name="provide" value="archive" checked>
+          <label for="prov-archive">直接上传 .tar.gz</label>
+          <input type="radio" id="prov-files" name="provide" value="files">
+          <label for="prov-files">上传文件，站点打包</label>
+        </div>
+      </div>
+      <div id="provide-archive">
+        <label>归档文件（.tar.gz / .tgz）*</label>
+        <input type="file" name="archive" id="f-archive" accept=".gz,.tgz,application/gzip">
+        <div class="hint">更新包模式下，这里上传的也应该是只含改动文件的 .tar.gz。</div>
+      </div>
+      <div id="provide-files" class="hidden">
+        <label>源文件 *</label>
+        <div class="drop" id="drop">
+          <input type="file" id="f-files" name="files[]" multiple>
+          <div>把文件拖到这里，或 <a href="#" id="pick">点击选择文件</a></div>
+          <div class="hint">可勾选「整个文件夹」或拖入文件夹（Chromium 系浏览器）批量上传；
+             站点会自动生成包含 <code>lux.json</code> 的规范归档。</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:10px;color:var(--fg);cursor:pointer">
+          <input type="checkbox" id="dir-toggle" style="width:auto"> 选择整个文件夹
+        </label>
+        <div id="filelist" class="filelist hidden"></div>
+      </div>
+
       <div><label>一句话简介</label><input name="summary" placeholder="这个包是做什么的"></div>
       <div><label>详细说明</label><textarea name="description"></textarea></div>
       <div class="row">
@@ -525,14 +687,95 @@ case 'upload':
         <div><label>许可</label><input name="license" placeholder="MIT"></div>
         <div><label>主页</label><input name="homepage" placeholder="https://…"></div>
       </div>
-      <div><label>源文件（逗号或换行分隔）</label><input name="files" placeholder="lib.lux"></div>
+      <div><label>源文件（逗号或换行分隔，留空时按上传文件自动填写）</label><input name="files" placeholder="lib.lux"></div>
       <div><label>标签</label><input name="tags" placeholder="math, utils"></div>
       <div><label>作者</label><input name="authors" placeholder="你的名字"></div>
       <div><label>依赖（每行 name 或 name@约束）</label><textarea name="deps" placeholder="mathx@^0.1.0"></textarea></div>
-      <div><label>归档文件（.tar.gz / .tgz）*</label><input type="file" name="archive" accept=".gz,.tgz,application/gzip" required></div>
       <button class="btn primary" type="submit">发布</button>
     </form>
   </div>
+  <script>
+  (function(){
+    var rel = document.querySelectorAll('input[name=release]');
+    var prov = document.querySelectorAll('input[name=provide]');
+    var nameInput = document.getElementById('f-name');
+    var baseRow = document.getElementById('base-row');
+    var baseSel = document.getElementById('f-base');
+    var prefBase = <?= json_encode($prefBase, JSON_UNESCAPED_UNICODE) ?>;
+    function checkedVal(list){ for (var i=0;i<list.length;i++) if (list[i].checked) return list[i].value; return ''; }
+    function loadVersions(){
+      var n = nameInput.value.trim();
+      if (!n) return;
+      fetch('lux.php?action=info&name=' + encodeURIComponent(n))
+        .then(function(r){ return r.json(); })
+        .then(function(j){
+          if (!j || !j.versions) return;
+          baseSel.innerHTML = '';
+          j.versions.forEach(function(v){
+            var o = document.createElement('option');
+            o.value = v.version;
+            o.textContent = 'v' + v.version + (v.owner ? '（@' + v.owner + '）' : '');
+            if (prefBase && v.version === prefBase) o.selected = true;
+            baseSel.appendChild(o);
+          });
+        }).catch(function(){});
+    }
+    function showBase(){
+      var upd = checkedVal(rel) === 'update';
+      baseRow.classList.toggle('hidden', !upd);
+      if (upd) loadVersions();
+    }
+    rel.forEach(function(r){ r.addEventListener('change', showBase); });
+    nameInput.addEventListener('change', function(){ if (checkedVal(rel)==='update') loadVersions(); });
+    prov.forEach(function(r){ r.addEventListener('change', function(){
+      var files = checkedVal(prov) === 'files';
+      document.getElementById('provide-archive').classList.toggle('hidden', files);
+      document.getElementById('provide-files').classList.toggle('hidden', !files);
+    }); });
+
+    var filesInput = document.getElementById('f-files');
+    var drop = document.getElementById('drop');
+    var list = document.getElementById('filelist');
+    var dirToggle = document.getElementById('dir-toggle');
+    function fmt(n){ if (n<1024) return n+' B'; if (n<1048576) return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(1)+' MB'; }
+    function render(){
+      var fs = filesInput.files || [];
+      list.innerHTML = '';
+      var total = 0;
+      for (var i=0;i<fs.length;i++){
+        total += fs[i].size;
+        var row = document.createElement('div'); row.className='row';
+        var n = document.createElement('span'); n.className='n';
+        n.textContent = fs[i].webkitRelativePath || fs[i].name;
+        var s = document.createElement('span'); s.className='s'; s.textContent = fmt(fs[i].size);
+        row.appendChild(n); row.appendChild(s); list.appendChild(row);
+      }
+      if (fs.length){
+        var t = document.createElement('div'); t.className='row';
+        var tn = document.createElement('span'); tn.className='n';
+        tn.innerHTML = '<b>共 ' + fs.length + ' 个文件</b>' + (total > 16777216 ? ' — 超过 16 MB 限制' : '');
+        var ts = document.createElement('span'); ts.className='s'; ts.textContent = fmt(total);
+        t.appendChild(tn); t.appendChild(ts); list.appendChild(t);
+        list.classList.remove('hidden');
+      } else list.classList.add('hidden');
+    }
+    drop.addEventListener('click', function(e){ e.preventDefault(); filesInput.click(); });
+    drop.addEventListener('dragover', function(e){ e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', function(){ drop.classList.remove('over'); });
+    drop.addEventListener('drop', function(e){
+      e.preventDefault(); drop.classList.remove('over');
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length){
+        filesInput.files = e.dataTransfer.files; render();
+      }
+    });
+    filesInput.addEventListener('change', render);
+    dirToggle.addEventListener('change', function(){
+      filesInput.webkitdirectory = dirToggle.checked;
+      filesInput.value = ''; render();
+    });
+    showBase();
+  })();
+  </script>
   <?php break;
 
 case 'edit':
@@ -608,7 +851,23 @@ case 'downloads': ?>
     <?php endforeach; endif; ?>
   </div>
   <?php
-  $other = array_values(array_filter($downloads, fn($d) => !in_array($d['kind'] ?? '', ['lux', 'server'], true)));
+  $updDl = array_values(array_filter($downloads, fn($d) => ($d['kind'] ?? '') === 'update'));
+  if ($updDl): ?>
+  <div class="panel">
+    <h3 style="margin-top:0">更新包</h3>
+    <p class="hint">从旧版本升级到新版本的增量包，只包含变化的文件。</p>
+    <?php foreach ($updDl as $d): ?>
+      <div class="dl">
+        <div>
+          <div class="t"><?= h($d['title'] ?? $d['file']) ?></div>
+          <div class="d"><?= h($d['desc'] ?? '') ?><?= !empty($d['size']) ? ' · ' . h(human_size($d['size'])) : '' ?></div>
+        </div>
+        <a class="btn primary small" href="downloads/<?= h(rawurlencode($d['file'])) ?>" download>下载</a>
+      </div>
+    <?php endforeach; ?>
+  </div>
+  <?php endif;
+  $other = array_values(array_filter($downloads, fn($d) => !in_array($d['kind'] ?? '', ['lux', 'server', 'update'], true)));
   if ($other): ?>
   <div class="panel">
     <h3 style="margin-top:0">其他</h3>
@@ -620,6 +879,49 @@ case 'downloads': ?>
   </div>
   <?php endif;
   break;
+
+case 'feedback':
+  $isAdmin = $user && !empty($user['admin']);
+  $myFb = $user
+      ? array_values(array_filter(feedback_list(), fn($f) => ($f['user'] ?? '') === $user['name']))
+      : [];
+  $allFb = $isAdmin ? feedback_list() : []; ?>
+  <h2 class="section">意见反馈</h2>
+  <div class="panel" style="max-width:760px;margin:0 auto">
+    <h3 style="margin-top:0">提交反馈</h3>
+    <p class="hint">使用中遇到的问题、想要的功能、对注册表 / 包管理的建议都可以写在这里，无需登录。
+       提交内容保存在服务端 <code>data/feedback.php</code>（带访问守卫）。</p>
+    <form class="form" method="post">
+      <input type="hidden" name="csrf" value="<?= h(csrf()) ?>">
+      <input type="hidden" name="do" value="feedback">
+      <div class="row">
+        <div><label>类型</label>
+          <select name="type">
+            <?php foreach (feedback_types() as $t): ?>
+              <option value="<?= h($t) ?>"><?= h($t) ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <div><label>联系方式（可选）</label><input name="contact"
+          value="<?= h($user['email'] ?? '') ?>" placeholder="邮箱 / QQ / 其它"></div>
+      </div>
+      <div><label>内容 *</label><textarea name="content" required
+        placeholder="请尽量描述清楚：做了什么、预期什么、实际怎样…"></textarea></div>
+      <button class="btn primary" type="submit">提交反馈</button>
+    </form>
+  </div>
+  <?php if ($myFb): ?>
+    <h2 class="section">我的反馈（<?= count($myFb) ?>）</h2>
+    <?php foreach ($myFb as $f) render_feedback_item($f, false); ?>
+  <?php elseif ($user): ?>
+    <div class="empty">你还没有提交过反馈。</div>
+  <?php endif; ?>
+  <?php if ($isAdmin): ?>
+    <h2 class="section">全部反馈（管理员，<?= count($allFb) ?>）</h2>
+    <?php if (!$allFb): ?><div class="empty">暂无反馈。</div>
+    <?php else: foreach ($allFb as $f): render_feedback_item($f, true); endforeach; endif; ?>
+  <?php endif; ?>
+  <?php break;
 
 case 'about': ?>
   <h2 class="section">关于</h2>
