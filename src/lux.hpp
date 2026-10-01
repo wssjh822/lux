@@ -457,10 +457,12 @@ struct StrLitExpr : Expr {
 };
 
 struct GlobalConstDecl;  // 前向声明（IdentExpr 引用它）
+struct FuncDecl;         // 前向声明（IdentExpr 引用具名函数，1.1）
 
 struct IdentExpr : Expr {
     std::string name;  // 普通标识符，或模块限定访问 "mod.name"
     GlobalConstDecl* constRef = nullptr;  // 引用全局常量时由 Sema 填充
+    FuncDecl* funcRef = nullptr;  // 1.1：引用具名函数（函数作为值）
     IdentExpr(SourceLoc l, std::string n)
         : Expr(ExprKind::Ident, l), name(std::move(n)) {}
 };
@@ -496,6 +498,9 @@ struct CallExpr : Expr {
     std::vector<Expr*> args;
     Builtin builtin = Builtin::None;  // Sema 填充
     struct FuncDecl* target = nullptr;  // Sema 填充（用户函数）
+    // 1.1：被调者是 fn 类型的局部变量（间接调用），callee 即变量名
+    bool viaValue = false;
+    const Ty* calleeFnTy = nullptr;  // 1.1：viaValue 时被调函数值的类型
     // 0.8：panic 变体调用（如 int!(s) / read!(p)），失败时退出而不是返回 T?
     bool panicVariant = false;
     // 数组方法调用（a.push(x)）：Sema 填充接收者变量名，代码生成用它

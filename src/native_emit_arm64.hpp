@@ -30,6 +30,7 @@ enum CC { CJo = 0, CJno = 1, CJb = 2, CJae = 3, CJe = 4, CJne = 5,
           CJl = 12, CJge = 13, CJle = 14, CJg = 15 };
 
 constexpr uint64_t kBase = 0x400000;
+constexpr uint64_t kCodeOff = 128;  // ELF 布局：[Ehdr][Phdr][pad→128][code][data]
 
 inline int a64cond(int cc) {
     switch (cc) {
@@ -233,6 +234,16 @@ struct Arm64 {
         size_t at = emit32(0x94000000u);
         fixups.push_back({at, label, 0, 0});
     }
+    // 1.1：取代码标签的绝对地址进寄存器（movz/movk ×4；函数作为值）
+    void movAbsLabel(int reg, int label) {
+        size_t at = code.size();
+        movzRaw(R(reg), 0, 0); movkRaw(R(reg), 0, 1); movkRaw(R(reg), 0, 2); movkRaw(R(reg), 0, 3);
+        fixups.push_back({at, label, 3, R(reg)});
+    }
+    // 1.1：间接调用 blr Xn
+    void callReg(int reg) {
+        emit32(0xD63F0000u | ((uint32_t)(R(reg) & 31) << 5));
+    }
     void ret() { emit32(0xD65F03C0u); }
     void syscall() { emit32(0xD4000001u); }  // svc #0
 
@@ -248,6 +259,22 @@ struct Arm64 {
             if (f.kind == 2) {
                 size_t doff = (size_t)(-1 - (long long)f.label);
                 uint64_t addr = kBase + dataSegOff + doff;
+                for (int h = 0; h < 4; h++) {
+                    uint16_t c = (uint16_t)((addr >> (16 * h)) & 0xFFFF);
+                    uint32_t w = (h == 0 ? 0xD2800000u : 0xF2800000u) |
+                                 ((uint32_t)h << 21) | ((uint32_t)c << 5) | (uint32_t)(f.reg & 31);
+                    for (int i = 0; i < 4; i++) code[f.at + h * 4 + i] = (uint8_t)((w >> (8 * i)) & 0xFF);
+                }
+                continue;
+            }
+            if (f.kind == 3) {
+                // 1.1：代码标签的绝对地址（函数作为值）
+                long long ct = labels[f.label];
+                if (ct < 0) {
+                    std::fprintf(stderr, "编译器内部错误: 未绑定的标签 %d\n", f.label);
+                    std::exit(3);
+                }
+                uint64_t addr = kBase + kCodeOff + (uint64_t)ct;
                 for (int h = 0; h < 4; h++) {
                     uint16_t c = (uint16_t)((addr >> (16 * h)) & 0xFFFF);
                     uint32_t w = (h == 0 ? 0xD2800000u : 0xF2800000u) |

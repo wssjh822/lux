@@ -473,6 +473,13 @@ struct NativeGen {
                 return;
             case ExprKind::Ident: {
                 auto* id = static_cast<IdentExpr*>(e);
+                // 1.1：函数作为值 → 函数代码地址（8 字节地址槽）
+                if (id->funcRef) {
+                    c.push(RAX);
+                    c.movAbsLabel(RAX, symLabel(keyOf(*id->funcRef)));
+                    c.movmr(RSP, 0, RAX);
+                    return;
+                }
                 if (id->constRef) { evalConstRef(id->constRef); return; }
                 Var* v = findVar(id->name);
                 if (!v) { pushImm(0); return; }  // Sema 已报错
@@ -1341,6 +1348,29 @@ struct NativeGen {
         }
         if (e->builtin != Builtin::None) {
             genBuiltin(e);
+            return;
+        }
+        // 1.1：通过 fn 类型变量间接调用
+        if (e->viaValue) {
+            int n = (int)e->args.size();
+            const Ty* ft = e->calleeFnTy;
+            for (int i = 0; i < n; i++) {
+                const Ty* pt = (ft && i < (int)ft->members.size())
+                                   ? ft->members[i]
+                                   : nullptr;
+                evalCoerced(e->args[i], pt);
+            }
+            Var* v = findVar(e->callee);
+            if (!v) { pushImm(0); return; }  // Sema 已报错
+            c.movrm(RAX, RBP, v->slot);
+            c.callReg(RAX);
+            addRspImm(8 * n);
+            if (e->panicVariant && ft && ft->elem &&
+                ft->elem->kind == TyKind::Optional) {
+                panicUnwrapTop("\u51fd\u6570\u8c03\u7528", ft->elem->elem);
+            } else {
+                callRet(e->ty);
+            }
             return;
         }
         if (e->target) {

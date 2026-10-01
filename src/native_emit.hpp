@@ -238,6 +238,21 @@ struct X64 {
     void jmp32(int label) { db(0xE9); fixLabel(label); }
     void jcc32(int cc, int label) { dbs({0x0F, 0x80 | cc}); fixLabel(label); }
     void call32(int label) { db(0xE8); fixLabel(label); }
+    // 1.1：取代码标签的地址进寄存器（lea reg, [rip+disp32]；函数作为值）
+    void leaRip(int reg, int label) {
+        if (reg >= 8) db(0x4C); else db(0x48);
+        db(0x8D);
+        db((uint8_t)(0x05 | ((reg & 7) << 3)));
+        fixLabel(label);
+    }
+    // 1.1：间接调用 call r/m64（mod=11, /2）
+    void callReg(int reg) {
+        if (reg >= 8) db(0x41);
+        db(0xFF);
+        db((uint8_t)(0xD0 | (reg & 7)));
+    }
+    // 1.1：取代码标签绝对地址（与 arm64 接口统一；x86 用 RIP 相对 lea）
+    void movAbsLabel(int reg, int label) { leaRip(reg, label); }
     void ret() { db(0xC3); }
     void setcc(int cc, int r) {  // 结果写入 r（64 位 0/1）
         db(0x40 | ((r >= 8) ? 1 : 0));

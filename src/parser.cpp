@@ -204,6 +204,22 @@ const Ty* Parser::parseTypeTok() {
             advance();
             base = TyStore::voidTy();
             break;
+        case Tok::KwFn: {
+            // 函数类型 fn(T1, T2) -> R（1.1：函数成为值）
+            advance();
+            expect(Tok::LParen, "'('（fn 类型的参数表）");
+            std::vector<const Ty*> params;
+            if (!at(Tok::RParen)) {
+                do {
+                    params.push_back(parseTypeTok());
+                } while (match(Tok::Comma) && !at(Tok::RParen));
+            }
+            expect(Tok::RParen, "')' 结束 fn 类型的参数表");
+            expect(Tok::Arrow, "'->'（fn 类型必须写返回类型，如 fn(int) -> int）");
+            const Ty* ret = parseTypeTok();
+            base = TyStore::fnOf(ret, std::move(params));
+            break;
+        }
         case Tok::Ident: {  // struct / 具名类型（0.7）
             Token n = advance();
             base = TyStore::named(n.text);

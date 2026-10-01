@@ -942,6 +942,68 @@ static inline bool lx_file_rename(const char* from, const char* to) {
 // struct 类型在生成的 C 里的名字（typedef 名）
 std::string structCName(const std::string& s) { return "lx_st_" + s; }
 
+// -----------------------------------------------------------------------------
+//  fn 类型（1.1：函数成为值）的 C 函数指针 typedef 注册表
+//  每个不同的 fn 类型对应一个 typedef，避免在参数 / 返回值里写复杂的
+//  C 声明符。generateC 每次重置；内层 fn 类型先登记，保证 typedef 依赖顺序。
+// -----------------------------------------------------------------------------
+std::vector<std::pair<std::string, const Ty*>>& fnTypedefList() {
+    static std::vector<std::pair<std::string, const Ty*>> v;
+    return v;
+}
+std::unordered_map<std::string, std::string>& fnTypedefMap() {
+    static std::unordered_map<std::string, std::string> m;
+    return m;
+}
+int& fnTypedefCounter() {
+    static int c = 0;
+    return c;
+}
+void resetFnTypedefs() {
+    fnTypedefList().clear();
+    fnTypedefMap().clear();
+    fnTypedefCounter() = 0;
+}
+std::string fnTypeCName(const Ty* t) {
+    std::string key = tyName(t);
+    auto& m = fnTypedefMap();
+    auto it = m.find(key);
+    if (it != m.end()) return it->second;
+    // 先登记内层 fn 类型（typedef 依赖：内层在前）
+    if (t->elem && t->elem->kind == TyKind::Fn) fnTypeCName(t->elem);
+    for (const Ty* p : t->members) {
+        if (p && p->kind == TyKind::Fn) fnTypeCName(p);
+    }
+    std::string name = "lux_fn" + std::to_string(fnTypedefCounter()++);
+    m[key] = name;
+    fnTypedefList().push_back({name, t});
+    return name;
+}
+
+std::string cType(const Ty* t);  // 前向声明（fnTypeCName 递归要用）
+
+// 生成全部 fn typedef 文本（列表可能在 cType 递归中继续增长）
+std::string fnTypedefCode() {
+    std::string out;
+    auto& list = fnTypedefList();
+    for (size_t i = 0; i < list.size(); i++) {
+        const std::string& name = list[i].first;
+        const Ty* ft = list[i].second;
+        std::string s = "typedef " + cType(ft->elem) + " (*" + name + ")(";
+        if (ft->members.empty()) {
+            s += "void";
+        } else {
+            for (size_t j = 0; j < ft->members.size(); j++) {
+                if (j) s += ", ";
+                s += cType(ft->members[j]);
+            }
+        }
+        s += ");";
+        out += s + "\n";
+    }
+    return out;
+}
+
 // 字段下标（与 Sema 的 StructDecl::fields 顺序一致）
 int structFieldIndex(const StructDecl* sd, const std::string& name) {
     if (!sd) return -1;
@@ -969,6 +1031,9 @@ std::string cType(const Ty* t) {
         case TyKind::Optional:
             // T? 统一表示为指向堆槽的指针，NULL = none（0.8）
             return cType(t->elem) + "*";
+        case TyKind::Fn:
+            // 函数指针 typedef（1.1）
+            return fnTypeCName(t);
         default:
             return "int64_t";  // 兜底，保证生成的 C 依旧合法
     }
@@ -1091,6 +1156,7 @@ struct CGen {
     std::map<std::string, std::string> litNames;
     std::vector<std::string> litDefs;
     size_t litAnchor = 0;  // 字面量包装区在 buf 中的位置
+    size_t fnTdAnchor = 0;  // fn typedef 插入点（1.1）
 
     const Ty* tInt = TyStore::int64Ty();
     const Ty* tFloat = TyStore::float64Ty();
@@ -1396,6 +1462,10 @@ struct CGen {
             }
             case ExprKind::Ident: {
                 auto* n = static_cast<IdentExpr*>(e);
+                // 1.1：具名函数作为值 → C 里就是函数指针（函数名）
+                if (n->funcRef) {
+                    return mangleFor(n->funcRef->module, n->funcRef->name);
+                }
                 // 引用全局常量（含模块限定访问）时用它的模块归属改写名字
                 if (n->constRef) {
                     return mangleFor(n->constRef->module, n->constRef->name);
@@ -1964,6 +2034,26 @@ struct CGen {
                 break;
         }
 
+        // 1.1：通过 fn 类型变量间接调用（C 里就是函数指针调用）
+        if (c->viaValue) {
+            std::string s = mangle(c->callee) + "(";
+            for (size_t i = 0; i < c->args.size(); i++) {
+                if (i) s += ", ";
+                Expr* a = c->args[i];
+                std::string av = expr(a);
+                if (c->calleeFnTy && i < c->calleeFnTy->members.size()) {
+                    av = coerceTo(a, c->calleeFnTy->members[i]);
+                }
+                s += av;
+            }
+            s += ")";
+            if (c->panicVariant && c->calleeFnTy && c->calleeFnTy->elem &&
+                c->calleeFnTy->elem->kind == TyKind::Optional) {
+                return panicUnwrap(s, c->calleeFnTy->elem, c->callee);
+            }
+            return s;
+        }
+
         // 用户函数调用（extern fn 直接引用 C 函数名，不做名字改写）
         std::string calleeName = (c->target && c->target->isExtern)
                                      ? c->callee
@@ -2449,6 +2539,9 @@ struct CGen {
             blank();
         }
 
+        // fn 类型 typedef 插入点（1.1）：在 struct 定义之后、函数原型之前
+        fnTdAnchor = buf.size();
+
         // extern fn 原型（调用 C 库函数）
         bool hasExtern = false;
         for (FuncDecl* fn : prog->funcs) {
@@ -2538,6 +2631,14 @@ struct CGen {
             line("}");
         }
 
+        // 回填 fn 类型 typedef（1.1）
+        if (!fnTypedefList().empty()) {
+            std::string td =
+                "/* --------------------- fn \u7c7b\u578b\uff08\u51fd\u6570\u6307\u9488\uff09 --------------------- */\n" +
+                fnTypedefCode() + "\n";
+            buf.insert(fnTdAnchor, td);
+        }
+
         // 回填 ARC 字符串字面量的静态不可变对象
         if (!litDefs.empty()) {
             const std::string marker = "/*__LUX_LIT_WRAPPERS__*/";
@@ -2551,6 +2652,7 @@ struct CGen {
 }  // namespace
 
 std::string generateC(Program* prog, const CodegenOptions& opt) {
+    resetFnTypedefs();
     CGen gen(opt);
     gen.program(prog);
     return gen.buf;

@@ -297,6 +297,25 @@ struct Analyzer {
         return -1;
     }
 
+    // ---------------- fn 类型（1.1：函数成为值） ----------------
+    // 具名函数能否作为某个 fn 类型的值：参数与返回类型必须逐项完全相同。
+    // 类型已 intern 化，指针比较即结构相等。
+    static bool fnMatchesType(const FuncDecl* fn, const Ty* ft) {
+        if (!fn || !ft || ft->kind != TyKind::Fn) return false;
+        if (fn->isExtern) return false;
+        if (fn->params.size() != ft->members.size()) return false;
+        for (size_t i = 0; i < fn->params.size(); i++) {
+            if (fn->params[i].ty != ft->members[i]) return false;
+        }
+        return fn->retTy == ft->elem;
+    }
+
+    static std::string fnSignName(const FuncDecl* fn) {
+        std::vector<const Ty*> ps;
+        for (const Param& p : fn->params) ps.push_back(p.ty);
+        return tyName(TyStore::fnOf(fn->retTy, std::move(ps)));
+    }
+
     // ---------------- 赋值左值检查（0.7） ----------------
     // 返回左值根变量（用于 const 可写性检查）；非变量根返回 nullptr
     static IdentExpr* lvalueRoot(Expr* t) {
@@ -637,7 +656,33 @@ struct Analyzer {
                 }
                 VarInfo* v = lookup(id->name);
                 if (!v) {
-                    err(id->loc, "未定义的变量 '" + id->name + "'");
+                    // 1.1：具名函数作为值（fn 类型）——需要上下文的 fn 类型 hint
+                    auto fit = funcs.find(id->name);
+                    if (fit != funcs.end()) {
+                        FuncDecl* fn = fit->second;
+                        if (!hint || hint->kind != TyKind::Fn) {
+                            err(id->loc,
+                                "函数 '" + id->name +
+                                    "' 只能作为 fn 类型的值使用（需要类型标注，"
+                                    "如 let f: fn(int) -> int = " +
+                                    id->name + ";）");
+                        } else if (fn->isExtern) {
+                            err(id->loc, "extern fn '" + id->name +
+                                             "' 不能作为值（原生后端没有 C 符号）");
+                        } else if (fn->name == "main" && fn->module.empty()) {
+                            err(id->loc, "main 函数不能作为值使用");
+                        } else if (!fnMatchesType(fn, hint)) {
+                            err(id->loc, "函数 '" + id->name + "' 的签名是 '" +
+                                             fnSignName(fn) + "'，与所需的 '" +
+                                             tyName(hint) + "' 不匹配");
+                        } else {
+                            id->funcRef = fn;
+                            e->ty = hint;
+                            return hint;
+                        }
+                    } else {
+                        err(id->loc, "未定义的变量 '" + id->name + "'");
+                    }
                     e->ty = tInvalid;
                     return tInvalid;
                 }
@@ -1148,6 +1193,49 @@ struct Analyzer {
             checkArgsNoHint(c);
             c->ty = tInvalid;
             return tInvalid;
+        }
+
+        // ---- 调用 fn 类型变量（1.1：函数成为值，间接调用）----
+        if (c->callee.rfind("__", 0) != 0) {
+            VarInfo* fv = findVar(c->callee);
+            if (fv && fv->ty && fv->ty->kind == TyKind::Fn) {
+                fv->used = true;
+                c->viaValue = true;
+                const Ty* ft = fv->ty;
+                c->calleeFnTy = ft;
+                if (c->args.size() != ft->members.size()) {
+                    err(c->loc, "函数值 '" + c->callee + "' 需要 " +
+                                    std::to_string(ft->members.size()) +
+                                    " 个参数，但调用时给了 " +
+                                    std::to_string(c->args.size()) + " 个");
+                    for (Expr* a : c->args) checkExpr(a);
+                    c->ty = tInvalid;
+                    return tInvalid;
+                }
+                bool bad = false;
+                for (size_t i = 0; i < c->args.size(); i++) {
+                    const Ty* want = ft->members[i];
+                    const Ty* at = checkExpr(c->args[i], want);
+                    if (at != tInvalid && !canCoerce(at, want) &&
+                        !tryCoerceArrayLit(c->args[i], want)) {
+                        typeError(c->args[i]->loc, at, want,
+                                  "函数值 '" + c->callee + "' 的第 " +
+                                      std::to_string(i + 1) + " 个实参类型不匹配");
+                        bad = true;
+                    }
+                }
+                if (c->panicVariant) {
+                    if (ft->elem && ft->elem->kind == TyKind::Optional) {
+                        c->ty = ft->elem->elem;
+                    } else {
+                        err(c->calleeLoc, "'! ' 只能用于返回可选类型 T? 的函数值");
+                        c->ty = tInvalid;
+                    }
+                } else {
+                    c->ty = bad ? tInvalid : ft->elem;
+                }
+                return c->ty;
+            }
         }
 
         // ---- 原生后端特权内建（__ 前缀，0.6）----
