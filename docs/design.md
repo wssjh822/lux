@@ -491,8 +491,8 @@ make test
 | --- | --- | --- |
 | 行为测试 | `tests/cases/*.lux` | 编译运行后与 `.expected` 逐行比对（含 `arrays` / `for_in` / `string_ops` / `return_paths` / `main_argv` / `math_edges` / `arc_stress`） |
 | 诊断测试 | `tests/errors/*.lux` | `.err`：必须编译失败且诊断含关键字；`.warn`：必须编译成功且输出含警告关键字 |
-| 原生后端差分 | `run_tests.sh` 第 2.5 节 | 每个行为用例再跑一遇 `--native`，与 C 后端输出逐字节对比 |
-| ARC | `run_tests.sh` 第 2.6 节 | 每个行为用例再跑一遇 `--arc`（MALLOC_CHECK_ 抽查）+ churn 内存回归 |
+| 原生后端差分 | `run_tests.sh` 第 2.5 节 | 每个行为用例再跑一遇 `--native`（0.9.4 起含 ARC），与 C 后端输出逐字节对比 |
+| ARC | `run_tests.sh` 第 2.6 节 | 每个行为用例再跑一遇 `--arc`（MALLOC_CHECK_ 抽查）+ C 后端 1e6 次 / 原生后端 20 万次 churn 内存回归；另验证默认开启与 `--no-arc` |
 | 冒烟测试 | `examples/*.lux` | 必须能顺利编译通过 |
 | 包管理 | `run_tests.sh` 后续节 | add / 重复 add 报错 / import / delete / 在线注册表 / PHP 账号链路 |
 | REPL | `run_tests.sh` 第 3 节 | 管道模式逐行求值与错误诊断 |
@@ -519,18 +519,24 @@ make test
 
 按重要性排列，详见 README 的路线图：
 
-1. **错误通道**：✅ **0.8 已落地**（见 2.9）。剩余：`find` 等函数的可选变体、
-   错误消息携带（当前 `T?` 只携带 ok/值，不携带错误描述）。
-2. **自动内存管理（ARC）**：✅ **0.9.2 已落地 C 后端**（`--arc`，实验性，见
-   2.7 与 `docs/stability.md` §6.1）——堆对象加 `{refs, on_zero}` 头、字符串
+1. **错误通道**：✅ **0.8 落地 `T?`，0.9.4 补齐余项**（见 2.9）——
+   `find_opt(s, sub): int?` 可选变体 + `last_error(): string` 错误消息携带
+   （`T?` 仍只携带 ok/值，但失败原因可从全局 `last_error()` 读到）。
+2. **自动内存管理（ARC）**：✅ **已全部落地**（见 2.7 与
+   `docs/stability.md` §6.1）——堆对象加 `{refs, on_zero}` 头、字符串
    字面量改为静态不可变对象、Codegen 在局部变量作用域 / 赋值 / 返回 /
-   数组增删改 / struct 字段 / 嵌套拼接处插入 retain/release。**0.9.3 修复**
-   折叠字符串常量的无头指针缺陷并回收打印临时串。**剩余**：
-   原生后端尺寸分级 free list、`T?` 装箱回收、默认开启。
+   数组增删改 / struct 字段 / 嵌套拼接处插入 retain/release（0.9.2 C 后端）；
+   0.9.3 修复折叠字符串常量的无头指针缺陷并回收打印临时串；
+   **0.9.4 原生后端按 `docs/arc.md` §2.3 实现尺寸分级 free list + 延迟释放
+   （pending）模型，`--arc --native` 解禁，ARC 默认开启并新增 `--no-arc`，
+   `T?` 装箱槽参与回收**。剩余仅有 `docs/arc.md` §2.4 列出的「只泄漏、
+   不误释放」缺口。
 3. **高阶函数 / `fn` 类型**：`fn(T,...) -> R` 类型与 `sort` / `map` / `filter`；
    类型表已有 `TyKind::Fn` 备用。**不进 1.0**，留到 1.x。
 4. **原生后端**：`codegen.cpp` 目前是唯一依赖 C 编译器的环节。
    抽象出一个 `Backend` 接口后，可以并列实现 x86-64 汇编或 LLVM IR 后端。
-5. **aarch64 数学末位对齐（C5）**：`sin` / `log` / `pow` / `sqrt` 等已与 libm
-   一致，但 `cos` / `tan` / `asin` / `atan` / `atan2` 在末位仍可能不同；
+5. **aarch64 数学末位对齐（C5）**：x86-64 侧 0.9.4 已把 `asin` / `acos`
+   统一改为调用运行时库实现（旧 x87 序列的栈方向写反，`|x| < 1` 恒得 NaN）；
+   aarch64 侧 `cos` / `tan` / `atan` / `atan2` 的末位对齐仍待有 aarch64
+   机器的版本验证；
    大数浮点格式化（`bigE ≥ 0`）已在 0.8 修正。

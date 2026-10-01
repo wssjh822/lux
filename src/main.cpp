@@ -69,8 +69,8 @@ void printHelp(const char* argv0) {
         "  --emit-c         只把生成的 C 代码输出到标准输出，不调用 C 编译器\n"
         "  --keep-c         编译后把生成的 .c 文件保留在可执行文件旁\n"
         "  --native         原生代码生成后端：直接输出本机 ELF，不依赖 C 编译器\n"
-        "  --arc            启用引用计数（ARC）内存回收（0.9.3 实验特性，\n"
-        "                   仅 C 后端；原生后端仍是 bump 分配器）\n"
+        "  --arc            引用计数（ARC）内存回收（0.9.4 起为默认，本开关冗余）\n"
+        "  --no-arc         关闭 ARC：堆对象只增不减（0.9.1 语义，仅用于排查）\n"
         "  -O <级别>        优化级别 0~3（默认 2，直接传给 C 编译器）\n"
         "  --run            编译成功后立即运行生成的可执行文件\n"
         "  --cc <编译器>    指定使用的 C 编译器（默认自动探测 cc/clang/gcc）\n"
@@ -377,7 +377,8 @@ struct Options {
     bool emitC = false;
     bool keepC = false;
     bool native = false;  // 0.6：原生代码生成后端（直接输出 ELF，不走 C 编译器）
-    bool arc = false;     // 0.9.2：实验性 ARC（仅 C 后端）
+    bool arc = true;      // 0.9.4：ARC 默认开启（--no-arc 关闭）
+    bool arcExplicit = false;  // 用户是否显式写过 --arc / --no-arc
     bool run = false;
     bool werror = false;
     bool optSpecified = false;  // 用户是否显式传过 -O（--native 下提示忽略）
@@ -422,7 +423,7 @@ struct BuildConf {
     std::string out;
     std::string outdir = "build";
     std::string backend = "c";
-    bool arc = false;
+    bool arc = true;   // 0.9.4：默认开启；LuxBuildFile 里 arc = false 可关闭
     int opt = 2;
     std::string cc;
     std::vector<std::string> cflags;
@@ -906,7 +907,11 @@ int main(int argc, char** argv) {
         } else if (a == "--native") {
             opt.native = true;
         } else if (a == "--arc") {
-            opt.arc = true;  // 0.9.2：引用计数内存回收（仅 C 后端）
+            opt.arc = true;   // 0.9.4：ARC 已是默认，显式给出仅作兼容
+            opt.arcExplicit = true;
+        } else if (a == "--no-arc") {
+            opt.arc = false;  // 0.9.4：关闭引用计数，退回 0.9.1 的只增不减语义
+            opt.arcExplicit = true;
         } else if (a == "--run") {
             opt.run = true;
         } else if (a == "-Werror") {
@@ -979,12 +984,8 @@ int compilePipeline(Options& opt, const std::vector<std::string>& runArgs) {
 
     // ---------------- 原生后端：本机机器码直出 ELF ----------------
     if (opt.native) {
-        if (opt.arc) {
-            std::fprintf(stderr,
-                         "错误: --arc 目前仅支持 C 后端；原生后端仍是 bump "
-                         "分配器（去掉 --native 或去掉 --arc）\n");
-            return 2;
-        }
+        // 0.9.4：原生后端也支持 ARC（尺寸分级 free list + 引用计数）
+        lux::setNativeArc(opt.arc);
         if (opt.optSpecified)
             std::fprintf(stderr,
                          "提示: --native 后端暂不支持优化，-O%d 已忽略\n",

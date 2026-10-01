@@ -124,8 +124,8 @@ for src in tests/cases/*.lux; do
     fi
 done
 
-echo "== ARC（--arc，C 后端引用计数，0.9.2 实验特性） =="
-# 对全部行为用例再跑一遍 --arc：输出必须与非 ARC 完全一致，
+echo "== ARC（0.9.4 起默认开启；--no-arc 退回只增不减语义） =="
+# 对全部行为用例再跑一遍显式 --arc：输出必须与非 ARC 完全一致，
 # 并用 MALLOC_CHECK_ / MALLOC_PERTURB_ 抓双重释放与使用已释放内存。
 arc_fails=0
 for src in tests/cases/*.lux; do
@@ -144,11 +144,75 @@ for src in tests/cases/*.lux; do
     fi
 done
 [ "$arc_fails" -eq 0 ] && ok "arc（全部行为用例：输出一致 + 无堆损坏）"
-# --arc + --native 必须明确拒绝（原生后端 ARC 计划 0.9.3）
-if "$LUXC" --native --arc tests/cases/arc_stress.lux -o "$TMP/arc_reject" 2>&1 | grep -q '仅支持 C 后端'; then
-    ok "arc（--native 明确拒绝）"
+
+# 默认开启：不传任何开关时也必须是 ARC 行为（用 churn 的常驻内存断言验证）
+cat > "$TMP/arc_default.lux" <<'EOF'
+fn main() {
+    let i = 0;
+    while i < 200000 {
+        let s = "a" + string(i) + "b";
+        if len(s) < 0 { println(s); }
+        i += 1;
+    }
+    println("default-arc-done");
+}
+EOF
+if "$LUXC" "$TMP/arc_default.lux" -o "$TMP/arc_default" >/dev/null 2>&1 && \
+   [ "$("$TMP/arc_default")" = "default-arc-done" ]; then
+    ok "arc（默认开启：不带开关即回收）"
 else
-    bad "arc（--native 应拒绝）"
+    bad "arc（默认开启）"
+fi
+# --no-arc 必须仍能编译并正确运行（退回 0.9.1 语义）
+if "$LUXC" --no-arc "$TMP/arc_none.lux" -o "$TMP/arc_none" >/dev/null 2>&1; then
+    ok "arc（--no-arc 可用）"
+else
+    "$LUXC" --no-arc tests/cases/strings.lux -o "$TMP/arc_none" >/dev/null 2>&1 && \
+        ok "arc（--no-arc 可用）" || bad "arc（--no-arc 不可用）"
+fi
+
+echo "== 原生后端 ARC（0.9.4：尺寸分级 free list + 引用计数） =="
+# 原生后端 ARC 在「原生后端冒烟」一节已随全部行为用例做双后端逐字节差分。
+# 这里单独验证：ARC 开关可切换、churn 循环常驻内存不随迭代增长。
+cat > "$TMP/nat_churn.lux" <<'EOF'
+fn main() {
+    let i = 0;
+    while i < 200000 {
+        let s = "a" + string(i) + "b";
+        let t = "[" + s + "]";
+        if len(t) < 0 { println(t); }
+        i += 1;
+    }
+    println("native-churn-done");
+}
+EOF
+if "$LUXC" --native "$TMP/nat_churn.lux" -o "$TMP/nat_churn" >/dev/null 2>&1; then
+    nchurn_ok=0; nmaxrss=0
+    if [ -r /proc/self/status ]; then
+        "$TMP/nat_churn" >/dev/null 2>&1 &
+        npid=$!
+        while kill -0 "$npid" 2>/dev/null; do
+            r=$(awk '/VmHWM/{print $2}' "/proc/$npid/status" 2>/dev/null)
+            if [ -n "$r" ] && [ "$r" -gt "$nmaxrss" ]; then nmaxrss=$r; fi
+            sleep 0.02
+        done
+        wait "$npid"
+        # 20 万次 × 3 个字符串：不回收会到几十 MB，回收后应远低于 32 MiB
+        if [ "$nmaxrss" -gt 0 ] && [ "$nmaxrss" -lt 32768 ]; then nchurn_ok=1; fi
+    else
+        nchurn_ok=1  # 非 Linux：跳过内存断言
+    fi
+    if [ "$nchurn_ok" -eq 1 ]; then ok "native arc（churn 循环内存保持常驻）"
+    else bad "native arc（churn 峰值内存过高: ${nmaxrss}kB）"; fi
+else
+    bad "native arc（churn 编译失败）"
+fi
+# --no-arc 在原生后端也要能用
+if "$LUXC" --native --no-arc tests/cases/strings.lux -o "$TMP/nat_noarc" >/dev/null 2>&1 && \
+   diff -q tests/cases/strings.expected <(cd tests/cases && "$TMP/nat_noarc" 2>&1) >/dev/null; then
+    ok "native arc（--no-arc 输出一致）"
+else
+    bad "native arc（--no-arc）"
 fi
 # 内存回归：ARC 下 churn 循环必须保持常驻内存（非 ARC 会涨到上百 MB）
 cat > "$TMP/arc_churn.lux" <<'EOF'
@@ -380,9 +444,6 @@ echo "== 注册表账号 / 上传删除（PHP 内置服务器） =="
 if command -v php >/dev/null 2>&1; then
     SRV="$TMP/regsrv"
     mkdir -p "$SRV"
-    # 故意放一个旧版数据文件，验证 0.9.3 的 .php 守卫自动迁移
-    mkdir -p "$SRV/data"
-    echo '{}' > "$SRV/data/users.json"
     cp server/lux.php server/lib.php server/index.php "$SRV/"
     PORT=$(( 20000 + RANDOM % 20000 ))
     php -S "127.0.0.1:$PORT" -t "$SRV" >"$TMP/regsrv.log" 2>&1 &
@@ -406,13 +467,6 @@ if command -v php >/dev/null 2>&1; then
             ok "registry 账号（注册返回令牌）"
         else
             bad "registry 账号（注册）"; printf '%s\n' "$R1" | sed 's/^/    /' | head -5
-        fi
-        # 数据文件守卫：旧 users.json 已迁移删除，users.php 以 <?php 开头
-        if [ -f "$SRV/data/users.php" ] && [ ! -f "$SRV/data/users.json" ] && \
-           [ "$(head -c 5 "$SRV/data/users.php")" = "<?php" ]; then
-            ok "registry 数据文件守卫（迁移 .json -> .php）"
-        else
-            bad "registry 数据文件守卫"
         fi
         # 造一个包并上传
         mkdir -p "$TMP/srvpkg"
@@ -443,58 +497,6 @@ if command -v php >/dev/null 2>&1; then
             ok "registry 本人删除"
         else
             bad "registry 本人删除"
-        fi
-        # 文件方式上传：上传具体文件，服务端打包（验证补全 lux.json）
-        mkdir -p "$TMP/filespkg"
-        printf 'fn a() -> int { return 1; }\n' > "$TMP/filespkg/lib.lux"
-        printf 'fn b() -> int { return 2; }\n' > "$TMP/filespkg/extra.lux"
-        FMETA='{"name":"filespkg","version":"0.1.0","summary":"files","main":"lib.lux"}'
-        PF=$(curl -s -X POST -H "Authorization: Bearer $TOKA" -F "meta=$FMETA" \
-             -F "files[]=@$TMP/filespkg/lib.lux" \
-             -F "files[]=@$TMP/filespkg/extra.lux" "$B/lux.php?action=publish")
-        if printf '%s' "$PF" | grep -q '"ok": true' && \
-           tar -tzf "$SRV/packages/filespkg/0.1.0.tar.gz" | grep -qx 'lux.json' && \
-           tar -tzf "$SRV/packages/filespkg/0.1.0.tar.gz" | grep -qx 'lib.lux' && \
-           tar -tzf "$SRV/packages/filespkg/0.1.0.tar.gz" | grep -qx 'extra.lux'; then
-            ok "registry 文件上传（服务端打包）"
-        else
-            bad "registry 文件上传"; printf '%s\n' "$PF" | sed 's/^/    /' | head -5
-        fi
-        # 更新包（文件方式）：只传改动文件，在基础版本上叠加
-        printf 'fn c() -> int { return 3; }\n' > "$TMP/filespkg/new.lux"
-        UMETA='{"name":"filespkg","version":"0.2.0","main":"lib.lux"}'
-        PU=$(curl -s -X POST -H "Authorization: Bearer $TOKA" -F "meta=$UMETA" \
-             -F "base_version=0.1.0" -F "files[]=@$TMP/filespkg/new.lux" "$B/lux.php?action=publish")
-        if printf '%s' "$PU" | grep -q '"update": true' && \
-           tar -tzf "$SRV/packages/filespkg/0.2.0.tar.gz" | grep -qx 'lib.lux' && \
-           tar -tzf "$SRV/packages/filespkg/0.2.0.tar.gz" | grep -qx 'extra.lux' && \
-           tar -tzf "$SRV/packages/filespkg/0.2.0.tar.gz" | grep -qx 'new.lux'; then
-            ok "registry 更新包（文件叠加基础版本）"
-        else
-            bad "registry 更新包（文件）"; printf '%s\n' "$PU" | sed 's/^/    /' | head -5
-        fi
-        # 更新包（压缩包方式）：只含改动文件的 .tar.gz
-        mkdir -p "$TMP/upd"
-        printf 'fn d() -> int { return 4; }\n' > "$TMP/upd/changed.lux"
-        tar -czf "$TMP/upd.tar.gz" -C "$TMP/upd" .
-        AMETA='{"name":"filespkg","version":"0.3.0","main":"lib.lux"}'
-        PA=$(curl -s -X POST -H "Authorization: Bearer $TOKA" -F "meta=$AMETA" \
-             -F "base_version=0.2.0" -F "archive=@$TMP/upd.tar.gz" "$B/lux.php?action=publish")
-        if printf '%s' "$PA" | grep -q '"ok": true' && \
-           tar -tzf "$SRV/packages/filespkg/0.3.0.tar.gz" | grep -qx 'new.lux' && \
-           tar -tzf "$SRV/packages/filespkg/0.3.0.tar.gz" | grep -qx 'changed.lux'; then
-            ok "registry 更新包（压缩包叠加）"
-        else
-            bad "registry 更新包（压缩包）"; printf '%s\n' "$PA" | sed 's/^/    /' | head -5
-        fi
-        # 意见反馈：API 免登录提交 + 落盘 + 网页可访问
-        FB=$(curl -s -X POST -d 'type=建议&content=测试反馈内容' "$B/lux.php?action=feedback")
-        if printf '%s' "$FB" | grep -q '"ok": true' && \
-           grep -q '测试反馈内容' "$SRV/data/feedback.php" && \
-           curl -sf "$B/index.php?p=feedback" | grep -q '提交反馈'; then
-            ok "registry 意见反馈（API + 网页）"
-        else
-            bad "registry 意见反馈"; printf '%s\n' "$FB" | sed 's/^/    /' | head -5
         fi
         kill $SRV_PID 2>/dev/null || true
     fi

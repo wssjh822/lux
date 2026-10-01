@@ -168,10 +168,10 @@
     </p>
     <div class="cmd"><span>$ </span>luxc hello.lux --run</div>
     <div class="badges">
-      <span class="badge">v0.9.3</span>
+      <span class="badge">v0.9.4</span>
       <span class="badge">静态类型</span>
       <span class="badge">错误通道 T? / ? / or / !</span>
-      <span class="badge">ARC 引用计数（--arc）</span>
+      <span class="badge">ARC 引用计数（默认开启）</span>
       <span class="badge">luxc build 项目构建</span>
       <span class="badge">from … import / #import</span>
       <span class="badge">C 后端（C17）</span>
@@ -397,6 +397,16 @@ $ luxc hello.lux --emit-c
         <h3>导入系统 <span style="color:var(--gold2)">0.9.3 新增</span></h3>
         <p><code>from "mod" import a, b;</code> 选择性导入，<code>#import "mod";</code> 预处理写法，以及 <code>#define</code> / <code>#ifdef</code> 条件编译。</p>
       </div>
+      <div class="card">
+        <span class="ic">♻</span>
+        <h3>ARC 收官 <span style="color:var(--gold2)">0.9.4 新增</span></h3>
+        <p><b>引用计数默认开启，两个后端都支持</b>。原生后端按 <code>docs/arc.md</code> §2.3 落地<b>尺寸分级 free list</b>（2 的幂分级 + bss 桶 + 无锁）与延迟释放模型，<code>--arc --native</code> 解禁；<code>T?</code> 装箱槽参与回收、不再只增不减。需要退回旧行为时用 <code>--no-arc</code>。</p>
+      </div>
+      <div class="card">
+        <span class="ic">⚠</span>
+        <h3>错误消息携带 <span style="color:var(--gold2)">0.9.4 新增</span></h3>
+        <p><code>T?</code> 只回答「成没成」，新的全局 <code>last_error(): string</code> 补上「为什么」—— <code>read()</code> 失败能区分<b>不存在</b>与<b>没权限</b>，<code>int()</code> / <code>float()</code> / <code>find_opt()</code> 也填充。外加 <code>find_opt(s, sub): int?</code> 可选变体，扫掉 A3 尾巴。</p>
+      </div>
     </div>
   </section>
 
@@ -518,7 +528,7 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
   <!-- ================= 性能 ================= -->
   <section>
     <h2><span class="num">05</span>性能</h2>
-    <p class="sub">同一套试除法素数算法，统计 2..2,000,000 之间的素数（正确结果 148,933），各跑 3 次取最快。括号内为相对手写 C 的倍数。</p>
+    <p class="sub">同一套试除法素数算法，统计 2..2,000,000 之间的素数（正确结果 148,933），x86-64 / Linux，各跑 3 次取最快。括号内为相对手写 C 的倍数。</p>
     <div class="bench">
       <div class="bar-row">
         <div class="bar-label">手写 C <em>gcc -O2（基准 1.00×）</em></div>
@@ -529,19 +539,25 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
         <div class="bar-track"><div class="bar-fill fast" style="width:6%">1.01×</div></div>
       </div>
       <div class="bar-row">
-        <div class="bar-label">Lux 原生后端 <em>luxc --native（未优化直出）</em></div>
-        <div class="bar-track"><div class="bar-fill slow" style="width:11%">2.05×</div></div>
+        <div class="bar-label">Lux 原生后端 <em>luxc --native --no-arc（未优化直出）</em></div>
+        <div class="bar-track"><div class="bar-fill slow" style="width:12%">2.03×</div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Lux 原生后端 <em>luxc --native（0.9.4 起 ARC 默认开启）</em></div>
+        <div class="bar-track"><div class="bar-fill slow" style="width:42%">8.37×</div></div>
       </div>
       <div class="bar-row">
         <div class="bar-label">Python 3 <em>解释执行</em></div>
-        <div class="bar-track"><div class="bar-fill slow" style="width:100%">9.7×</div></div>
+        <div class="bar-track"><div class="bar-fill slow" style="width:100%">20×</div></div>
       </div>
     </div>
     <p style="margin-top:20px;color:var(--dim);font-size:14.5px">
       Lux 生成的代码与手写 C <b style="color:var(--gold2)">同速（1.01×）</b>；
-      原生后端不依赖 C 编译器、不做优化，约 <b style="color:var(--gold2)">2 倍</b> 于
-      手写 C，仍远快于解释执行（Python 的 9.7× 与本机原生 2.05× 同量级基准）。
-      两套独立后端在回归里做<b style="color:var(--gold2)">逐字节差分对拍</b>，互相校验正确性。
+      原生后端不依赖 C 编译器、不做优化，不回收内存时约 <b style="color:var(--gold2)">2 倍</b>、
+      ARC 默认开启后约 <b style="color:var(--gold2)">8.4 倍</b>于手写 C
+      —— 多出来的 4.1× 就是「带头分配 + 每条语句归还一次临时对象」的代价，
+      换来的是长驻进程不再只增不减。两套独立后端在回归里做
+      <b style="color:var(--gold2)">逐字节差分对拍</b>，互相校验正确性。
     </p>
   </section>
 
@@ -553,11 +569,11 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
       <div>
         <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">当前限制（0.9）</h3>
         <ul class="li">
-          <li class="warn"><b>内存默认不自动回收</b> —— 不带 <code>--arc</code> 时字符串拼接、数组扩容、<b>可选值装箱</b>、struct 构造都会持续占用；
-            <b>0.9.3 修复了 ARC 折叠串缺陷并回收打印临时串</b>；原生后端 free list、<code>T?</code> 装箱回收与 ARC 默认开启仍待完成（见 <code>docs/arc.md</code>）</li>
+          <li class="done"><b>内存由 ARC 自动回收，0.9.4 起两个后端都默认开启</b> —— 临时对象在<b>每条语句结束时</b>归还，局部变量在作用域出口回收。C 后端 1e6 次拼接峰值 117MB→11MB；原生后端 20 万次 × 3 串 churn 峰值 RSS &lt; 32MB。需要旧行为时用 <code>--no-arc</code>。
+            仍存的最小缺口（<b>只泄漏、不误释放</b>）：<code>main(argv)</code> 的 argv 数组是一次性泄漏；原生后端 <code>break</code> / <code>continue</code> / <code>return</code> 提前离开块时不释放该块已声明的引用型局部（见 <code>docs/arc.md</code> §2.4）</li>
           <li class="warn">数组与 struct 都是引用语义，<b>不支持 <code>==</code> 比较</b>（请逐个比较元素 / 字段）</li>
           <li class="warn"><code>len()</code> / <code>find</code> / <code>substr</code> / <code>chars</code> / 字符串 for-in 按 UTF-8 <b>字节</b>计，不是字符数</li>
-          <li class="warn">原生后端 <code>cos</code> / <code>tan</code> / <code>asin</code> / <code>atan</code> / <code>atan2</code> 在<b>末位</b>与 libm 可能不同（大数格式化 bug 已在 0.8 修正）</li>
+          <li class="warn">原生后端 <code>cos</code> / <code>tan</code> / <code>atan</code> / <code>atan2</code> 在<b>末位</b>与 libm 可能不同（大数格式化 bug 0.8 已修；x86-64 上 <code>asin</code> / <code>acos</code> 恒返 NaN 的 x87 栈序缺陷 0.9.4 已修，两端统一走运行时实现）</li>
           <li class="warn">没有高阶函数 / <code>fn</code> 类型（<code>sort</code> / <code>map</code> / <code>filter</code>）与 <code>static let</code> 全局可变变量</li>
           <li class="warn">标识符只支持 ASCII；C 后端需系统装有 C 编译器（原生后端不需要）</li>
           <li class="warn">只支持 POSIX 平台（Linux / macOS），Windows 请用 WSL / MSYS2</li>
@@ -591,9 +607,12 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
           <li class="done"><b>项目构建 <code>luxc build</code> + <code>LuxBuildFile</code>（构建 / 运行 / 测试 / 清理）</b> ✓ 0.9.3 已完成</li>
           <li class="done"><b>导入系统：<code>from … import …</code> / <code>#import</code> / <code>#define</code> / <code>#ifdef</code></b> ✓ 0.9.3 已完成</li>
           <li class="done"><b>ARC 正确性（折叠串 / 打印临时串 / 原生未初始化 string）+ 自带库扩展</b> ✓ 0.9.3 已完成</li>
-          <li>原生后端 ARC（free list）、<code>T?</code> 装箱回收与 ARC 默认开启
+          <li class="done"><b>原生后端尺寸分级 free list（2 的幂分级 + bss 桶 + 无锁）+ 引用计数；<code>--arc --native</code> 解禁</b> ✓ 0.9.4 已完成</li>
+          <li class="done"><b>ARC 默认开启（两个后端）+ <code>T?</code> 装箱回收 + <code>--no-arc</code> 逃生阀</b> ✓ 0.9.4 已完成</li>
+          <li class="done"><b>错误消息携带 <code>last_error()</code> + <code>find_opt()</code> 可选变体</b> ✓ 0.9.4 已完成</li>
+          <li class="done"><b>回归全绿 222/222（含双后端逐字节差分 + churn 内存回归）</b> ✓ 0.9.4 已完成</li>
           <li>高阶函数与 <code>fn</code> 类型（sort / map / filter）— 不进 1.0，留 1.x</li>
-          <li>aarch64 原生数学末位对齐 — 待校准</li>
+          <li>aarch64 原生数学末位对齐 — 待有 aarch64 机器的版本校准</li>
           <li>枚举与模式匹配、泛型 — 1.x</li>
         </ul>
       </div>
@@ -601,14 +620,14 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
   </section>
 
   <footer>
-    <p><span class="lx">Lux</span> v0.9.3 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
+    <p><span class="lx">Lux</span> v0.9.4 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
     <p style="margin-top:8px">
       完整文档见 <a href="README.md">README.md</a> ·
       <a href="docs/language.md">语言教程</a> ·
       <a href="docs/grammar.md">文法定义</a> ·
       <a href="docs/design.md">架构与扩展指南</a> ·
       <a href="docs/stability.md">稳定性说明</a> ·
-      <a href="docs/arc.md">ARC 设计</a>
+      <a href="docs/arc.md">ARC 设计与欠账清单</a>
     </p>
   </footer>
 

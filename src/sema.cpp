@@ -67,6 +67,7 @@ const std::unordered_map<std::string, Builtin>& builtinTable() {
         {"startswith", Builtin::StrStartsWith},
         {"endswith", Builtin::StrEndsWith},
         {"find", Builtin::StrFind},
+        {"find_opt", Builtin::StrFindOpt},
         {"replace", Builtin::StrReplace},
         {"trim", Builtin::StrTrim},
         {"upper", Builtin::StrUpper},
@@ -76,6 +77,8 @@ const std::unordered_map<std::string, Builtin>& builtinTable() {
         {"split", Builtin::StrSplit},
         {"chars", Builtin::StrChars},
         {"join", Builtin::StrJoin},
+        // 全局错误通道（0.9.4）：无 import 即可用
+        {"last_error", Builtin::LastError},
         // 数组方法（a.push 等）不在此表：它们只经"变量.方法"路径解析，
         // 避免与用户自定义的 push / pop 等函数名冲突。
     };
@@ -129,6 +132,7 @@ const char* builtinModule(Builtin b) {
         case Builtin::StrStartsWith:
         case Builtin::StrEndsWith:
         case Builtin::StrFind:
+        case Builtin::StrFindOpt:
         case Builtin::StrReplace:
         case Builtin::StrTrim:
         case Builtin::StrUpper:
@@ -1776,6 +1780,25 @@ struct Analyzer {
                 strArg(0, "find() 的第一个参数必须是字符串");
                 strArg(1, "find() 的第二个参数必须是字符串");
                 return tInt;
+            }
+
+            case Builtin::StrFindOpt: {
+                // 0.9.4（P1-8）：find 的可选变体，扫掉 A3 尾巴
+                const Ty* optInt = TyStore::optionalOf(tInt);
+                c->ty = optInt;
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] == tInvalid || argTys[1] == tInvalid)
+                    return tInvalid;
+                strArg(0, "find_opt() 的第一个参数必须是字符串");
+                strArg(1, "find_opt() 的第二个参数必须是字符串");
+                return optInt;
+            }
+
+            case Builtin::LastError: {
+                // 0.9.4（P1-5）：最近一次标准库失败的说明（无并发，全局够用）
+                c->ty = tString;
+                if (!arity(0)) return tInvalid;
+                return tString;
             }
 
             case Builtin::StrReplace: {

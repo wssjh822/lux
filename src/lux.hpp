@@ -375,6 +375,7 @@ enum class Builtin {
     StrStartsWith, // startswith(s, pre)   : bool
     StrEndsWith,   // endswith(s, suf)     : bool
     StrFind,       // find(s, sub)         : int（字节偏移，找不到返回 -1）
+    StrFindOpt,    // find_opt(s, sub)     : int?（0.9.4：找不到返回 none）
     StrReplace,    // replace(s, old, new) : string
     StrTrim,       // trim(s)              : string
     StrUpper,      // upper(s)             : string（ASCII 大小写）
@@ -384,6 +385,7 @@ enum class Builtin {
     StrSplit,      // split(s, sep)       : string[]（0.5 新增）
     StrChars,      // chars(s)            : string[]（逐字节单字符，0.5 新增）
     StrJoin,       // join(arr, sep)      : string（0.5 新增）
+    LastError,     // last_error()        : string（0.9.4：最近一次标准库失败的说明）
     // ---- 数组方法（a.push(x) 形式；Sema 校验接收者，0.5 新增） ----
     ArrPush,       // a.push(v)           : void
     ArrPop,        // a.pop()             : 元素类型
@@ -970,7 +972,7 @@ private:
 
 struct CodegenOptions {
     bool emitLineMarks = false;  // 是否在生成的 C 里插入 Lux 源码行号注释
-    bool arc = false;            // 0.9.2：实验性 ARC（C 后端）引用计数回收
+    bool arc = true;             // 0.9.4：ARC 默认开启（--no-arc 关闭）
     std::string sourceName;
 };
 
@@ -985,6 +987,9 @@ std::string generateC(Program* prog, const CodegenOptions& opt);
 //（不依赖 C 编译器 / libc）。失败返回 false（诊断经 diags 报告）。
 bool generateNative(Program* prog, Diags& diags, const std::string& sourceName,
                     std::vector<uint8_t>& outElf);
+
+// 0.9.4：原生后端引用计数开关（默认开，--no-arc 关闭）
+void setNativeArc(bool on);
 
 // =============================================================================
 //  工具

@@ -9,7 +9,8 @@ struct Var {
 };
 
 // 数组元素种类
-enum { EK_INT = 0, EK_FLOAT = 1, EK_BOOL = 2, EK_STR = 3, EK_ARR = 4 };
+// 0.9.4：新增 EK_STRUCT —— struct 数组的元素是堆指针，ARC 释放时要逐个 release
+enum { EK_INT = 0, EK_FLOAT = 1, EK_BOOL = 2, EK_STR = 3, EK_ARR = 4, EK_STRUCT = 5 };
 
 static int ekindOf(const Ty* t) {
     switch (t->kind) {
@@ -17,6 +18,7 @@ static int ekindOf(const Ty* t) {
         case TyKind::Bool: return EK_BOOL;
         case TyKind::String: return EK_STR;
         case TyKind::Array: return EK_ARR;
+        case TyKind::Named: return EK_STRUCT;  // 0.9.4：struct 数组（引用元素）
         default: return EK_INT;
     }
 }
@@ -53,9 +55,17 @@ struct NativeGen {
     std::unordered_map<std::string, StructDecl*> structs_;  // struct 名 -> 声明（0.7）
 
     // ---- 数据段 ----
+    // 0.9.4（P0-1）：字符串字面量也带 32 字节计数头（refs = -1 的静态不可变
+    // 对象），这样 retain/release 读到 -1 直接跳过，不会去动只读数据段。
+    // 返回的是**载荷偏移**（[len][bytes][NUL] 的起点），所有引用字面量的
+    // 代码路径保持原样。
     size_t addStr(const std::string& s) {
         auto it = strPool.find(s);
         if (it != strPool.end()) return it->second;
+        while (data.size() % 8) data.push_back(0);
+        // 头：refs = -1，desc / class / 保留 = 0
+        for (int i = 0; i < 8; i++) data.push_back(0xFF);
+        for (int i = 0; i < 24; i++) data.push_back(0);
         size_t at = data.size();
         strPool[s] = at;
         uint64_t len = s.size();
@@ -65,6 +75,24 @@ struct NativeGen {
         while (data.size() % 8) data.push_back(0);
         return at;
     }
+    // struct 引用字段描述符（数据段）：[count][idx0][idx1]…
+    // release 时按它逐个释放字段引用。没有引用字段的 struct 用 0（= kDescNone）。
+    std::unordered_map<std::string, size_t> structDesc_;
+    size_t structDescOf(StructDecl* sd) {
+        std::vector<int64_t> refs;
+        for (size_t i = 0; i < sd->fields.size(); i++)
+            if (eIsRefTy(sd->fields[i].ty)) refs.push_back((int64_t)i);
+        if (refs.empty()) return 0;
+        auto it = structDesc_.find(sd->name);
+        if (it != structDesc_.end()) return it->second;
+        while (data.size() % 8) data.push_back(0);
+        size_t at = data.size();
+        addQword((uint64_t)refs.size());
+        for (int64_t r : refs) addQword((uint64_t)r);
+        structDesc_[sd->name] = at;
+        return at;
+    }
+
     size_t addQword(uint64_t v) {
         size_t at = data.size();
         for (int i = 0; i < 8; i++) data.push_back((uint8_t)((v >> (8 * i)) & 0xFF));
@@ -147,10 +175,151 @@ struct NativeGen {
 
     // ---- 可选值（0.8 错误通道） ----
     // T? 统一是 8 字节槽里的指针，0 = none；装箱 / 解包都走运行时。
-    void boxTop() {
+    // 0.9.4（P0-1）：装箱槽带引用计数头，内层是引用类型时传 kDescOpt，
+    // 槽归零时顺带释放内层。
+    // 把值栈顶的 T 装箱成 T?（栈顶被替换成箱指针）。
+    // 参数顺序 push 左→右：arg0 = 值，arg1 = desc（1 = 内层是引用类型）。
+    void boxTop(const Ty* elem) {
+        bool refInner = eIsRefTy(elem);
+        c.pop(RAX);                        // 取出待装箱的值
+        c.push(RAX);                       // arg0 = v
+        c.mov64i(RCX, refInner ? 1 : 0);
+        c.push(RCX);                       // arg1 = desc
         c.call32(symLabel("luxrt_opt_box"));
-        addRspImm(8);
+        addRspImm(16);
         c.push(RAX);
+    }
+
+    // =====================================================================
+    //  ARC（0.9.4，P0-1）
+    //  模型：运行时 alloc 会把对象登记进本帧的 pending 区；每条语句结束时
+    //  flush 掉本帧登记的全部对象。「存进变量 / 数组 / 结构体 / 返回值」的
+    //  位置先 retain，引用计数天然配平。多 retain 只会短暂多占内存，不会
+    //  误释放 —— 与 docs/arc.md §2.2「先做对，再做省」一致。
+    // =====================================================================
+    bool arcOn = false;
+    int slotPend = 0;   // 本函数的 pending 基准深度
+    int slotRv = 0;     // 返回值暂存（跨 flush 保住 RAX / xmm0）
+    // 当前语句块内声明、需要在本块出口释放（含 flush 后仍持有引用）的局部槽
+    std::vector<std::vector<int>> arcLocals;
+
+    static bool eIsRefTy(const Ty* t) {
+        if (!t) return false;
+        return t->kind == TyKind::String || t->kind == TyKind::Array ||
+               t->kind == TyKind::Named;
+    }
+    static bool eNeedsOwn(const Ty* t) {
+        return eIsRefTy(t) || (t && t->kind == TyKind::Optional);
+    }
+
+    // 登记 / 保留栈顶的值（净栈效果为 0）
+    void callWithTop(const char* fn) {
+        c.push(RAX);
+        c.movrm(RAX, RSP, 8);
+        c.push(RAX);
+        c.call32(symLabel(fn));
+        addRspImm(8);
+        c.pop(RAX);
+    }
+    void retainTop() { callWithTop("luxrt_retain"); }
+    void pendPushTop() { callWithTop("luxrt_pend_push"); }
+
+    // 释放本帧登记的全部临时对象
+    void emitPendFlush() {
+        c.push(RAX);
+        c.movrm(RAX, RBP, slotPend);
+        c.push(RAX);
+        c.call32(symLabel("luxrt_pend_flush_to"));
+        addRspImm(8);
+        c.pop(RAX);
+    }
+
+    // 释放 [rbp+slot] 持有的引用并置零（块出口用；置零保证不会重复释放）
+    void releaseLocal(int slot) {
+        c.push(RAX);
+        c.movrm(RAX, RBP, slot);
+        c.push(RAX);
+        c.call32(symLabel("luxrt_release"));
+        addRspImm(8);
+        c.pop(RAX);
+        c.mov64i(RAX, 0);
+        c.movmr(RBP, slot, RAX);
+    }
+    // 让 [rbp+slot] 自持一份引用（跨语句存活的值用）
+    void retainLocal(int slot) {
+        c.push(RAX);
+        c.movrm(RAX, RBP, slot);
+        c.push(RAX);
+        c.call32(symLabel("luxrt_retain"));
+        addRspImm(8);
+        c.pop(RAX);
+    }
+    void releaseScope(int from) {
+        if (!arcOn) return;
+        while ((int)arcLocals.size() > from) {
+            for (int slot : arcLocals.back()) releaseLocal(slot);
+            arcLocals.pop_back();
+        }
+    }
+    void pushArcScope() { arcLocals.emplace_back(); }
+    void popArcScope() { if (!arcLocals.empty()) arcLocals.pop_back(); }
+    void noteArcLocal(int slot) {
+        if (arcOn && !arcLocals.empty()) arcLocals.back().push_back(slot);
+    }
+
+    // 函数出口：retain 返回值 → flush 本帧临时对象 → 把返回值登记给调用方
+    void emitFnExit(bool hasRet, bool retOwned) {
+        if (!arcOn) return;
+        if (hasRet) c.movmr(RBP, slotRv, RAX);
+        if (hasRet && retOwned) {
+            c.push(RAX);
+            c.movrm(RAX, RBP, slotRv);
+            c.push(RAX);
+            c.call32(symLabel("luxrt_retain"));
+            addRspImm(8);
+            c.pop(RAX);
+        }
+        c.push(RAX);
+        c.movrm(RAX, RBP, slotPend);
+        c.push(RAX);
+        c.call32(symLabel("luxrt_pend_flush_to"));
+        addRspImm(8);
+        c.pop(RAX);
+        if (hasRet && retOwned) {
+            // 只有引用型 / 可选型返回值登记进调用方的 pending 区；
+            // 值类型（int / float / bool）绝不能登记 —— 否则 flush 会把
+            // 整数当指针去 release。
+            c.push(RAX);
+            c.movrm(RAX, RBP, slotRv);
+            c.push(RAX);
+            c.call32(symLabel("luxrt_pend_push"));
+            addRspImm(8);
+            c.pop(RAX);
+        }
+        if (hasRet) c.movrm(RAX, RBP, slotRv);
+    }
+    // 浮点返回：值在 xmm0，跨 flush 需要经槽保存
+    void emitFnExitFloat() {
+        if (!arcOn) return;
+        c.movsdToMem(0, RBP, slotRv);
+        c.push(RAX);
+        c.movrm(RAX, RBP, slotPend);
+        c.push(RAX);
+        c.call32(symLabel("luxrt_pend_flush_to"));
+        addRspImm(8);
+        c.pop(RAX);
+        c.movsdFromMem(0, RBP, slotRv);
+    }
+
+    // 语句级 flush
+    void emitStmtFlush() {
+        if (!arcOn) return;
+        c.push(RAX);
+        c.movrm(RAX, RBP, slotPend);
+        c.push(RAX);
+        c.call32(symLabel("luxrt_pend_flush_to"));
+        addRspImm(8);
+        c.pop(RAX);
     }
     // 求值 e 并按目标类型 to 做隐式转换（int→float / T→T? 装箱）
     void evalCoerced(Expr* e, const Ty* to) {
@@ -162,16 +331,16 @@ struct NativeGen {
             return;
         }
         if (to->kind == TyKind::Optional) {
-            if (from == to->elem) { boxTop(); return; }
+            if (from == to->elem) { boxTop(to->elem); return; }
             if (from->kind == TyKind::Int && to->elem &&
                 to->elem->kind == TyKind::Float) {
                 fpromoteTop();
-                boxTop();
+                boxTop(to->elem);
             }
         }
     }
     // RAX 中是 T? 指针；为 none 时 panic，否则换成 T 压栈
-    void panicUnwrapTop(const std::string& what) {
+    void panicUnwrapTop(const std::string& what, const Ty* elem) {
         int lok = c.newLabel();
         c.testRR(RAX, RAX);
         c.jcc32(CJne, lok);
@@ -181,6 +350,11 @@ struct NativeGen {
         c.bind(lok);
         c.movrm(RAX, RAX, 0);
         c.push(RAX);
+        if (arcOn && eIsRefTy(elem)) {
+            // 解包出的载荷自持一份引用（空槽稍后被 flush 回收，会释放它那一份）
+            retainTop();
+            pendPushTop();
+        }
     }
     // read! 专用：栈顶还保留着路径（调用方多压了一份），panic 时一起报出来。
     // RAX 中是 lx_read_opt 的返回（string?）。
@@ -198,6 +372,11 @@ struct NativeGen {
         c.movrm(RAX, RAX, 0);
         addRspImm(8);           // 丢掉保存的 path
         c.push(RAX);
+        if (arcOn) {
+            // string? 的载荷是引用类型：自持引用 + 登记
+            retainTop();
+            pendPushTop();
+        }
     }
     // expr?（0.8）：为 none 时返回 none（当前函数必须返回 T?）
     void evalTry(TryExpr* e) {
@@ -207,10 +386,15 @@ struct NativeGen {
         c.testRR(RAX, RAX);
         c.jcc32(CJne, lok);
         c.zeroReg(RAX);
-        c.frameLeave();  // 返回 none
+        emitFnExit(false, false);   // 返回 none：先归还本帧临时对象
+        c.frameLeave();
         c.bind(lok);
         c.movrm(RAX, RAX, 0);
         c.push(RAX);
+        if (arcOn && eIsRefTy(e->ty)) {
+            retainTop();
+            pendPushTop();
+        }
     }
     // inc qword [base+disp]（for 循环自增用）
     void incMem(int base, int32_t disp) { c.incMem(base, disp); }
@@ -394,6 +578,18 @@ struct NativeGen {
         c.call32(symLabel("luxrt_struct_new"));
         addRspImm(8);
         int slot = declareVar("__st" + std::to_string(uid_++));
+        // 0.9.4（P0-1）：登记引用字段描述符，release 时按它释放字段引用
+        if (arcOn) {
+            size_t doff = structDescOf(sd);
+            c.movmr(RBP, slot, RAX);          // 先存进槽，腾出 RAX
+            c.movrm(RAX, RBP, slot);
+            c.push(RAX);                      // arg0 = p
+            c.movAbsData(RAX, doff);
+            c.push(RAX);                      // arg1 = desc（数据段地址）
+            c.call32(symLabel("luxrt_struct_desc"));
+            addRspImm(16);
+            c.movrm(RAX, RBP, slot);          // 恢复 RAX = struct
+        }
         c.movmr(RBP, slot, RAX);
         for (auto& kv : e->inits) {
             int idx = -1;
@@ -402,6 +598,8 @@ struct NativeGen {
             if (idx < 0) continue;
             const Ty* ft = sd->fields[idx].ty;
             evalCoerced(kv.second, ft);
+            // 0.9.4：引用型字段值由 struct 持有一份
+            if (arcOn && eIsRefTy(ft)) retainTop();
             c.pop(RAX);
             c.movrm(RCX, RBP, slot);
             c.movmr(RCX, idx * 8, RAX);
@@ -576,8 +774,16 @@ struct NativeGen {
             c.jcc32(CJe, lnone);
             c.movrm(RAX, RAX, 0);
             c.push(RAX);
+            if (arcOn && eIsRefTy(elem)) {
+                // 命中分支：引用类型载荷自持一份引用 + 登记（空槽由 flush 回收）
+                retainTop();
+                pendPushTop();
+            }
             c.jmp32(lend);
             c.bind(lnone);
+            // 兜底分支：rhs 若是函数调用，其返回值已由被调方登记进 pending；
+            // 若是变量 / 字面量则本就不需要回收。两种情况都**不能**再登记一次
+            // —— 重复登记会导致语句 flush 释放两次（双重释放）。
             evalCoerced(e->rhs, elem);
             c.bind(lend);
             return;
@@ -787,21 +993,31 @@ struct NativeGen {
     }
 
     // 栈顶值（按类型 t）换成字符串所需的临时槽数（打印 / string / format）
+    // 打印 struct / 可选 struct 需要的临时栈槽数。
+    // 0.9.4：加 visited 集合 —— 自引用 struct（如 jsonx 的 Json 含 Json[]）
+    // 以前会让本函数无限递归，直接把编译器打崩（栈溢出 SIGSEGV）。
+    // 每个 struct 类型只展开一次：仍然给出足够的槽位，同时保证终止。
     int strSlotsForType(const Ty* t) {
-        if (!t) return 0;
+        std::unordered_set<std::string> seen;
+        return strSlotsForType_(t, seen, 0);
+    }
+    int strSlotsForType_(const Ty* t, std::unordered_set<std::string>& seen,
+                         int depth) {
+        if (!t || depth > 12) return 0;
         if (t->kind == TyKind::Named) {
+            if (!seen.insert(t->name).second) return 1;  // 已展开过：只留 __pst
             int n = 1;  // __pst
             auto it = structs_.find(t->name);
             if (it != structs_.end())
                 for (const FieldDecl& f : it->second->fields)
-                    n += strSlotsForType(f.ty);
+                    n += strSlotsForType_(f.ty, seen, depth + 1);
             return n;
         }
         if (t->kind == TyKind::Optional) {
-            return 1 + strSlotsForType(t->elem);  // __opt 临时槽（0.8）
+            return 1 + strSlotsForType_(t->elem, seen, depth + 1);  // __opt（0.8）
         }
         if (t->kind == TyKind::Array && t->elem && containsNamed(t->elem)) {
-            return 5 + strSlotsForType(t->elem);  // arr/len/i/acc + 递归
+            return 5 + strSlotsForType_(t->elem, seen, depth + 1);  // arr/len/i/acc
         }
         return 0;
     }
@@ -815,6 +1031,8 @@ struct NativeGen {
 
     // 栈顶是 struct 数组（元素为 Named）；换成 "[...]" 字符串（0.7）
     void arrayToStrOnStack(const Ty* elemTy) {
+        if (printDepth_ > kPrintDepthMax) { c.pop(RAX); pushStrRef("<...>"); return; }
+        printDepth_++;
         c.pop(RAX);
         int aslot = declareVar("__ast" + std::to_string(uid_++));
         c.movmr(RBP, aslot, RAX);
@@ -868,6 +1086,7 @@ struct NativeGen {
         c.call32(symLabel("luxrt_str_concat"));
         addRspImm(16);
         c.push(RAX);
+        printDepth_--;
     }
 
     // 栈顶值转字符串（不给 string 加引号）：供可选值 some(...) 拼接使用
@@ -945,10 +1164,18 @@ struct NativeGen {
     }
 
     // 栈顶是 struct 指针；换成字符串（拼接链），结果在栈顶
+    // 0.9.4：打印递归深度上限。自引用 struct（jsonx 的 Json 含 Json[]）
+    // 以前让 structToStr ↔ arrayToStrOnStack 互相无限展开，把编译器打崩；
+    // 超过上限就输出 "<...>" 占位（正常嵌套深度 ≤ 3，不受影响）。
+    int printDepth_ = 0;
+    static constexpr int kPrintDepthMax = 8;
+
     void structToStr(const std::string& name) {
+        if (printDepth_ > kPrintDepthMax) { c.pop(RAX); pushStrRef("<...>"); return; }
         auto it = structs_.find(name);
         if (it == structs_.end()) { pushStrRef(""); return; }
         StructDecl* sd = it->second;
+        printDepth_++;
         c.pop(RAX);
         int slot = declareVar("__pst" + std::to_string(uid_++));
         c.movmr(RBP, slot, RAX);
@@ -967,6 +1194,7 @@ struct NativeGen {
         }
         pushStrRef(" }");
         strConcatTop2();
+        printDepth_--;
     }
 
     // 栈顶值转 string 并压回（ToString / format 参数共用）
@@ -1135,7 +1363,7 @@ struct NativeGen {
             // 0.8：panic 变体 f!(...)（f 返回 T?，失败即退出）
             if (e->panicVariant && e->target->retTy &&
                 e->target->retTy->kind == TyKind::Optional) {
-                panicUnwrapTop(e->target->name);
+                panicUnwrapTop(e->target->name, e->target->retTy->elem);
             } else {
                 callRet(e->ty);
             }
@@ -1191,7 +1419,7 @@ struct NativeGen {
                         c.call32(symLabel("luxrt_str_to_i64_opt"));
                         addRspImm(8);
                         if (e->panicVariant)
-                            panicUnwrapTop("int 解析");
+                            panicUnwrapTop("int 解析", nullptr);
                         else
                             c.push(RAX);
                         return;
@@ -1208,7 +1436,7 @@ struct NativeGen {
                         c.call32(symLabel("luxrt_str_to_f64_opt"));
                         addRspImm(8);
                         if (e->panicVariant)
-                            panicUnwrapTop("float 解析");
+                            panicUnwrapTop("float 解析", nullptr);
                         else
                             c.push(RAX);
                         return;
@@ -1308,6 +1536,17 @@ struct NativeGen {
             case Builtin::Exp: {
                 evalExpr(args[0]);
                 if (argIsInt(0)) fpromoteTop();
+                // 0.9.4：asin / acos 统一调运行时库实现（两个架构同一套代码）。
+                // 旧 x86-64 用 x87 手写：FSUBP 的栈方向写反，算的是 √(x²−1)，
+                // 对 |x|<1 恒得 NaN —— asin(0.99999) 直接输出 nan。
+                if (e->builtin == Builtin::Asin || e->builtin == Builtin::Acos) {
+                    c.call32(symLabel(e->builtin == Builtin::Asin
+                                          ? "luxrt_math_asin"
+                                          : "luxrt_math_acos"));
+                    addRspImm(8);
+                    pushFloatXmm0();
+                    return;
+                }
 #if defined(__aarch64__)
                 const char* mfn = e->builtin == Builtin::Sin    ? "luxrt_math_sin"
                                 : e->builtin == Builtin::Cos    ? "luxrt_math_cos"
@@ -1659,6 +1898,19 @@ struct NativeGen {
                 c.push(RAX);
                 return;
             }
+            case Builtin::StrFindOpt:
+                // 0.9.4（P1-8）：找不到返回 none（装箱槽由 luxrt_alloc 登记）
+                evalExpr(args[0]);
+                evalExpr(args[1]);
+                c.call32(symLabel("luxrt_str_find_opt"));
+                addRspImm(16);
+                c.push(RAX);
+                return;
+            case Builtin::LastError:
+                // 0.9.4（P1-5）：返回的是进程级根串（借用），无需登记
+                c.call32(symLabel("luxrt_last_error"));
+                c.push(RAX);
+                return;
             case Builtin::StrReplace:
                 evalExpr(args[0]); evalExpr(args[1]); evalExpr(args[2]);
                 c.call32(symLabel("luxrt_str_replace"));
@@ -2011,11 +2263,11 @@ struct NativeGen {
             // 0.8：目标类型是 T?（或 float?）时把值装箱
             if (tt && tt->kind == TyKind::Optional) {
                 if (val->ty == tt->elem) {
-                    boxTop();
+                    boxTop(tt->elem);
                 } else if (val->ty && val->ty->kind == TyKind::Int &&
                            tt->elem && tt->elem->kind == TyKind::Float) {
                     fpromoteTop();
-                    boxTop();
+                    boxTop(tt->elem);
                 }
             }
         };
@@ -2029,12 +2281,37 @@ struct NativeGen {
                 evalExpr(a->value);
                 promote(a->value);
                 applyCompound(a->compoundOp, tt);
+                if (arcOn && eNeedsOwn(tt)) {
+                    // 新串（pending 登记中）先自持一份，再释放被覆盖的旧值
+                    retainTop();
+                    c.pop(RAX);
+                    c.push(RAX);
+                    c.movrm(RAX, RBP, v->slot);
+                    c.push(RAX);
+                    c.call32(symLabel("luxrt_release"));
+                    addRspImm(8);
+                    c.pop(RAX);
+                    c.movmr(RBP, v->slot, RAX);
+                    return;
+                }
                 c.pop(RAX);
                 c.movmr(RBP, v->slot, RAX);
                 return;
             }
             evalExpr(a->value);
             promote(a->value);
+            if (arcOn && eNeedsOwn(tt)) {
+                retainTop();                       // 新值自持一份
+                c.pop(RAX);
+                c.push(RAX);
+                c.movrm(RAX, RBP, v->slot);
+                c.push(RAX);
+                c.call32(symLabel("luxrt_release"));  // 先存新值再释旧值
+                addRspImm(8);
+                c.pop(RAX);
+                c.movmr(RBP, v->slot, RAX);
+                return;
+            }
             c.pop(RAX);
             c.movmr(RBP, v->slot, RAX);
             return;
@@ -2054,6 +2331,20 @@ struct NativeGen {
                 evalExpr(a->value);
                 promote(a->value);
                 applyCompound(a->compoundOp, tt);
+                if (arcOn && eNeedsOwn(tt)) {
+                    retainTop();
+                    c.pop(RAX);
+                    c.push(RAX);
+                    c.movrm(RCX, RBP, pslot);
+                    c.movrm(RCX, RCX, off);
+                    c.push(RCX);
+                    c.call32(symLabel("luxrt_release"));
+                    addRspImm(8);
+                    c.pop(RAX);
+                    c.movrm(RCX, RBP, pslot);
+                    c.movmr(RCX, off, RAX);
+                    return;
+                }
                 c.pop(RAX);
                 c.movrm(RCX, RBP, pslot);
                 c.movmr(RCX, off, RAX);
@@ -2061,6 +2352,20 @@ struct NativeGen {
             }
             evalExpr(a->value);
             promote(a->value);
+            if (arcOn && eNeedsOwn(tt)) {
+                retainTop();                       // 新字段值自持一份
+                c.pop(RAX);
+                c.push(RAX);
+                c.movrm(RCX, RBP, pslot);
+                c.movrm(RCX, RCX, off);
+                c.push(RCX);
+                c.call32(symLabel("luxrt_release"));  // 释放被覆盖的旧字段
+                addRspImm(8);
+                c.pop(RAX);
+                c.movrm(RCX, RBP, pslot);
+                c.movmr(RCX, off, RAX);
+                return;
+            }
             c.pop(RAX);
             c.movrm(RCX, RBP, pslot);
             c.movmr(RCX, off, RAX);
@@ -2111,13 +2416,25 @@ struct NativeGen {
         }
     }
 
+    // 语句包装：每条语句结束后 flush 掉本帧登记的临时对象（0.9.4）。
+    // 存进变量 / 数组 / 结构体 / 返回值的对象已先 retain，因此这里只回收
+    // 「用完就没」的中间结果（拼接串、to_str、装箱槽…）。
     void genStmt(Stmt* s) {
+        if (!s) return;
+        genStmtInner(s);
+        if (arcOn) emitStmtFlush();
+    }
+
+    void genStmtInner(Stmt* s) {
         if (!s) return;
         switch (s->kind) {
             case StmtKind::Block: {
                 auto* b = static_cast<BlockStmt*>(s);
                 pushScope();
+                pushArcScope();
+                int arcMark = (int)arcLocals.size() - 1;
                 for (Stmt* st : b->stmts) genStmt(st);
+                releaseScope(arcMark);   // 块出口释放本块声明的引用型局部
                 popScope();
                 return;
             }
@@ -2134,6 +2451,11 @@ struct NativeGen {
                     pushStrRef("");
                 } else {
                     pushImm(0);
+                }
+                // 0.9.4：引用型/可选型局部自持一份引用，块出口统一释放
+                if (arcOn && eNeedsOwn(let->resolved)) {
+                    retainTop();
+                    noteArcLocal(slot);
                 }
                 c.pop(RAX);
                 c.movmr(RBP, slot, RAX);
@@ -2222,12 +2544,17 @@ struct NativeGen {
                     if (curRet && curRet->kind == TyKind::Float) {
                         c.movsdFromMem(0, RSP, 0);
                         addRspImm(8);
+                        emitFnExitFloat();
                     } else {
                         c.pop(RAX);
+                        // 返回值归调用方所有：先 retain 保住，再归还本帧临时对象，
+                        // 最后登记进调用方的 pending 区
+                        emitFnExit(true, eNeedsOwn(curRet));
                     }
                 } else {
                     // void 返回：返回值寄存器归零；Optional 返回：none = 0
                     c.zeroReg(RAX);
+                    emitFnExit(true, false);
                 }
                 c.frameLeave();  // mov rsp,rbp / pop rbp / ret（arm64 恢复 x29,x30）
                 return;
@@ -2238,6 +2565,8 @@ struct NativeGen {
     void genFor(ForStmt* f) {
         if (f->mode == ForMode::Range) {
             pushScope();
+            pushArcScope();
+            int arcMark = (int)arcLocals.size() - 1;
             int vslot = declareVar(f->var, TyStore::int64Ty());
             evalExpr(f->start);
             c.pop(RAX);
@@ -2262,16 +2591,25 @@ struct NativeGen {
             incMem(RBP, vslot);                   // i += 1
             c.jmp32(lcond);
             c.bind(lend);
+            releaseScope(arcMark);
             popScope();
             return;
         }
 
         // ---- for-in：迭代数组或字符串 ----
         pushScope();
+        pushArcScope();
+        int arcMark2 = (int)arcLocals.size() - 1;
         int islot = declareVar("__iter", nullptr);
         evalExpr(f->iterable);
         c.pop(RAX);
         c.movmr(RBP, islot, RAX);
+        // 0.9.4：被迭代对象要跨语句存活（循环体里每条语句结束都会 flush），
+        // 因此这里自持一份引用，循环出口统一释放。
+        if (arcOn && eIsRefTy(f->iterable->ty)) {
+            retainLocal(islot);
+            noteArcLocal(islot);
+        }
         int vslot = declareVar(f->var, f->varTy);
         int ixslot = declareVar("__ix", nullptr);
         int nslot = declareVar("__n", nullptr);
@@ -2320,6 +2658,7 @@ struct NativeGen {
         incMem(RBP, ixslot);
         c.jmp32(lcond);
         c.bind(lend);
+        releaseScope(arcMark2);
         popScope();
     }
 
@@ -2441,10 +2780,17 @@ struct NativeGen {
         curFile = fn->file.empty() ? curSourceName : fn->file;
         curFnKey = keyOf(*fn);
         curRet = fn->retTy;
+        // 0.9.4（P0-1）：ARC 只作用于用户程序。运行时库（native_rt.lux）自身
+        // 不插桩 —— 它分配的对象由 luxrt_alloc 在运行时自动登记进 pending，
+        // 由**调用方**的语句级 flush 回收；运行时自身插桩反而会与
+        // luxrt_pend_mark 等底层函数递归打架。
+        arcOn = !inRuntime && g_nativeArc;
         pushScope();
+        pushArcScope();
         int n = (int)fn->params.size();
         // prologue 预留：参数槽 + 函数体槽（预扫描，含 ArrayLit 临时）+ 余量
-        frameSize = 8 * n + 8 * countSlots(fn->body) + 16;
+        // 0.9.4：另加 6 槽给 __pendbase / __rv 等 ARC 临时槽
+        frameSize = 8 * n + 8 * countSlots(fn->body) + 8 * 6;
         c.frameEnter(frameSize);
         // 槽位从 -8 重新分配（预留量已覆盖参数 + 函数体 + 余量）
         frameSize = 0;
@@ -2455,14 +2801,24 @@ struct NativeGen {
             c.loadParam(RAX, j, n);
             c.movmr(RBP, slot, RAX);
         }
+        slotPend = declareVar("__pendbase", TyStore::int64Ty());
+        slotRv = declareVar("__rv", TyStore::int64Ty());
+        if (arcOn) {
+            // 记下进入本函数时的 pending 深度：本函数所有语句都 flush 到它
+            c.call32(symLabel("luxrt_pend_mark"));
+            c.movmr(RBP, slotPend, RAX);
+        }
         genStmt(fn->body);
         // 兜底 epilogue（0.5.1 起无条件生成；void 函数顺带把返回码归零，
         // 保证 void main 正常退出码 0）
         if (fn->retTy && fn->retTy->kind == TyKind::Void)
             c.zeroReg(RAX);
+        emitFnExit(false, false);   // 归还本帧残余的临时对象
         c.frameLeave();
+        popArcScope();
         popScope();
         frameSize = 0;
+        arcOn = false;
     }
 
     void genProgram(Program* prog, bool isRt) {

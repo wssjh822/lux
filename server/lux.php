@@ -14,15 +14,10 @@
 //    ?action=logout    token
 //    ?action=whoami    token                    -> {user}
 //  需登录（POST，带 token）：
-//    ?action=publish   meta=<JSON> + 二选一：
-//                        archive=<tar.gz 文件>   直接上传压缩包
-//                        files[]=<具体文件>      由服务端打成 tar.gz
-//                      可选 base_version=<版本>  作为更新包叠加在基础版本上
+//    ?action=publish   meta=<JSON> + archive=<tar.gz 文件>
 //    ?action=edit      token/name/version + 可改字段
 //    ?action=delete    token/name[/version]
 //    ?action=mine      token                    -> 我发布的包
-//  公开（POST，免登录，按 IP 限流）：
-//    ?action=feedback  type/content/contact     -> 意见反馈
 //
 //  上传 / 修改 / 删除都要求注册账号，且只能操作自己发布的包。
 // =============================================================================
@@ -168,36 +163,12 @@ case 'publish': {
     $metaRaw = (string)($_POST['meta'] ?? '');
     $meta = json_decode($metaRaw, true);
     if (!is_array($meta)) fail('缺少或无法解析 meta（应为 JSON）');
-    $base = trim((string)($_POST['base_version'] ?? ''));
     $err = '';
-    $hasFiles = !empty($_FILES['files']['name']);
-    if ($hasFiles) {
-        // 上传具体文件，服务端打包（更新包时在 base_version 上叠加）
-        $saved = pkg_store_files($_FILES['files'], $meta, $u['name'],
-                                 !empty($u['admin']), $base, $err);
-    } else {
-        // 直接上传 .tar.gz；带 base_version 时按更新包叠加
-        $saved = pkg_store_upload($_FILES['archive'] ?? [], $meta, $u['name'],
-                                  !empty($u['admin']), $err,
-                                  $base !== '' ? $base : null);
-    }
+    $saved = pkg_store_upload($_FILES['archive'] ?? [], $meta, $u['name'],
+                              !empty($u['admin']), $err);
     if (!$saved) fail($err);
     respond(['ok' => true, 'name' => $saved['name'], 'version' => $saved['version'],
-             'update' => $base !== '', 'base' => $base,
              'url' => $saved['url'], 'sha256' => $saved['sha256'], 'size' => $saved['size']]);
-    break;
-}
-
-case 'feedback': {
-    if ($method !== 'POST') fail('feedback 需要 POST', 405);
-    $u = request_user();
-    $err = '';
-    $item = feedback_add((string)($_POST['type'] ?? ''),
-                         (string)($_POST['content'] ?? ''),
-                         (string)($_POST['contact'] ?? ''),
-                         $u['name'] ?? '', $err);
-    if (!$item) fail($err);
-    respond(['ok' => true, 'id' => $item['id'], 'time' => $item['time']]);
     break;
 }
 

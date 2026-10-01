@@ -63,8 +63,164 @@ const kEkFloat = 1;
 const kEkBool = 2;
 const kEkStr = 3;
 const kEkArr = 4;
+const kEkStruct = 5;   // 0.9.4：struct 数组（元素是堆指针，释放时逐个 release）
 
 const kInt64Min = -9223372036854775807 - 1;
+
+// ---------------------------------------------------------------------------
+//  内存管理（0.9.4，P0-1）：尺寸分级 free list + 引用计数
+//
+//  对象块布局（32 字节头，返回 blk+32）：
+//    +0  refs      引用计数；-1 = 静态不可变对象（字符串字面量），跳过计数
+//    +8  desc      内层引用描述：0=无 1=可选槽（内层是引用类型）2=数组
+//                  >=0x10000 = struct 字段描述符（数据段地址）
+//    +16 class     尺寸等级（2 的幂的下标，供 free 归桶）
+//    +24 保留
+//  free list：把请求大小向上取整到 2 的幂（32 / 64 / … 共 20 级），
+//  桶头放 bss 固定槽；桶空才向 bump 区要内存。释放把块链回对应桶，
+//  链指针复用块头前 8 字节。单线程无锁（与 docs/arc.md §2.3 一致）。
+//
+//  pending（延迟释放）：每次分配都把对象登记进本帧的 pending 区；
+//  语句结束时 flush 掉本帧登记的全部对象 —— 「存进变量 / 数组 / 结构体 /
+//  返回值」的位置先 retain，于是引用计数天然配平。这是设计文档 §2.2 的
+//  「先做对，再做省」：多 retain 只会短暂多占内存，不会误释放。
+//
+//  bss 槽（kMinMemSz = 8MiB，0x601000 起 1MiB 是 read_line 行缓冲）：
+//   0x700000  free list 桶头（kFreeClasses × 8 字节）
+//   0x700400  pending 深度 / 溢出计数
+//   0x701000  pending 指针数组（kPendMax × 8 = 32KiB）
+// ---------------------------------------------------------------------------
+
+const kFreeClasses = 20;         // 32 * 2^19 = 16 MiB 封顶
+const kSlotFreeList = 0x700000;
+const kSlotPendDepth = 0x700400;
+const kSlotPendMark = 0x700408;  // 最近一次 mark 的值（防帧内嵌套）
+const kSlotLastErr = 0x700410;   // last_error() 的字符串根
+const kPendArray = 0x701000;
+const kPendMax = 4096;
+
+const kDescNone = 0;
+const kDescOpt = 1;
+const kDescArr = 2;
+const kDescStructBase = 0x10000;  // 之上都是数据段地址
+
+// 2 的幂 → 桶下标（sz 最小 32）
+fn luxrt_class_of(sz: int) -> int {
+    let c = 0;
+    let s = 32;
+    while s < sz {
+        s = s * 2;
+        c = c + 1;
+    }
+    return c;
+}
+
+// 向上取整到 2 的幂（含 32 字节头）
+fn luxrt_round_size(n: int) -> int {
+    let need = n + 32;
+    let sz = 32;
+    while sz < need { sz = sz * 2; }
+    return sz;
+}
+
+// 从 free list 取块（不初始化头）；桶空才 bump
+fn luxrt_raw_alloc(sz: int) -> int {
+    let cls = luxrt_class_of(sz);
+    let bin = kSlotFreeList + cls * 8;
+    let head = __peek64(bin, 0);
+    if head != 0 {
+        __poke64(bin, 0, __peek64(head, 0));
+        return head;
+    }
+    return __bump_alloc(sz);
+}
+
+// 普通堆对象：带计数头，登记进 pending
+fn luxrt_alloc(n: int) -> int {
+    let sz = luxrt_round_size(n);
+    let blk = luxrt_raw_alloc(sz);
+    __poke64(blk, 0, 1);
+    __poke64(blk, 8, kDescNone);
+    __poke64(blk, 16, luxrt_class_of(sz));
+    __poke64(blk, 24, 0);
+    luxrt_pend_push(blk + 32);
+    return blk + 32;
+}
+
+// 带内层描述的堆对象（数组 / 可选槽 / struct）
+fn luxrt_alloc_d(n: int, desc: int) -> int {
+    let p = luxrt_alloc(n);
+    __poke64(p - 32, 8, desc);
+    return p;
+}
+
+// 内部数据块（数组元素区）：带头供 free 归桶，但不进 pending、不计数
+fn luxrt_data_alloc(n: int) -> int {
+    let sz = luxrt_round_size(n);
+    let blk = luxrt_raw_alloc(sz);
+    __poke64(blk, 0, -1);
+    __poke64(blk, 8, kDescNone);
+    __poke64(blk, 16, luxrt_class_of(sz));
+    __poke64(blk, 24, 0);
+    return blk + 32;
+}
+
+fn luxrt_free(p: int) {
+    if p == 0 { return; }
+    let blk = p - 32;
+    let cls = __peek64(blk, 16);
+    let bin = kSlotFreeList + cls * 8;
+    __poke64(blk, 0, __peek64(bin, 0));
+    __poke64(bin, 0, blk);
+}
+
+fn luxrt_retain(p: int) {
+    if p == 0 { return; }
+    let blk = p - 32;
+    let r = __peek64(blk, 0);
+    if r >= 0 { __poke64(blk, 0, r + 1); }
+}
+
+fn luxrt_release(p: int) {
+    if p == 0 { return; }
+    let blk = p - 32;
+    let r = __peek64(blk, 0);
+    if r < 0 { return; }
+    r = r - 1;
+    __poke64(blk, 0, r);
+    if r > 0 { return; }
+    let desc = __peek64(blk, 8);
+    if desc == kDescOpt {
+        luxrt_release(__peek64(p, 0));      // 可选槽：释放内层引用
+    } else if desc == kDescArr {
+        luxrt_arr_release_elems(p);         // 数组：逐个释放引用元素 + 数据区
+    } else if desc >= kDescStructBase {
+        luxrt_struct_release(p, desc);      // struct：按字段描述符释放
+    }
+    luxrt_free(p);
+}
+
+// ---- pending：每帧登记 / 语句级 flush ----
+fn luxrt_pend_mark() -> int {
+    return __peek64(kSlotPendDepth, 0);
+}
+
+fn luxrt_pend_push(p: int) {
+    let d = __peek64(kSlotPendDepth, 0);
+    if d >= kPendMax { return; }   // 溢出：放弃登记（安全，只是多占内存）
+    __poke64(kPendArray + d * 8, 0, p);
+    __poke64(kSlotPendDepth, 0, d + 1);
+}
+
+// 释放 [mark, depth) 区间登记的对象，并把深度收回到 mark
+fn luxrt_pend_flush_to(mark: int) {
+    let d = __peek64(kSlotPendDepth, 0);
+    while d > mark {
+        d = d - 1;
+        luxrt_release(__peek64(kPendArray + d * 8, 0));
+    }
+    __poke64(kSlotPendDepth, 0, mark);
+}
 
 // ---------------------------------------------------------------------------
 //  基础：panic / 输出
@@ -186,7 +342,7 @@ fn luxrt_urem10(u: int) -> int {
 fn luxrt_i64_to_str(v: int) -> string {
     let u = v;
     if v < 0 { u = 0 - v; }  // 补码取负 = 位模式的无符号值（含 INT64_MIN）
-    let raw = __bump_alloc(33);  // len 头 8 + 最多 20 字符 + NUL
+    let raw = luxrt_alloc(33);  // len 头 8 + 最多 20 字符 + NUL
     let w = 32;
     __poke8(raw, w, 0);
     loop {
@@ -206,6 +362,31 @@ fn luxrt_i64_to_str(v: int) -> string {
     return __sval(raw);
 }
 
+// ---------------------------------------------------------------------------
+//  全局错误通道（0.9.4，P1-5）：与 C 后端 lx_set_error / lx_last_error 对应
+//  T? 只回答“成没成”，last_error() 补上“为什么”。无并发，单个 bss 槽够用。
+// ---------------------------------------------------------------------------
+fn luxrt_set_error(msg: string) {
+    __poke64(kSlotLastErr, 0, __sptr(msg));
+    luxrt_retain(__sptr(msg));   // 永久根（字面量 refs = -1，实际是空操作）
+}
+
+fn luxrt_last_error() -> string {
+    let p = __peek64(kSlotLastErr, 0);
+    if p == 0 { return ""; }
+    return __sval(p);
+}
+
+// find_opt(s, sub)：找不到返回 none 并写 last_error()
+fn luxrt_str_find_opt(s: string, sub: string) -> int? {
+    let i = luxrt_str_find(s, sub);
+    if i < 0 {
+        luxrt_set_error("find_opt 失败：未找到子串");
+        return none;
+    }
+    return i;
+}
+
 fn luxrt_bool_to_str(v: bool) -> string {
     if v { return "true"; }
     return "false";
@@ -217,7 +398,7 @@ fn luxrt_bool_to_str(v: bool) -> string {
 
 // 从裸指针拷 n 字节为新字符串
 fn luxrt_str_from_ptr(p: int, n: int) -> string {
-    let r = __bump_alloc(8 + n + 1);
+    let r = luxrt_alloc(8 + n + 1);
     __poke64(r, 0, n);
     __mem_copy(r, 8, p, 0, n);
     __poke8(r, 8 + n, 0);
@@ -232,7 +413,7 @@ fn luxrt_str_from_bytes(s: string, off: int, n: int) -> string {
 fn luxrt_str_concat(a: string, b: string) -> string {
     let la = __peek64(a, 0);
     let lb = __peek64(b, 0);
-    let r = __bump_alloc(8 + la + lb + 1);
+    let r = luxrt_alloc(8 + la + lb + 1);
     __poke64(r, 0, la + lb);
     __mem_copy(r, 8, a, 8, la);
     __mem_copy(r, 8 + la, b, 8, lb);
@@ -242,7 +423,7 @@ fn luxrt_str_concat(a: string, b: string) -> string {
 
 // 单字节字符 → 1 字符字符串
 fn luxrt_str_chr(b: int) -> string {
-    let r = __bump_alloc(10);
+    let r = luxrt_alloc(10);
     __poke64(r, 0, 1);
     __poke8(r, 8, b);
     __poke8(r, 9, 0);
@@ -350,7 +531,7 @@ fn luxrt_str_trim(s: string) -> string {
 
 fn luxrt_str_upper(s: string) -> string {
     let n = __peek64(s, 0);
-    let r = __bump_alloc(8 + n + 1);
+    let r = luxrt_alloc(8 + n + 1);
     __poke64(r, 0, n);
     for i in 0..n {
         let c = __peek8u(s, 8 + i);
@@ -363,7 +544,7 @@ fn luxrt_str_upper(s: string) -> string {
 
 fn luxrt_str_lower(s: string) -> string {
     let n = __peek64(s, 0);
-    let r = __bump_alloc(8 + n + 1);
+    let r = luxrt_alloc(8 + n + 1);
     __poke64(r, 0, n);
     for i in 0..n {
         let c = __peek8u(s, 8 + i);
@@ -399,7 +580,7 @@ fn luxrt_str_replace(s: string, old: string, nw: string) -> string {
     }
     let total = ls + (ln - lo) * cnt;
     if total < 0 { total = 0; }
-    let r = __bump_alloc(8 + total + 1);
+    let r = luxrt_alloc(8 + total + 1);
     __poke64(r, 0, total);
     let w = 0;
     p = 0;
@@ -640,9 +821,11 @@ fn luxrt_str_to_f64(sv: string) -> float {
 // 用 8 元素字面量拿到真 Lux 数组对象，再改造成空数组（cap 8 起倍增）
 fn luxrt_arr_new(ek: int) -> int[] {
     // 注意：这里绝不能用数组字面量（字面量编译为 luxrt_arr_new 调用，
-    // 会无限递归耗尽栈），只能用裸 bump + poke 手工构造数组对象。
-    let r = __bump_alloc(32);   // [len][cap][data][ek]
-    let d = __bump_alloc(64);   // 8 元素容量起步
+    // 会无限递归耗尽栈），只能手工构造数组对象。
+    // 0.9.4：数组头与元素区都走带头的分配器（free list 需要 32 字节头），
+    // 描述符 desc = kDescArr 让 release 时逐个释放引用元素。
+    let r = luxrt_alloc_d(32, kDescArr);   // [len][cap][data][ek]
+    let d = luxrt_data_alloc(64);          // 8 元素容量起步
     __poke64(r, 0, 0);          // len = 0
     __poke64(r, 8, 8);          // cap = 8
     __poke64(r, 16, d);         // data
@@ -650,30 +833,85 @@ fn luxrt_arr_new(ek: int) -> int[] {
     return __sval_a(r);
 }
 
-// 容量不够就翻倍搬迁（bump 分配不回收旧块）
+// 元素种类是否会持有引用（释放数组时要逐个 release）
+fn luxrt_ek_is_ref(ek: int) -> bool {
+    return ek == kEkStr || ek == kEkArr || ek == kEkStruct;
+}
+
+// 数组归零：释放引用元素 + 归还元素区（0.9.4，P0-1）
+fn luxrt_arr_release_elems(a: int) {
+    let ek = __peek64(a, 24);
+    let d = __peek64(a, 16);
+    if d == 0 { return; }
+    if luxrt_ek_is_ref(ek) {
+        let n = __peek64(a, 0);
+        for i in 0..n { luxrt_release(__peek64(d, i * 8)); }
+    }
+    luxrt_free(d);
+    __poke64(a, 16, 0);
+    __poke64(a, 0, 0);
+    __poke64(a, 8, 0);
+}
+
+// 容量不够就翻倍搬迁；0.9.4 起旧元素区归还 free list（不再是 bump 泄漏）
 fn luxrt_arr_reserve(a: int[], need: int) {
     let cap = __peek64(a, 8);
     if need <= cap { return; }
     let nc = cap * 2;
     while nc < need { nc = nc * 2; }
-    let nd = __bump_alloc(nc * 8);
+    let nd = luxrt_data_alloc(nc * 8);
     __mem_copy(nd, 0, __peek64(a, 16), 0, __peek64(a, 0) * 8);
+    luxrt_free(__peek64(a, 16));
     __poke64(a, 8, nc);
     __poke64(a, 16, nd);
+}
+
+// 填入「当前不是有效元素」的槽（push / insert）：只 retain，不 release。
+// 注意不能在这里 release 旧值 —— 自由链表回收来的块里是上一任的残渣，
+// 当垃圾指针释放会直接崩溃。
+fn luxrt_arr_put(a: int[], i: int, v: int) {
+    if luxrt_ek_is_ref(__peek64(a, 24)) { luxrt_retain(v); }
+    __poke64(__peek64(a, 16), i * 8, v);
+}
+
+// 覆盖既有元素（set）：先 retain 新值，再 release 被覆盖的旧元素
+fn luxrt_arr_store(a: int[], i: int, v: int) {
+    let d = __peek64(a, 16);
+    if luxrt_ek_is_ref(__peek64(a, 24)) {
+        luxrt_retain(v);
+        luxrt_release(__peek64(d, i * 8));
+    }
+    __poke64(d, i * 8, v);
 }
 
 fn luxrt_arr_push(a: int[], v: int) {
     let lenv = __peek64(a, 0);
     luxrt_arr_reserve(a, lenv + 1);
-    __poke64(__peek64(a, 16), lenv * 8, v);
+    luxrt_arr_put(a, lenv, v);
     __poke64(a, 0, lenv + 1);
 }
 
-// struct 字段对象（0.7）：n 字节零初始化，返回裸指针（int）
+// struct 字段对象（0.7）：n 字节零初始化，返回裸指针（int）。
+// desc 是数据段的字段描述符地址（0 = 无引用字段），release 时按它释放字段。
 fn luxrt_struct_new(n: int) -> int {
-    let p = __bump_alloc(n);
+    let p = luxrt_alloc_d(n, kDescNone);
     for i in 0..n { __poke8(p, i, 0); }
     return p;
+}
+
+// 设置 struct 的字段描述符（codegen 在字面量构造后调用；传 0 表示没有引用字段）
+fn luxrt_struct_desc(p: int, desc: int) {
+    if p == 0 { return; }
+    __poke64(p - 32, 8, desc);
+}
+
+// 按描述符释放 struct 的引用字段。描述符布局：[0]=count，随后 count 个字段下标
+fn luxrt_struct_release(p: int, desc: int) {
+    let n = __peek64(desc, 0);
+    for i in 0..n {
+        let idx = __peek64(desc, 8 + i * 8);
+        luxrt_release(__peek64(p, idx * 8));
+    }
 }
 
 // argc/argv → 字符串数组（main(argv: string[])，取 _start 快照，argv[0]=程序名）
@@ -687,7 +925,7 @@ fn luxrt_argv() -> int[] {
         let p = __peek64(sp + 8 + i * 8, 0);
         let n = 0;
         while __peek8u(p, n) != 0 { n = n + 1; }
-        let r = __bump_alloc(8 + n + 1);
+        let r = luxrt_alloc(8 + n + 1);
         __poke64(r, 0, n);
         __mem_copy(r, 8, p, 0, n);
         __poke8(r, 8 + n, 0);
@@ -713,6 +951,12 @@ fn luxrt_arr_slice(a: int[], lo: int, hi: int) -> int[] {
     let r = luxrt_arr_new(__peek64(a, 24));
     if cnt > 0 {
         luxrt_arr_reserve(r, cnt);
+        // 0.9.4：切片是复制语义，引用元素必须 retain（新数组持有一份）
+        if luxrt_ek_is_ref(__peek64(a, 24)) {
+            for i in 0..cnt {
+                luxrt_retain(__peek64(__peek64(a, 16), (lo + i) * 8));
+            }
+        }
         __mem_copy(__peek64(r, 16), 0, __peek64(a, 16), lo * 8, cnt * 8);
         __poke64(r, 0, cnt);
     }
@@ -731,8 +975,9 @@ fn luxrt_arr_insert(a: int[], i: int, v: int) {
     if i < 0 || i > lenv { luxrt_panic_arr_oob(i, a); }
     luxrt_arr_reserve(a, lenv + 1);
     let data = __peek64(a, 16);
+    if luxrt_ek_is_ref(__peek64(a, 24)) { luxrt_retain(v); }
     __mem_copy(data, (i + 1) * 8, data, i * 8, (lenv - i) * 8);
-    __poke64(data, i * 8, v);
+    __poke64(data, i * 8, v);   // 搬移后槽位是旧元素副本，不能再 release
     __poke64(a, 0, lenv + 1);
 }
 
@@ -749,7 +994,7 @@ fn luxrt_arr_remove(a: int[], i: int) -> int {
 fn luxrt_arr_set(a: int[], i: int, v: int) {
     let lenv = __peek64(a, 0);
     if i < 0 || i >= lenv { luxrt_panic_arr_oob(i, a); }
-    __poke64(__peek64(a, 16), i * 8, v);
+    luxrt_arr_store(a, i, v);
 }
 
 // 读元素（复合赋值 a[i] += v 用；与内联读的越界行为一致）
@@ -760,6 +1005,12 @@ fn luxrt_arr_get(a: int[], i: int) -> int {
 }
 
 fn luxrt_arr_clear(a: int[]) {
+    // 0.9.4：清空 = 释放全部引用元素（以前只是把 len 置 0，元素引用全漏）
+    let d = __peek64(a, 16);
+    if d != 0 && luxrt_ek_is_ref(__peek64(a, 24)) {
+        let n = __peek64(a, 0);
+        for i in 0..n { luxrt_release(__peek64(d, i * 8)); }
+    }
     __poke64(a, 0, 0);
 }
 
@@ -1068,7 +1319,8 @@ fn luxrt_f64_to_str(v: float) -> string {
             if neg { return "-inf"; }
             return "inf";
         }
-        if neg { return "-nan"; }
+        // 0.9.4：NaN 一律打印 "nan"（与 C 后端 lx_f64_shortest 一致，
+        // 否则 NaN 的符号位会让两个后端、不同架构的输出各不相同）
         return "nan";
     }
     let e = luxrt_usr(bits, 52) & 2047;
@@ -1299,7 +1551,7 @@ fn luxrt_read_line() -> string {
             luxrt_panic_msg("输入行过长（超过 1 MiB 上限）");
         }
     }
-    let r2 = __bump_alloc(8 + lenv + 1);
+    let r2 = luxrt_alloc(8 + lenv + 1);
     __poke64(r2, 0, lenv);
     __mem_copy(r2, 8, kLineBuf, 0, lenv);
     __poke8(r2, 8 + lenv, 0);
@@ -1498,6 +1750,9 @@ fn luxrt_setenv(name: string, val: string) -> bool {
     if __peek64(kSlotEnvList, 0) == 0 {
         let fresh = luxrt_arr_new(kEkStr);
         __poke64(kSlotEnvList, 0, __sptr(fresh));
+        // 0.9.4：bss 槽是长期根，必须 retain —— 否则调用方的语句级 flush
+        // 会把刚创建的表回收掉，槽里留悬空指针。
+        luxrt_retain(__sptr(fresh));
         luxrt_arr_push(fresh, __sptr(nv));
         __poke64(kSlotEnvpCache, 0, 0);  // 失效 envp 缓存
         return true;
@@ -1508,7 +1763,7 @@ fn luxrt_setenv(name: string, val: string) -> bool {
     for i in 0..n {
         let item = __sval(__peek64(data, i * 8));
         if luxrt_str_find(item, nameEq) == 0 {
-            luxrt_arr_set(list, i, __sptr(nv));
+            luxrt_arr_set(list, i, __sptr(nv));   // set 内部会 retain 新值
             __poke64(kSlotEnvpCache, 0, 0);
             return true;
         }
@@ -1603,7 +1858,7 @@ fn luxrt_file_read(path: string) -> string {
     let sb = __bump_alloc(256);
     if __syscall(kSysFstat, fd, sb) < 0 { luxrt_file_fail("读取", path); }
     let sz = __peek64(sb, 48);  // st_size 偏移 48
-    let buf = __bump_alloc(8 + sz + 1);
+    let buf = luxrt_alloc(8 + sz + 1);
     let got = 0;
     loop {
         let r = __syscall(kSysRead, fd, buf + 8 + got, sz - got);
@@ -1881,10 +2136,22 @@ fn luxrt_math_hypot(a: float, b: float) -> float {
 //  T? 在机器层统一是一个 8 字节槽里的指针：0 = none，否则指向存放 T 的堆槽。
 //  codegen 的装箱 / 解包都直接调这里的函数。
 // ---------------------------------------------------------------------------
-fn luxrt_opt_box(v: int) -> int {
-    let p = __bump_alloc(8);
+// 装箱：desc = 0（内层是值类型）或 kDescOpt（内层是引用类型，槽持有引用）。
+// 0.9.4：槽走带头的分配器，release 时按 desc 释放内层，不再只增不减。
+fn luxrt_opt_box(v: int, desc: int) -> int {
+    let p = luxrt_alloc_d(8, desc);
     __poke64(p, 0, v);
+    if desc == kDescOpt { luxrt_retain(v); }
     return p;
+}
+
+// 解包：为 none 时 panic，否则给载荷。载荷先 retain（槽即将被 flush 回收），
+// 调用方拿到的是一份自持引用。
+fn luxrt_opt_take(p: int, desc: int) -> int {
+    if p == 0 { return 0; }
+    let v = __peek64(p, 0);
+    if desc == kDescOpt { luxrt_retain(v); }
+    return v;
 }
 
 fn luxrt_panic_opt(what: string) {
@@ -1983,25 +2250,37 @@ fn luxrt_f64_ok(s: string) -> bool {
 }
 
 fn luxrt_str_to_i64_opt(s: string) -> int? {
-    if !luxrt_i64_ok(s) { return none; }
+    if !luxrt_i64_ok(s) {
+        luxrt_set_error("int 解析失败：不是合法的 64 位整数");
+        return none;
+    }
     return luxrt_str_to_i64(s);
 }
 
 fn luxrt_str_to_f64_opt(s: string) -> float? {
-    if !luxrt_f64_ok(s) { return none; }
+    if !luxrt_f64_ok(s) {
+        luxrt_set_error("float 解析失败：不是合法的浮点数");
+        return none;
+    }
     return luxrt_str_to_f64(s);
 }
 
 fn luxrt_read_opt(path: string) -> string? {
     let fd = __sys_open(__sptr(path) + 8, kO_RDONLY);
-    if fd < 0 { return none; }
+    if fd < 0 {
+        // __sys_open 失败返回 -errno：ENOENT = 2，EACCES = 13
+        if fd == -2 { luxrt_set_error("read 失败：文件不存在"); }
+        else if fd == -13 { luxrt_set_error("read 失败：没有读取权限"); }
+        else { luxrt_set_error("read 失败：无法打开文件"); }
+        return none;
+    }
     let sb = __bump_alloc(256);
     if __syscall(kSysFstat, fd, sb) < 0 {
         __syscall(kSysClose, fd);
         return none;
     }
     let sz = __peek64(sb, 48);
-    let buf = __bump_alloc(8 + sz + 1);
+    let buf = luxrt_alloc(8 + sz + 1);
     let got = 0;
     loop {
         let r = __syscall(kSysRead, fd, buf + 8 + got, sz - got);

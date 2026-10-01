@@ -58,6 +58,13 @@ static inline void lx_panic(const char* msg) {
 /* 最短往返表示：从 %.15g 试到 %.17g，取第一个能精确还原原值的写法。
  * 0.5 修复：旧版固定 %.15g 会截断精度（pi 打成 3.14159265358979）。 */
 static inline int lx_f64_shortest(double v, char* out) {
+    /* 0.9.4：NaN 一律打印 "nan"，不带符号。glibc 会按 NaN 的符号位印出
+     * "-nan"，aarch64 的默认 NaN 却是正号 —— 同一份源码在不同架构上
+     * 输出不同。打印层统一去掉 NaN 的符号，inf 仍保留 +- 。 */
+    if (v != v) {
+        memcpy(out, "nan", 4);   /* 含结尾 NUL：调用方按 n+1 字节拷贝 */
+        return 3;
+    }
     for (int prec = 15; prec <= 17; prec++) {
         snprintf(out, 40, "%.*g", prec, v);
         if (strtod(out, NULL) == v) return (int)strlen(out);
@@ -143,14 +150,78 @@ static inline char* lx_str_concat3(const char* a, const char* b,
     return r;
 }
 
+/* ---- 全局错误通道（0.9.4，P1-5）----
+ * T? 只回答“成没成”，不回答“为什么”。last_error() 补上这条信息：
+ * 标准库失败路径把一句人话写进全局槽，脚本层据此区分“不存在 / 没权限”。
+ * 无并发（Lux 不引入线程），单个全局量足够，且不改动 T? 的签名。
+ * 存的是带 gc 头的 Lux 字符串对象，首次读取时构造并作为进程级根永久持有。 */
+static const char* lx_last_err_msg = "";
+static const char* lx_last_err_obj = NULL;
+
+static inline void lx_set_error(const char* msg) {
+    lx_last_err_msg = msg ? msg : "";
+    lx_last_err_obj = NULL;   /* 懒重建 */
+}
+
+static inline const char* lx_last_error(void) {
+    if (!lx_last_err_obj) {
+        size_t n = strlen(lx_last_err_msg);
+        char* r = lx_alloc(n + 1);
+        memcpy(r, lx_last_err_msg, n + 1);
+        lx_last_err_obj = r;   /* refs = 1，永不释放：进程级根 */
+    }
+    return lx_last_err_obj;
+}
+
 /* ---- 可选值（0.8 错误通道） ----
  * T? 统一表示为 <T>*：指向堆上一个存放 T 的槽，NULL 表示 none。
  * 这样 int? / float? / string? / 数组? / struct? 都是单个指针，
- * 两个后端的 ABI 都能用 8 字节槽传递。 */
-static inline void* lx_opt_alloc(size_t n) {
-    void* p = malloc(n);
-    if (!p) lx_panic("内存分配失败（可选值装箱）");
+ * 两个后端的 ABI 都能用 8 字节槽传递。
+ *
+ * 0.9.4（P0-3）：槽不再「只增不减」。槽与堆对象同构，前面也有 16 字节
+ * 的 lx_gc_hdr；载荷是引用类型时 on_zero = lx_gc_releasep，槽归零时
+ * 顺带释放内层对象。局部 T? 变量挂 __attribute__((cleanup(lx_opt_releasep)))，
+ * 在作用域出口统一回收（牺牲一点峰值内存换正确性，与设计文档 §2.2 一致）。
+ *
+ * 注意：槽的回收与 lx_gc_enabled 无关 —— 即便 --no-arc，装箱也不在
+ * 循环里无限增长；--no-arc 下内层引用不参与回收（on_zero 里的
+ * lx_gc_release 是空操作），语义与「只增不减」保持一致。 */
+static inline void* lx_opt_alloc(size_t n, void (*on_zero)(void*)) {
+    lx_gc_hdr* h = (lx_gc_hdr*)calloc(1, sizeof(lx_gc_hdr) + n);
+    if (!h) lx_panic("内存分配失败（可选值装箱）");
+    h->refs = 1;
+    h->on_zero = on_zero;
+    return (char*)(h + 1);
+}
+
+static inline void* lx_opt_retain(void* p) {
+    if (!p) return p;
+    lx_gc_hdr* h = ((lx_gc_hdr*)p) - 1;
+    if (h->refs >= 0) h->refs++;
     return p;
+}
+
+static inline void lx_opt_release(void* p) {
+    if (!p) return;
+    lx_gc_hdr* h = ((lx_gc_hdr*)p) - 1;
+    if (h->refs < 0) return;
+    if (--h->refs == 0) {
+        if (h->on_zero) h->on_zero(p);
+        free(h);
+    }
+}
+
+/* 供 __attribute__((cleanup)) 使用：p 指向变量本身 */
+static inline void lx_opt_releasep(void* p) { lx_opt_release(*(void**)p); }
+
+/* 所有权取出：释放槽本身但**不**调用 on_zero —— 载荷已被调用方取走。
+ * 用于 or 兜底 / ? 传播 / name! 解包这三处「消费掉一个可选值」的位置。 */
+static inline void lx_opt_drop(void* p) {
+    if (!p) return;
+    lx_gc_hdr* h = ((lx_gc_hdr*)p) - 1;
+    h->on_zero = 0;
+    h->refs = 1;
+    lx_opt_release(p);
 }
 
 static inline void lx_panic_opt(const char* what) {
@@ -181,8 +252,11 @@ static inline int64_t* lx_str_to_i64_opt(const char* s) {
     char* end = NULL;
     errno = 0;
     long long v = strtoll(s, &end, 10);
-    if (end == s || (end && *end != '\0') || errno != 0) return NULL;
-    int64_t* p = (int64_t*)lx_opt_alloc(sizeof(int64_t));
+    if (end == s || (end && *end != '\0') || errno != 0) {
+        lx_set_error("int 解析失败：不是合法的 64 位整数");
+        return NULL;
+    }
+    int64_t* p = (int64_t*)lx_opt_alloc(sizeof(int64_t), 0);
     *p = (int64_t)v;
     return p;
 }
@@ -193,8 +267,11 @@ static inline double* lx_str_to_f64_opt(const char* s) {
     char* end = NULL;
     errno = 0;
     double v = strtod(s, &end);
-    if (end == s || (end && *end != '\0')) return NULL;
-    double* p = (double*)lx_opt_alloc(sizeof(double));
+    if (end == s || (end && *end != '\0')) {
+        lx_set_error("float 解析失败：不是合法的浮点数");
+        return NULL;
+    }
+    double* p = (double*)lx_opt_alloc(sizeof(double), 0);
     *p = v;
     return p;
 }
@@ -251,6 +328,19 @@ static inline bool lx_str_endswith(const char* s, const char* suf) {
 static inline int64_t lx_str_find(const char* s, const char* sub) {
     const char* p = strstr(s, sub);
     return p ? (int64_t)(p - s) : -1;
+}
+
+/* find_opt(s, sub)：find 的可选变体，找不到返回 none 并写 last_error()
+ * （0.9.4，P1-8：扫掉 A3 尾巴，不再让调用方跟 -1 打交道） */
+static inline int64_t* lx_str_find_opt(const char* s, const char* sub) {
+    int64_t i = lx_str_find(s, sub);
+    if (i < 0) {
+        lx_set_error("find_opt 失败：未找到子串");
+        return NULL;
+    }
+    int64_t* p = (int64_t*)lx_opt_alloc(sizeof(int64_t), 0);
+    *p = i;
+    return p;
 }
 
 static inline char* lx_str_trim(const char* s) {
@@ -798,7 +888,14 @@ static inline bool lx_file_exists(const char* path) {
 /* 读整个文件 → string?（0.8）：打开失败返回 NULL */
 static inline const char** lx_read_opt(const char* path) {
     FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
+    if (!f) {
+        /* 0.9.4（P1-5）：把“为什么”写进 last_error()，脚本据此区分
+         * “不存在”与“没权限”——这是 T? 单靠 none 给不出的信息 */
+        if (errno == ENOENT) lx_set_error("read 失败：文件不存在");
+        else if (errno == EACCES) lx_set_error("read 失败：没有读取权限");
+        else lx_set_error("read 失败：无法打开文件");
+        return NULL;
+    }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long n = ftell(f);
     if (n < 0) { fclose(f); return NULL; }
@@ -807,7 +904,7 @@ static inline const char** lx_read_opt(const char* path) {
     size_t got = fread(buf, 1, (size_t)n, f);
     buf[got] = '\0';
     fclose(f);
-    const char** p = (const char**)lx_opt_alloc(sizeof(char*));
+    const char** p = (const char**)lx_opt_alloc(sizeof(char*), lx_gc_releasep);
     *p = buf;
     return p;
 }
@@ -1049,15 +1146,17 @@ struct CGen {
             }
             std::string ct = cType(elem);
             std::string o = tmpName("box");
-            // ARC：可选装箱目前不参与回收（0.9.3），但若内层是引用类型，
-            // 必须 retain —— 否则源变量的 cleanup 会把对象释放，
-            // 箱里就成悬空指针。多 retain 的引用会随箱一起泄露（安全）。
+            // 0.9.4（P0-3）：装箱参与回收。载荷是引用类型时槽自带
+            // on_zero = lx_gc_releasep（槽归零顺带释放内层），并在装箱时
+            // retain —— 否则源变量的 cleanup 会先把对象释放，箱里成悬空。
+            // 装箱出的槽是「新对象」，归调用方所有（owned）。
+            bool refInner = isRefTy(elem);
             std::string put = inner;
-            if (arcMode && isRefTy(elem))
+            if (arcMode && refInner)
                 put = "((" + ct + ")lx_gc_retain((void*)(" + inner + ")))";
-            return "({ " + ct + "* " + o + " = (" + ct +
-                   "*)lx_opt_alloc(sizeof(" + ct + ")); *" + o + " = " +
-                   put + "; " + o + "; })";
+            return "({ " + ct + "* " + o + " = (" + ct + "*)lx_opt_alloc(sizeof(" +
+                   ct + "), " + (refInner ? "lx_gc_releasep" : "0") + "); *" + o +
+                   " = " + put + "; " + o + "; })";
         }
         return v;
     }
@@ -1089,11 +1188,14 @@ struct CGen {
         if (!arcMode || !e || !isRefTy(e->ty)) return false;
         switch (e->kind) {
             case ExprKind::Binary: {
-                // 只有字符串拼接产生新串；or 兜底的结果可能是借用的
+                // 拼接产生新串；or 兜底（0.9.4）按下面的构造保证结果自持引用
                 auto* b = static_cast<BinaryExpr*>(e);
-                if (b->orFallback) return false;
+                if (b->orFallback) return isRefTy(e->ty);
                 return e->ty->kind == TyKind::String;
             }
+            case ExprKind::Try:
+                // ? 传播（0.9.4）：结果已按「自持引用」构造，见 consumeOpt
+                return isRefTy(e->ty);
             case ExprKind::Index: {
                 // s[i] 产生单字节字符（新字符串）
                 auto* ix = static_cast<IndexExpr*>(e);
@@ -1145,17 +1247,89 @@ struct CGen {
         return !c->target && c->builtin == Builtin::Env;
     }
 
+    // 可选值表达式是否「产生一个新槽归调用方所有」（0.9.4，P0-3）。
+    // 保守原则：判不准就当借用（多 retain 一次只是短暂多占内存，
+    // 误判成 owned 会导致槽被提前 drop 而载荷悬空）。
+    bool isOwnedOpt(Expr* e) {
+        if (!arcMode || !e || !e->ty || e->ty->kind != TyKind::Optional)
+            return false;
+        if (!e->ty->elem || !isRefTy(e->ty->elem)) {
+            // 值类型载荷：槽本身仍然要回收，以下同样按「新槽」判断
+        }
+        switch (e->kind) {
+            case ExprKind::Call: {
+                auto* c = static_cast<CallExpr*>(e);
+                if (c->target) return !c->target->isExtern;  // 用户函数返回新槽
+                switch (c->builtin) {
+                    case Builtin::ToInt:
+                    case Builtin::ToFloat:
+                    case Builtin::FileRead:
+                    case Builtin::StrFindOpt: return true;
+                    default: return false;
+                }
+            }
+            case ExprKind::NoneLit:
+                return true;  // none 是空指针，drop/retain 都是空操作
+            default:
+                return false;  // 变量 / 其他：借用
+        }
+    }
+
     // 存储语义：把 e 存进一个引用类型槽位。
     //   原始 C 串 → lx_str_dup 拷成有头对象
     //   owned     → 转移（不 retain，调用方把引用交给槽位）
     //   借用     → retain 后再存（槽位自己持有一份）
     std::string coerceStore(Expr* e, const Ty* to) {
         std::string v = coerceTo(e, to);
-        if (!arcMode || !isRefTy(to)) return v;
+        if (!arcMode) return v;
+        if (to->kind == TyKind::Optional) {
+            // 0.9.4（P0-3）：可选槽位同样有所有权语义。
+            //   T → T?  新装箱，归槽位所有（coerceTo 已 return 新槽）
+            //   owned   转移
+            //   借用    retain（槽位自己持有一份）
+            const Ty* from = e ? e->ty : nullptr;
+            if (!from || from->kind != TyKind::Optional) return v;
+            if (isOwnedOpt(e)) return v;
+            return "((" + cType(to) + ")lx_opt_retain((void*)(" + v + ")))";
+        }
+        if (!isRefTy(to)) return v;
         if (isRawCString(e))
             return "lx_str_dup((const char*)(" + v + "))";
         if (isOwned(e)) return v;
         return "((" + cType(to) + ")lx_gc_retain((void*)(" + v + ")))";
+    }
+
+    // 消费一个可选值表达式（0.9.4，P0-3）：读出 elem 类型的载荷，
+    // 并保证结果「自持一份引用」（引用类型时：借用 → retain，owned → 取走
+    // 所有权后 drop 掉空槽）。泛型化的三处消费者：
+    //   or 兜底 / ? 传播 / name! 解包。
+    // panicWhat 非空 → 为 none 时 panic；为空 → 为 none 时 return 当前返回类型的零值。
+    std::string consumeOpt(Expr* optExpr, const Ty* optTy,
+                           const char* panicWhat) {
+        return consumeOptCode(expr(optExpr), optTy, isOwnedOpt(optExpr),
+                              panicWhat ? std::string(panicWhat) : std::string());
+    }
+
+    // 同上，但直接吃一段已经生成好的 C 代码（用于内建 panic 变体）
+    std::string consumeOptCode(const std::string& optCode, const Ty* optTy,
+                               bool owned, const std::string& panicWhat) {
+        const Ty* elem = optTy->elem;
+        std::string ct = cType(optTy);
+        std::string et = cType(elem);
+        std::string o = tmpName("oc");
+        std::string tail;
+        std::string take = "(*" + o + ")";
+        if (arcMode && isRefTy(elem) && !owned)
+            take = "((void*)lx_gc_retain((void*)(*" + o + ")))";
+        if (arcMode && owned) tail = " lx_opt_drop((void*)" + o + ");";
+        std::string guard;
+        if (!panicWhat.empty())
+            guard = "if (!" + o + ") lx_panic_opt(\"" +
+                    escapeCString(panicWhat) + "\"); ";
+        else
+            guard = "if (!" + o + ") return " + zeroOfA(curRetTy) + "; ";
+        return "({ " + ct + " " + o + " = " + optCode + "; " + guard + et +
+               " " + o + "_v = " + take + ";" + tail + " " + o + "_v; })";
     }
 
     // 引用类型的“零值”：ARC 下 string 的空串用静态字面量包装，
@@ -1186,13 +1360,11 @@ struct CGen {
         }
     }
 
-    // panic 变体（name!）解包：opt 是 T? 表达式；为 none 时 panic，否则给 T
+    // panic 变体（name!）解包：opt 是 T? 表达式；为 none 时 panic，否则给 T。
+    // 0.9.4：解包出来的值是「自持引用」，且空槽被回收（见 consumeOptCode）。
     std::string panicUnwrap(const std::string& opt, const Ty* optTy,
                             const std::string& what) {
-        std::string o = tmpName("pu");
-        return "({ " + cType(optTy) + " " + o + " = " + opt + "; if (!" + o +
-               ") lx_panic_opt(\"" + escapeCString(what) + "\"); (*" + o +
-               "); })";
+        return consumeOptCode(opt, optTy, /*owned=*/true, what);
     }
 
     std::string expr(Expr* e) {
@@ -1246,9 +1418,30 @@ struct CGen {
                 if (n->orFallback) {
                     const Ty* elem = n->lhs->ty->elem;
                     std::string o = tmpName("or");
+                    if (!arcMode) {
+                        return "({ " + cType(n->lhs->ty) + " " + o + " = " +
+                               expr(n->lhs) + "; " + o + " ? (*" + o + ") : (" +
+                               coerceTo(n->rhs, elem) + "); })";
+                    }
+                    // 0.9.4（P0-3）：两条分支都构造成「自持一份引用」——
+                    //   命中：借用盒先 retain 内层，owned 盒取走所有权后 drop 槽；
+                    //   兜底：走存储语义（owned 转移 / 借用 retain）。
+                    // 因此 or 的结果对引用类型恒为 owned（见 isOwned）。
+                    bool refE = isRefTy(elem);
+                    std::string vslot = o + "_v";
+                    std::string hit = "*" + o;
+                    if (refE && !isOwnedOpt(n->lhs))
+                        hit = "((void*)lx_gc_retain((void*)(*" + o + ")))";
+                    std::string hitTail;
+                    if (isOwnedOpt(n->lhs))
+                        hitTail = " lx_opt_drop((void*)" + o + ");";
+                    std::string miss = refE ? coerceStore(n->rhs, elem)
+                                            : coerceTo(n->rhs, elem);
                     return "({ " + cType(n->lhs->ty) + " " + o + " = " +
-                           expr(n->lhs) + "; " + o + " ? (*" + o + ") : (" +
-                           coerceTo(n->rhs, elem) + "); })";
+                           expr(n->lhs) + "; " + cType(elem) + " " + vslot +
+                           "; if (" + o + ") { " + vslot + " = " + hit + ";" +
+                           hitTail + " } else { " + vslot + " = " + miss +
+                           "; } " + vslot + "; })";
                 }
                 // Sema 折叠过的常量表达式直接落成字面量
                 if (n->folded) {
@@ -1368,10 +1561,15 @@ struct CGen {
                 // expr?（0.8）：失败就 return none（当前函数必须返回 T?）
                 auto* tr = static_cast<TryExpr*>(e);
                 const Ty* ot = tr->operand->ty;
-                std::string o = tmpName("try");
-                return "({ " + cType(ot) + " " + o + " = " +
-                       expr(tr->operand) + "; if (!" + o + ") return " +
-                       zeroOfA(curRetTy) + "; (*" + o + "); })";
+                if (!arcMode) {
+                    std::string o = tmpName("try");
+                    return "({ " + cType(ot) + " " + o + " = " +
+                           expr(tr->operand) + "; if (!" + o + ") return " +
+                           zeroOfA(curRetTy) + "; (*" + o + "); })";
+                }
+                // 0.9.4（P0-3）：结果自持引用（借用先 retain），
+                // 且临时槽被回收。
+                return consumeOpt(tr->operand, ot, nullptr);
             }
         }
         return "0";
@@ -1693,6 +1891,12 @@ struct CGen {
             case Builtin::StrFind:
                 return "lx_str_find(" + expr(c->args[0]) + ", " +
                        expr(c->args[1]) + ")";
+            case Builtin::StrFindOpt:
+                // 0.9.4（P1-8）：找不到返回 none；同时写 last_error()
+                return "lx_str_find_opt(" + expr(c->args[0]) + ", " +
+                       expr(c->args[1]) + ")";
+            case Builtin::LastError:
+                return "lx_last_error()";
             case Builtin::StrReplace:
                 return "lx_str_replace(" + expr(c->args[0]) + ", " +
                        expr(c->args[1]) + ", " + expr(c->args[2]) + ")";
@@ -1804,7 +2008,11 @@ struct CGen {
     void assignStmt(AssignStmt* a) {
         Expr* t = a->target;
         const Ty* tt = a->elemTy ? a->elemTy : TyStore::int64Ty();
-        bool managed = arcMode && isRefTy(tt);
+        bool refManaged = arcMode && isRefTy(tt);
+        // 0.9.4（P0-3）：T? 变量赋值同样要先释放旧槽再存新槽
+        bool optManaged =
+            arcMode && tt && tt->kind == TyKind::Optional;
+        bool managed = refManaged || optManaged;
         if (t->kind == ExprKind::Index) {
             // 数组元素：用临时变量保证 base / index 只求值一次
             std::string base = expr(static_cast<IndexExpr*>(t)->base);
@@ -1848,7 +2056,8 @@ struct CGen {
             std::string tv = tmpName("as");
             // 先算新值再释放旧值，兼容 x = x + ... / x += ...
             line(std::string(cType(tt)) + " " + tv + " = " + rhs + ";");
-            line("lx_gc_release((void*)" + lv + ");");
+            line(std::string(refManaged ? "lx_gc_release" : "lx_opt_release") +
+                 "((void*)" + lv + ");");
             line(lv + " = " + tv + ";");
             return;
         }
@@ -1899,13 +2108,20 @@ struct CGen {
             }
             case StmtKind::Let: {
                 auto* let = static_cast<LetStmt*>(s);
-                bool managed = arcMode && isRefTy(let->resolved);
+                bool refManaged = arcMode && isRefTy(let->resolved);
+                // 0.9.4（P0-3）：T? 局部变量同样在作用域出口回收空槽
+                bool optManaged =
+                    arcMode && let->resolved &&
+                    let->resolved->kind == TyKind::Optional;
+                bool managed = refManaged || optManaged;
                 std::string decl;
                 if (let->isConst && !managed) decl += "const ";
                 decl += std::string(cType(let->resolved)) + " " +
                         mangle(let->name);
                 if (managed)
-                    decl += " __attribute__((cleanup(lx_gc_releasep)))";
+                    decl += std::string(" __attribute__((cleanup(") +
+                            (refManaged ? "lx_gc_releasep" : "lx_opt_releasep") +
+                            ")))";
                 if (let->init) {
                     decl += " = " + (managed
                                          ? coerceStore(let->init, let->resolved)
@@ -1952,6 +2168,13 @@ struct CGen {
                         if (c->builtin == Builtin::PrintLn) line("lx_print_nl();");
                         break;
                     }
+                }
+                // 0.9.4（P0-3）：可选值表达式语句（f(...); 放弃返回值）——
+                // 若是自己拥有的临时槽，顺手回收，否则整个槽连同载荷一起漏掉。
+                if (arcMode && e->ty && e->ty->kind == TyKind::Optional &&
+                    isOwnedOpt(e)) {
+                    line("lx_opt_drop((void*)(" + expr(e) + "));");
+                    break;
                 }
                 line(expr(e) + ";");
                 break;

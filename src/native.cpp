@@ -20,6 +20,11 @@
 #include <unordered_set>
 
 namespace lux {
+
+// 0.9.4：原生后端 ARC 开关（默认开；--no-arc 关闭，用于对拍排查）
+bool g_nativeArc = true;
+void setNativeArc(bool on) { g_nativeArc = on; }
+
 namespace {
 
 #include "native_body.inc"
