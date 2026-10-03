@@ -1,0 +1,13 @@
+// tests/cases/net_dial_refused.lux —— 连确定关闭的端口 → none + last_error
+import "net";
+
+fn main() {
+    let fd = dial("127.0.0.1", 39299);
+    let v = fd or 0;
+    if v == 0 {
+        println(last_error());
+    } else {
+        println("unexpected");
+        close(v);
+    }
+}

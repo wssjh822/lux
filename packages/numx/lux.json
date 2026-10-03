@@ -1,6 +1,6 @@
 {
   "name": "numx",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "summary": "整数分解工具：质因数 / 约数个数 / 第 k 个素数（依赖 mathx）",
   "description": "在 mathx 之上提供 prime_factors、divisor_count、nth_prime。安装 numx 时 luxc 会先自动安装 mathx。",
   "main": "lib.lux",
@@ -15,8 +15,8 @@
   "authors": [
     "Lux 社区"
   ],
-  "lux": ">=1.1.0",
+  "lux": ">=1.2.0",
   "deps": {
-    "mathx": "^1.1.0"
+    "mathx": "^1.2.0"
   }
 }

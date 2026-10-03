@@ -2,7 +2,7 @@
 //  loader.cpp : 模块加载 —— 递归解析 import，把多个源文件合并成一个程序
 //
 //  import "路径" 支持四种形态：
-//    1. "math" / "time" / "system" / "file" / "string"   内置标准库模块
+//    1. "math" / "time" / "system" / "file" / "string" / "net"   内置标准库模块
 //    2. "c:库名"                             链接外部 C 库（传给 cc -l库名）
 //    3. "文件.lux"                           相对当前文件所在目录的源码文件
 //    4. "目录"                               包：目录里有 lux.json 配置文件
@@ -98,7 +98,7 @@ bool fileExists(const std::string& path) {
 
 const std::set<std::string>& stdlibNames() {
     static const std::set<std::string> names = {"math", "time", "system",
-                                                "file", "string"};
+                                                "file", "string", "net"};
     return names;
 }
 

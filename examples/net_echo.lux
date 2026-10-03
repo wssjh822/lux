@@ -1,0 +1,21 @@
+// net_echo.lux —— 最小 echo 服务端（1.2 net 模块）
+// 编译运行： luxc examples/net_echo.lux --run
+// 原生后端： luxc --native examples/net_echo.lux --run
+// 测试：     printf 'hi\n' | nc 127.0.0.1 8123
+import "net";
+
+fn main() {
+    let lfd = listen(8123) or 0;
+    if lfd == 0 {
+        println("listen 失败：" + last_error());
+        exit(1);
+    }
+    let cfd = accept(lfd) or 0;
+    if cfd != 0 {
+        let msg = recv(cfd, 4096) or "";
+        send(cfd, msg);
+        close(cfd);
+    }
+    close(lfd);
+    println("echo 服务端已退出");
+}

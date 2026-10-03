@@ -1,0 +1,26 @@
+// tests/net/server.lux —— 回环 echo 服务端（双后端共用）
+// 用法: server <端口> <轮数>
+// 每轮 accept → recv → 原样回发 → close；不做并发（1.2 既定拍板）。
+import "net";
+
+fn main(argv: string[]) {
+    let port = int(argv[1]) or 0;
+    let rounds = int(argv[2]) or 1;
+    let lfd = listen(port) or 0;
+    if lfd == 0 {
+        println("listen failed: " + last_error());
+        exit(1);
+    }
+    let i = 0;
+    while i < rounds {
+        let cfd = accept(lfd) or 0;
+        if cfd != 0 {
+            let msg = recv(cfd, 4096) or "";
+            if len(msg) > 0 { send(cfd, msg); }
+            close(cfd);
+        }
+        i = i + 1;
+    }
+    close(lfd);
+    println("server-ok");
+}

@@ -1,0 +1,21 @@
+// tests/cases/net_hosts_resolve.lux —— 只吃 /etc/hosts（CI 确定性）
+import "net";
+
+fn main() {
+    let lfd = listen(39242) or 0;
+    if lfd == 0 {
+        println("listen failed: " + last_error());
+        exit(1);
+    }
+    let fd = dial("localhost", 39242) or 0;
+    if fd == 0 {
+        println("dial failed: " + last_error());
+        exit(1);
+    }
+    let cfd = accept(lfd) or 0;
+    send(fd, "hosts-ok");
+    println(recv(cfd, 64) or "");
+    close(cfd);
+    close(fd);
+    close(lfd);
+}

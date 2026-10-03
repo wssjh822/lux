@@ -1,0 +1,14 @@
+200
+OK
+3
+text/plain
+42
+none
+hello
+404
+Not Found
+nope
+example.com:8080/a/b?q=1
+localhost:80/x
+true
+true

@@ -1,0 +1,16 @@
+// tests/net/client_echo.lux —— 回环 echo 客户端（双后端共用）
+// 用法: client_echo <端口>
+import "net";
+
+fn main(argv: string[]) {
+    let port = int(argv[1]) or 0;
+    let fd = dial("127.0.0.1", port) or 0;
+    if fd == 0 {
+        println("dial failed: " + last_error());
+        exit(1);
+    }
+    send(fd, "hello-lux");
+    let r = recv(fd, 4096) or "";
+    println(r);
+    close(fd);
+}

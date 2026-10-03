@@ -29,7 +29,7 @@ namespace {
 
 // 版本号由 Makefile 经 -DLUX_VERSION='"x.y.z"' 编译期注入（单源化）
 #ifndef LUX_VERSION
-#define LUX_VERSION "1.1.0"
+#define LUX_VERSION "1.2.0"
 #endif
 
 const std::string kVersion = std::string("Lux ") + LUX_VERSION + " (C 后端 + 原生后端)";

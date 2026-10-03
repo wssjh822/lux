@@ -524,6 +524,98 @@ struct X64 {
         syscall();
         push(RAX);
     }
+    // ---- 网络系统调用（1.2）：参数槽布局 [rsp+8*(n-1-j)] = arg j ----
+    void sysSocket() {
+        movrm(RDI, RSP, 16);  // domain
+        movrm(RSI, RSP, 8);   // type
+        movrm(RDX, RSP, 0);   // protocol
+        mov64i(RAX, 41);      // __NR_socket
+        addRsp(24);
+        syscall();
+        push(RAX);
+    }
+    void sysConnect() {
+        movrm(RDI, RSP, 16);  // fd
+        movrm(RSI, RSP, 8);   // addr
+        movrm(RDX, RSP, 0);   // len
+        mov64i(RAX, 42);      // __NR_connect
+        addRsp(24);
+        syscall();
+        push(RAX);
+    }
+    void sysSendto() {
+        movrm(RDI, RSP, 40);  // fd
+        movrm(RSI, RSP, 32);  // buf
+        movrm(RDX, RSP, 24);  // len
+        movrm(10, RSP, 16);   // flags → r10
+        movrm(8, RSP, 8);     // addr → r8
+        movrm(9, RSP, 0);     // addrlen → r9
+        mov64i(RAX, 44);      // __NR_sendto
+        addRsp(48);
+        syscall();
+        push(RAX);
+    }
+    void sysRecvfrom() {
+        movrm(RDI, RSP, 40);
+        movrm(RSI, RSP, 32);
+        movrm(RDX, RSP, 24);
+        movrm(10, RSP, 16);
+        movrm(8, RSP, 8);
+        movrm(9, RSP, 0);
+        mov64i(RAX, 45);      // __NR_recvfrom
+        addRsp(48);
+        syscall();
+        push(RAX);
+    }
+    void sysBind() {
+        movrm(RDI, RSP, 16);  // fd
+        movrm(RSI, RSP, 8);   // addr
+        movrm(RDX, RSP, 0);   // len
+        mov64i(RAX, 49);      // __NR_bind
+        addRsp(24);
+        syscall();
+        push(RAX);
+    }
+    void sysListen() {
+        movrm(RDI, RSP, 8);   // fd
+        movrm(RSI, RSP, 0);   // backlog
+        mov64i(RAX, 50);      // __NR_listen
+        addRsp(16);
+        syscall();
+        push(RAX);
+    }
+    void sysAccept() {
+        movrm(RDI, RSP, 16);  // fd
+        movrm(RSI, RSP, 8);   // addr
+        movrm(RDX, RSP, 0);   // addrlen
+        mov64i(RAX, 43);      // __NR_accept
+        addRsp(24);
+        syscall();
+        push(RAX);
+    }
+    void sysSetsockopt() {
+        movrm(RDI, RSP, 32);  // fd
+        movrm(RSI, RSP, 24);  // level
+        movrm(RDX, RSP, 16);  // optname
+        movrm(10, RSP, 8);    // optval → r10
+        movrm(8, RSP, 0);     // optlen → r8
+        mov64i(RAX, 54);      // __NR_setsockopt
+        addRsp(40);
+        syscall();
+        push(RAX);
+    }
+    // 写 2 / 4 字节（sockaddr_in 的 family / port / addr 字段）
+    void store16Reg(int addr, int src) {
+        db(0x66);  // 操作数大小前缀
+        if ((src >= 8) || (addr >= 8))
+            db(0x40 | ((src >= 8) ? 4 : 0) | ((addr >= 8) ? 1 : 0));
+        db(0x89); db((uint8_t)(((src & 7) << 3) | (addr & 7)));
+    }
+    void store32Reg(int addr, int src) {
+        if ((src >= 8) || (addr >= 8))
+            db(0x40 | ((src >= 8) ? 4 : 0) | ((addr >= 8) ? 1 : 0));
+        db(0x89); db((uint8_t)(((src & 7) << 3) | (addr & 7)));
+    }
     void heapMmapFirst() {
         // 入参：RAX = 堆槽地址；出参：RAX = 槽地址，RCX = base
         push(RAX);  // 保存槽地址（syscall 会破坏寄存器）

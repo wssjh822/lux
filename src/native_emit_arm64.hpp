@@ -197,6 +197,27 @@ struct Arm64 {
             emit32(0x39000000u | ((uint32_t)17 << 5) | (uint32_t)(rt & 31));
         }
     }
+    // 半字 / 字写入（sockaddr_in 的 port / addr 字段）
+    void strhRaw(int rt, int rn, int32_t disp) {
+        if (disp >= 0 && disp <= 8190 && (disp % 2 == 0)) {
+            emit32(0x79000000u | ((uint32_t)(disp / 2) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+        } else if (disp >= -256 && disp <= 255) {
+            emit32(0x78000000u | ((uint32_t)(disp & 0x1FF) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+        } else {
+            addAddr(17, rn, disp);
+            emit32(0x79000000u | ((uint32_t)17 << 5) | (uint32_t)(rt & 31));
+        }
+    }
+    void strwRaw(int rt, int rn, int32_t disp) {
+        if (disp >= 0 && disp <= 16380 && (disp % 4 == 0)) {
+            emit32(0xB9000000u | ((uint32_t)(disp / 4) << 10) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+        } else if (disp >= -256 && disp <= 255) {
+            emit32(0xB8000000u | ((uint32_t)(disp & 0x1FF) << 12) | ((uint32_t)(rn & 31) << 5) | (uint32_t)(rt & 31));
+        } else {
+            addAddr(17, rn, disp);
+            emit32(0xB9000000u | ((uint32_t)17 << 5) | (uint32_t)(rt & 31));
+        }
+    }
 
     // 二元整数运算（k：add/sub/xor/and/or）
     enum { A_ADD = 0, A_SUB, A_XOR, A_AND, A_OR };
@@ -384,6 +405,8 @@ struct Arm64 {
         emit32(0x53001C00u | ((uint32_t)(R(src) & 31) << 5) | (uint32_t)(R(dst) & 31));
     }
     void store8Reg(int addr, int src) { strbRaw(R(src), R(addr), 0); }
+    void store16Reg(int addr, int src) { strhRaw(R(src), R(addr), 0); }
+    void store32Reg(int addr, int src) { strwRaw(R(src), R(addr), 0); }
     void movzx8mem(int dst, int addr) { ldrbRaw(R(dst), R(addr), 0); }
 
     // ---- 整数算术 / 逻辑 ----
@@ -591,6 +614,52 @@ struct Arm64 {
         movzRaw(8, 220, 0);            // __NR_clone（fork 语义）
         syscall();
         push(0);
+    }
+    // ---- 网络系统调用（1.2）：参数槽 [sp+8*(n-1-j)] = arg j（n=28 是值栈） ----
+    void sysSocket() {
+        ldrRaw(0, 28, 16); ldrRaw(1, 28, 8); ldrRaw(2, 28, 0);
+        movzRaw(8, 198, 0);            // __NR_socket
+        addRsp(24); syscall(); push(0);
+    }
+    void sysConnect() {
+        ldrRaw(0, 28, 16); ldrRaw(1, 28, 8); ldrRaw(2, 28, 0);
+        movzRaw(8, 203, 0);            // __NR_connect
+        addRsp(24); syscall(); push(0);
+    }
+    void sysSendto() {
+        ldrRaw(0, 28, 40); ldrRaw(1, 28, 32); ldrRaw(2, 28, 24);
+        ldrRaw(3, 28, 16); ldrRaw(4, 28, 8); ldrRaw(5, 28, 0);
+        movzRaw(8, 206, 0);            // __NR_sendto
+        addRsp(48); syscall(); push(0);
+    }
+    void sysRecvfrom() {
+        ldrRaw(0, 28, 40); ldrRaw(1, 28, 32); ldrRaw(2, 28, 24);
+        ldrRaw(3, 28, 16); ldrRaw(4, 28, 8); ldrRaw(5, 28, 0);
+        movzRaw(8, 207, 0);            // __NR_recvfrom
+        addRsp(48); syscall(); push(0);
+    }
+    void sysBind() {
+        ldrRaw(0, 28, 16); ldrRaw(1, 28, 8); ldrRaw(2, 28, 0);
+        movzRaw(8, 200, 0);            // __NR_bind
+        addRsp(24); syscall(); push(0);
+    }
+    void sysListen() {
+        ldrRaw(0, 28, 8); ldrRaw(1, 28, 0);
+        movzRaw(8, 201, 0);            // __NR_listen
+        addRsp(16); syscall(); push(0);
+    }
+    void sysAccept() {
+        // arm64 没有 accept：用 accept4(fd, addr, addrlen, flags=0) 吸收差异
+        ldrRaw(0, 28, 16); ldrRaw(1, 28, 8); ldrRaw(2, 28, 0);
+        movzRaw(3, 0, 0);
+        movzRaw(8, 202, 0);            // __NR_accept4
+        addRsp(24); syscall(); push(0);
+    }
+    void sysSetsockopt() {
+        ldrRaw(0, 28, 32); ldrRaw(1, 28, 24); ldrRaw(2, 28, 16);
+        ldrRaw(3, 28, 8); ldrRaw(4, 28, 0);
+        movzRaw(8, 208, 0);            // __NR_setsockopt
+        addRsp(40); syscall(); push(0);
     }
     void heapMmapFirst() {        // 入参 x0 = 堆槽地址；出参 x0 = 槽地址，x1 = base
         movReg(19, 0);

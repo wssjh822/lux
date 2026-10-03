@@ -25,6 +25,12 @@ server/packages/
 # bench 里的 C 对照实现是手写的，要保留
 !bench/primes_hand.c
 
+# 网络测试临时产物（run_tests.sh 实际写到 $TMP，这里兜底）
+/tests/net/server
+/tests/net/client_echo
+/tests/net/server_silent
+/tests/net/client_timeout
+
 # 个人草稿，不随仓库发布
 建议.txt
 

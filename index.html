@@ -168,7 +168,7 @@
     </p>
     <div class="cmd"><span>$ </span>luxc hello.lux --run</div>
     <div class="badges">
-      <span class="badge">v1.1.0</span>
+      <span class="badge">v1.2.0</span>
       <span class="badge">静态类型</span>
       <span class="badge">错误通道 T? / ? / or / !</span>
       <span class="badge">ARC 引用计数（默认开启）</span>
@@ -338,6 +338,11 @@ $ luxc hello.lux --emit-c
         <p><code>byte_at(s, i)</code> / <code>bytes(s)</code> 直读字节；<code>list_dir(path) -&gt; string[]?</code> 列举目录（原生走 <code>getdents64</code>）。</p>
       </div>
       <div class="card">
+        <span class="ic">⇄</span>
+        <h3>net 模块 + httpx <span style="color:var(--gold2)">1.2 新增</span></h3>
+        <p>标准库 <code>net</code>：<code>dial</code> / <code>send</code> / <code>recv</code> / <code>listen</code> / <code>accept</code> / <code>close</code> / <code>set_timeout</code>，自带 DNS-lite（/etc/hosts → UDP A 查询），双后端逐字节一致；<code>httpx</code> 包在其上提供 <code>get</code> / <code>post</code>。</p>
+      </div>
+      <div class="card">
         <span class="ic">▦</span>
         <h3>数组，引用语义 <span style="color:var(--gold2)">0.5 新增</span></h3>
         <p><code>let a: int[] = [1,2,3]</code>，越界立即 panic，<code>push</code> / <code>pop</code> / <code>insert</code> / <code>remove</code> 自动扩容；传参与赋值共享同一数组，和 Python list 一致。</p>
@@ -400,7 +405,7 @@ $ luxc hello.lux --emit-c
       <div class="card">
         <span class="ic">⬇</span>
         <h3>在线包管理 <span style="color:var(--gold2)">0.9 新增</span></h3>
-        <p><code>luxc install</code> 从注册表下载安装并自动解析依赖；<code>login</code> / <code>publish</code> / <code>unpublish</code> 带账号体系。官方包：<code>mathx</code> / <code>strx</code> / <code>numx</code> / <code>arrx</code> / <code>jsonx</code>。网页端在 <a href="https://lux.xfes.top/lux/">lux.xfes.top/lux</a>。</p>
+        <p><code>luxc install</code> 从注册表下载安装并自动解析依赖；<code>login</code> / <code>publish</code> / <code>unpublish</code> 带账号体系。官方包：<code>mathx</code> / <code>strx</code> / <code>numx</code> / <code>arrx</code> / <code>jsonx</code> / <code>httpx</code>。网页端在 <a href="https://lux.xfes.top/lux/">lux.xfes.top/lux</a>。</p>
       </div>
       <div class="card">
         <span class="ic">⚙</span>
@@ -484,6 +489,7 @@ x += <span class="n">5</span>;  s += <span class="s">"!"</span>;  i++;  j--;
 <span class="k">import</span> <span class="s">"system"</span>;        <span class="c">// system(cmd) / env / setenv</span>
 <span class="k">import</span> <span class="s">"file"</span>;          <span class="c">// read / write / append / exists / remove / rename</span>
 <span class="k">import</span> <span class="s">"string"</span>;        <span class="c">// contains / replace / trim / substr / format ...</span>
+<span class="k">import</span> <span class="s">"net"</span>;           <span class="c">// dial / send / recv / listen / accept / close / set_timeout</span>
 <span class="k">import</span> <span class="s">"./util.lux"</span>;   <span class="c">// 相对路径的 .lux 文件</span>
 <span class="k">import</span> <span class="s">"mypkg"</span>;         <span class="c">// 包目录（lux.json）或已安装的包</span>
 <span class="k">import</span> <span class="s">"c:m"</span>;           <span class="c">// 链接 C 库（-lm）</span>
@@ -582,7 +588,7 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
     <p class="sub">以下取舍是刻意为之 —— 把不确定的东西留在后面，先把确定的部分做对。</p>
     <div class="road">
       <div>
-        <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">当前限制（1.0）</h3>
+        <h3 style="font-size:15px;margin-bottom:12px;color:var(--gold2)">当前限制（1.2）</h3>
         <ul class="li">
           <li class="done"><b>内存由 ARC 自动回收，0.9.4 起两个后端都默认开启</b> —— 临时对象在<b>每条语句结束时</b>归还，局部变量在作用域出口回收。C 后端 1e6 次拼接峰值 117MB→11MB；原生后端 20 万次 × 3 串 churn 峰值 RSS &lt; 32MB。需要旧行为时用 <code>--no-arc</code>。
             仍存的最小缺口（<b>只泄漏、不误释放</b>）：<code>main(argv)</code> 的 argv 数组是一次性泄漏；原生后端 <code>break</code> / <code>continue</code> / <code>return</code> 提前离开块时不释放该块已声明的引用型局部（见 <code>docs/arc.md</code> §2.4）</li>
@@ -591,6 +597,7 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
           <li class="warn">原生后端 <code>cos</code> / <code>tan</code> / <code>atan</code> / <code>atan2</code> 在<b>末位</b>与 libm 可能不同（大数格式化 bug 0.8 已修；x86-64 上 <code>asin</code> / <code>acos</code> 恒返 NaN 的 x87 栈序缺陷 0.9.4 已修，两端统一走运行时实现）</li>
           <li class="warn">没有高阶函数 / <code>fn</code> 类型（<code>sort</code> / <code>map</code> / <code>filter</code>）与 <code>static let</code> 全局可变变量</li>
           <li class="warn">标识符只支持 ASCII；C 后端需系统装有 C 编译器（原生后端不需要）</li>
+          <li class="warn">网络仅 IPv4 + <code>http://</code>：<b>没有 TLS/HTTPS</b>（顺延 1.3）、无 IPv6 / AAAA、无 connect 阶段超时、无 chunked / keep-alive / gzip / 重定向；服务端顺序 accept，无并发</li>
           <li class="warn">只支持 POSIX 平台（Linux / macOS），Windows 请用 WSL / MSYS2</li>
         </ul>
       </div>
@@ -628,17 +635,18 @@ $ luxc search math       <span class="c"># 搜索 / list / upgrade</span></code>
           <li class="done"><b>回归全绿 227/227（含双后端逐字节差分 + churn 内存回归）</b> ✓ 0.9.4 已完成</li>
           <li class="done"><b>Lux 1.0.0 正式版：语言 / 标准库 / 错误通道 / 构建 / 包管理 / ARC 全部冻结</b> ✓ 1.0 已完成</li>
           <li class="done"><b>Lux 1.1.0：<code>fn</code> 函数类型（函数成为值）+ <code>sort</code> / <code>map</code> / <code>filter</code> / <code>map_opt</code> + 字节原语 / <code>list_dir</code> + 原生 ARC 提前退出修复 + REPL 彩色 / 下载器进度条</b> ✓ 1.1 已完成</li>
-          <li>闭包 / lambda — 不进 1.1，留 1.2+</li>
-          <li>高阶函数与 <code>fn</code> 类型（sort / map / filter）— 不进 1.0，留 1.x</li>
+          <li class="done"><b>Lux 1.2.0：<code>net</code> 标准库（dial / send / recv / listen / accept / close / set_timeout + DNS-lite）+ <code>httpx</code> 包 + 原生后端 ARC 插桩按需关闭（纯计算函数提速约 3.8×）</b> ✓ 1.2 已完成</li>
+          <li>TLS / HTTPS — 不进 1.2，留 1.3 候选</li>
+          <li>闭包 / lambda — 留 1.3 候选</li>
           <li>aarch64 原生数学末位对齐 — 待有 aarch64 机器的版本校准</li>
-          <li>枚举与模式匹配、泛型 — 1.x</li>
+          <li>枚举与模式匹配、泛型、<code>map&lt;K,V&gt;</code> — 1.x</li>
         </ul>
       </div>
     </div>
   </section>
 
   <footer>
-    <p><span class="lx">Lux</span> v1.1.0 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
+    <p><span class="lx">Lux</span> v1.2.0 &nbsp;·&nbsp; 用 C++ 写成 &nbsp;·&nbsp; MIT 许可</p>
     <p style="margin-top:8px">
       完整文档见 <a href="README.md">README.md</a> ·
       <a href="docs/language.md">语言教程</a> ·

@@ -14,7 +14,7 @@ function e(?string $s): string {
 $ROOT = __DIR__;
 
 // ---- 读取下载清单（失败回退） ------------------------------------------------
-$latest     = '1.1.0';
+$latest     = '1.2.0';
 $luxDl      = [];
 $serverDl   = [];
 $dlFile     = $ROOT . '/lux/downloads/downloads.json';
@@ -266,7 +266,8 @@ $year = date('Y');
       既可翻译成 C 交给 gcc 优化，也能<b>直出本机架构的 Linux ELF</b>，
       运行时系统全部由 Lux 自身实现；<b>ARC 引用计数自动回收内存</b>。
       语言、标准库、错误通道、构建与包管理均已在 <b>1.0 正式版</b>冻结；
-      <b>1.1</b> 让具名函数成为可传递的值（<code>fn</code> 类型），并带来 <code>sort</code> / <code>map</code> / <code>filter</code>。
+      <b>1.1</b> 让具名函数成为可传递的值（<code>fn</code> 类型），并带来 <code>sort</code> / <code>map</code> / <code>filter</code>；
+      <b>1.2</b> 新增标准库 <code>net</code>（dial / send / recv / listen / accept）与 <code>httpx</code> 包。
     </p>
     <div class="cta">
       <a class="btn primary" href="/lux/">
@@ -361,7 +362,7 @@ $year = date('Y');
       <div class="card">
         <div class="ico"><svg viewBox="0 0 24 24"><path d="M21 16V8l-9-5-9 5v8l9 5 9-5z"/><path d="M3.3 7.5L12 12l8.7-4.5M12 22V12"/></svg></div>
         <h3>在线包管理</h3>
-        <p><code>luxc install</code> 从注册表下载并解析依赖，<code>login</code> / <code>publish</code> 带账号体系；自带 <code>mathx</code> / <code>strx</code> / <code>numx</code> / <code>arrx</code> / <code>jsonx</code>。</p>
+        <p><code>luxc install</code> 从注册表下载并解析依赖，<code>login</code> / <code>publish</code> 带账号体系；自带 <code>mathx</code> / <code>strx</code> / <code>numx</code> / <code>arrx</code> / <code>jsonx</code> / <code>httpx</code>。</p>
       </div>
     </div>
   </section>

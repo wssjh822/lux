@@ -31,6 +31,7 @@ jobs:
         run: make test
       - name: Compile examples (C backend)
         run: |
+          ./build/luxc add packages/httpx
           for f in examples/*.lux; do ./build/luxc "$f" -o /tmp/ex_bin; done
       - name: Lex/parse fuzzing (short smoke)
         run: LUX_FUZZ_ITERS=200 ./tests/fuzz_lexparse.sh

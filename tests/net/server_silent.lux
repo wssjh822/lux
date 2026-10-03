@@ -1,0 +1,16 @@
+// tests/net/server_silent.lux —— accept 后不回话，专测 recv 超时
+// 用法: server_silent <端口>
+import "net";
+import "time";
+
+fn main(argv: string[]) {
+    let port = int(argv[1]) or 0;
+    let lfd = listen(port) or 0;
+    let cfd = accept(lfd) or 0;
+    if cfd != 0 {
+        sleep(2.0);
+        close(cfd);
+    }
+    close(lfd);
+    println("silent-ok");
+}

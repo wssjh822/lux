@@ -248,6 +248,50 @@ else
     bad "arc（churn 编译失败）"
 fi
 
+echo "== 网络差分（1.2：回环 echo，禁外网，全程超时保护） =="
+# 双后端各编一份 server / client，C 服务端 39251、原生服务端 39252，
+# 跑出 C/Native × client/server 的对角矩阵；再测 set_timeout + recv 超时。
+net_ok=1
+for t in server client_echo server_silent client_timeout; do
+    "$LUXC" "tests/net/$t.lux" -o "$TMP/net_c_$t" >"$TMP/net_c_$t.log" 2>&1 || net_ok=0
+    "$LUXC" --native "tests/net/$t.lux" -o "$TMP/net_n_$t" >"$TMP/net_n_$t.log" 2>&1 || net_ok=0
+done
+if [ "$net_ok" -ne 1 ]; then
+    bad "net（编译失败）"
+else
+    run_t() { timeout 20 "$@"; }
+    run_t "$TMP/net_c_server" 39251 2 >"$TMP/net_c_server.out" 2>&1 &
+    nsp1=$!
+    run_t "$TMP/net_n_server" 39252 2 >"$TMP/net_n_server.out" 2>&1 &
+    nsp2=$!
+    sleep 0.4
+    cc=$(run_t "$TMP/net_c_client_echo" 39251 2>&1)
+    cn=$(run_t "$TMP/net_c_client_echo" 39252 2>&1)
+    nc=$(run_t "$TMP/net_n_client_echo" 39251 2>&1)
+    nn=$(run_t "$TMP/net_n_client_echo" 39252 2>&1)
+    wait "$nsp1" "$nsp2" 2>/dev/null
+    if [ "$cc" = "hello-lux" ] && [ "$cn" = "hello-lux" ] && \
+       [ "$nc" = "hello-lux" ] && [ "$nn" = "hello-lux" ]; then
+        ok "net 回环 echo（C/Native × client/server 对角矩阵）"
+    else
+        bad "net 回环 echo（cc='$cc' cn='$cn' nc='$nc' nn='$nn'）"
+    fi
+    run_t "$TMP/net_c_server_silent" 39253 >/dev/null 2>&1 &
+    slp1=$!
+    run_t "$TMP/net_n_server_silent" 39254 >/dev/null 2>&1 &
+    slp2=$!
+    sleep 0.4
+    expect_to="timeout: net.recv 失败：超时"
+    to_c=$(run_t "$TMP/net_c_client_timeout" 39253 2>&1)
+    to_n=$(run_t "$TMP/net_n_client_timeout" 39254 2>&1)
+    wait "$slp1" "$slp2" 2>/dev/null
+    if [ "$to_c" = "$expect_to" ] && [ "$to_n" = "$expect_to" ]; then
+        ok "net.set_timeout + recv 超时（C / native 文案一致）"
+    else
+        bad "net 超时（C='$to_c' native='$to_n'）"
+    fi
+fi
+
 echo "== luxc build（LuxBuildFile 项目构建） =="
 BPROJ="$TMP/bproj"
 mkdir -p "$BPROJ/src" "$BPROJ/tests"
@@ -336,6 +380,26 @@ if (cd "$TMP" && "$OLDPWD/$LUXC" add "$OLDPWD/packages/jsonx" >/dev/null 2>&1); 
     (cd "$TMP" && "$OLDPWD/$LUXC" delete jsonx >/dev/null 2>&1)
 else
     bad "jsonx（安装失败）"
+fi
+
+echo "== 官方包 httpx（HTTP 响应解析，零网络） =="
+if (cd "$TMP" && "$OLDPWD/$LUXC" add "$OLDPWD/packages/httpx" >/dev/null 2>&1); then
+    if (cd "$OLDPWD" && "$LUXC" tests/pkgs/httpx_test.lux -o "$TMP/httpx_app") >/dev/null 2>&1 && \
+       diff -u "$OLDPWD/tests/pkgs/httpx_test.expected" <("$TMP/httpx_app" 2>&1) >/dev/null; then
+        ok "httpx（响应 / URL 解析）"
+    else
+        bad "httpx（行为不符）"
+        (cd "$OLDPWD" && "$LUXC" tests/pkgs/httpx_test.lux -o "$TMP/httpx_app" 2>&1; "$TMP/httpx_app" 2>&1) | sed 's/^/    /' | head -10
+    fi
+    if (cd "$OLDPWD" && "$LUXC" --native tests/pkgs/httpx_test.lux -o "$TMP/httpx_appn") >/dev/null 2>&1 && \
+       diff -u "$OLDPWD/tests/pkgs/httpx_test.expected" <("$TMP/httpx_appn" 2>&1) >/dev/null; then
+        ok "httpx（原生后端差分）"
+    else
+        bad "httpx（原生后端输出不一致）"
+    fi
+    (cd "$TMP" && "$OLDPWD/$LUXC" delete httpx >/dev/null 2>&1)
+else
+    bad "httpx（安装失败）"
 fi
 
 echo "== 官方包 mathx / strx / arrx（自带库） =="

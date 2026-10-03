@@ -1,0 +1,44 @@
+// httpx 包回归：纯字符串构造输入，零网络、确定性
+import "httpx";
+
+// 取哨兵：none 时 status=0
+fn is_none(r: HttpResponse?) -> bool {
+    let d = r or HttpResponse {
+        status: 0,
+        reason: "",
+        header_keys: [],
+        header_vals: [],
+        body: ""
+    };
+    return d.status == 0;
+}
+
+fn main() {
+    let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Test: 42\r\n" +
+              "Content-Length: 5\r\n\r\nhello";
+    let resp = parse_response!(raw);
+    println(resp.status);
+    println(resp.reason);
+    println(len(resp.header_keys));
+    println(header(resp, "content-type") or "?");
+    println(header(resp, "X-Test") or "?");
+    println(header(resp, "Missing") or "none");
+    println(resp.body);
+
+    // 404 + 仅 LF 分隔
+    let resp2 = parse_response!("HTTP/1.0 404 Not Found\nContent-Type: text/html\n\nnope");
+    println(resp2.status);
+    println(resp2.reason);
+    println(resp2.body);
+
+    // URL 解析
+    let u = parse_url!("http://example.com:8080/a/b?q=1");
+    println(u[0] + ":" + u[1] + u[2]);
+    let u3 = parse_url!("http://localhost/x");
+    println(u3[0] + ":" + u3[1] + u3[2]);
+
+    // https 与非 HTTP 输入 → none
+    let u2 = parse_url("https://example.com/") or [""];
+    println(len(u2) == 1 && u2[0] == "");
+    println(is_none(parse_response("")));
+}

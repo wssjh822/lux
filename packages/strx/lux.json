@@ -1,6 +1,6 @@
 {
   "name": "strx",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "summary": "字符串小工具：反转 / 重复 / 填充 / 首字母大写 / 子串计数",
   "description": "纯 Lux 字符串小工具：reverse、repeat_str、pad_left、pad_right、capitalize、count_sub、is_empty、index_of、trim_left、trim_right、replace_all。依赖内置 string 模块。",
   "main": "lib.lux",
@@ -16,6 +16,6 @@
   "authors": [
     "Lux 社区"
   ],
-  "lux": ">=1.1.0",
+  "lux": ">=1.2.0",
   "deps": {}
 }

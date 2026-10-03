@@ -1,0 +1,22 @@
+{
+  "name": "httpx",
+  "version": "1.2.0",
+  "summary": "极简 HTTP 客户端：无 TLS，仅 http://，统一 Connection: close",
+  "description": "纯 Lux 实现的 HTTP/1.0 客户端。get/post 走 net 模块的 7 个原语，读满 EOF；响应解析为并行数组头，header() 大小写不敏感取值。无 TLS、无 gzip、无重定向、无 chunked 解码（1.2 明确不做，详见 docs/net.md）。C 后端与原生后端行为一致。",
+  "main": "lib.lux",
+  "files": [
+    "lib.lux"
+  ],
+  "license": "MIT",
+  "tags": [
+    "http",
+    "net",
+    "client",
+    "web"
+  ],
+  "authors": [
+    "Lux 社区"
+  ],
+  "lux": ">=1.2.0",
+  "deps": {}
+}

@@ -1989,6 +1989,53 @@ struct NativeGen {
                 addRspImm(8);
                 c.push(RAX);
                 return;
+            // ---- net（1.2）----
+            case Builtin::NetDial:
+                evalExpr(args[0]);
+                evalExpr(args[1]);
+                c.call32(symLabel("luxrt_net_dial"));
+                addRspImm(16);
+                c.push(RAX);
+                return;
+            case Builtin::NetSend:
+                evalExpr(args[0]);
+                evalExpr(args[1]);
+                c.call32(symLabel("luxrt_net_send"));
+                addRspImm(16);
+                c.push(RAX);
+                return;
+            case Builtin::NetRecv:
+                evalExpr(args[0]);
+                evalExpr(args[1]);
+                c.call32(symLabel("luxrt_net_recv"));
+                addRspImm(16);
+                c.push(RAX);
+                return;
+            case Builtin::NetClose:
+                evalExpr(args[0]);
+                c.call32(symLabel("luxrt_net_close"));
+                addRspImm(8);
+                c.push(RAX);
+                return;
+            case Builtin::NetListen:
+                evalExpr(args[0]);
+                c.call32(symLabel("luxrt_net_listen"));
+                addRspImm(8);
+                c.push(RAX);
+                return;
+            case Builtin::NetAccept:
+                evalExpr(args[0]);
+                c.call32(symLabel("luxrt_net_accept"));
+                addRspImm(8);
+                c.push(RAX);
+                return;
+            case Builtin::NetSetTimeout:
+                evalExpr(args[0]);
+                evalCoerced(args[1], TyStore::float64Ty());
+                c.call32(symLabel("luxrt_net_set_timeout"));
+                addRspImm(16);
+                c.push(RAX);
+                return;
             case Builtin::Map:
                 evalExpr(args[0]);
                 pushImm(ekOf(e->ty->elem));
@@ -2160,6 +2207,46 @@ struct NativeGen {
                 c.sysFork();
                 return;
 
+            case Builtin::IntrSysSocket:
+                evalExpr(args[0]); evalExpr(args[1]); evalExpr(args[2]);
+                c.sysSocket();
+                return;
+
+            case Builtin::IntrSysConnect:
+                evalExpr(args[0]); evalExpr(args[1]); evalExpr(args[2]);
+                c.sysConnect();
+                return;
+
+            case Builtin::IntrSysSendto:
+                for (int i = 0; i < 6; i++) evalExpr(args[i]);
+                c.sysSendto();
+                return;
+
+            case Builtin::IntrSysRecvfrom:
+                for (int i = 0; i < 6; i++) evalExpr(args[i]);
+                c.sysRecvfrom();
+                return;
+
+            case Builtin::IntrSysBind:
+                evalExpr(args[0]); evalExpr(args[1]); evalExpr(args[2]);
+                c.sysBind();
+                return;
+
+            case Builtin::IntrSysListen:
+                evalExpr(args[0]); evalExpr(args[1]);
+                c.sysListen();
+                return;
+
+            case Builtin::IntrSysAccept:
+                evalExpr(args[0]); evalExpr(args[1]); evalExpr(args[2]);
+                c.sysAccept();
+                return;
+
+            case Builtin::IntrSysSetsockopt:
+                for (int i = 0; i < 5; i++) evalExpr(args[i]);
+                c.sysSetsockopt();
+                return;
+
             case Builtin::IntrBumpAlloc: {
                 // 全局堆指针在 bss 固定槽（kSlotHeap：cur / end），零初始化
                 evalExpr(args[0]);  // n 压栈 → [rsp]（公共路径 mov (%rsp),%rsi 读取）
@@ -2236,6 +2323,30 @@ struct NativeGen {
                 c.opRM(0x03, RAX, RSP, 8);
                 c.movrm(RCX, RSP, 0);
                 c.store8Reg(RAX, RCX);       // mov [rax], cl
+                addRspImm(24);
+                return;
+            }
+
+            case Builtin::IntrPoke16: {
+                evalExpr(args[0]);
+                evalExpr(args[1]);
+                evalExpr(args[2]);
+                c.movrm(RAX, RSP, 16);
+                c.opRM(0x03, RAX, RSP, 8);
+                c.movrm(RCX, RSP, 0);
+                c.store16Reg(RAX, RCX);      // mov word ptr [rax], cx
+                addRspImm(24);
+                return;
+            }
+
+            case Builtin::IntrPoke32: {
+                evalExpr(args[0]);
+                evalExpr(args[1]);
+                evalExpr(args[2]);
+                c.movrm(RAX, RSP, 16);
+                c.opRM(0x03, RAX, RSP, 8);
+                c.movrm(RCX, RSP, 0);
+                c.store32Reg(RAX, RCX);      // mov dword ptr [rax], ecx
                 addRspImm(24);
                 return;
             }
@@ -2925,6 +3036,133 @@ struct NativeGen {
     // =====================================================================
     //  函数 / 程序 / 入口
     // =====================================================================
+    // =====================================================================
+    //  ARC 必要性分析（1.2 性能）
+    //  仅当函数体可能创建堆对象（引用 / 可选类型，或调用可能创建堆对象的
+    //  函数）时才需要 pending flush / 返回值登记。对纯值计算函数关闭 ARC
+    //  插桩，省掉每条语句的 luxrt_pend_flush_to 调用——行为完全不变（ARC
+    //  只影响内存回收，不影响可观察结果）。
+    // =====================================================================
+    std::unordered_map<const FuncDecl*, bool> pendCache_;
+    std::unordered_set<const FuncDecl*> pendBusy_;
+
+    static bool tyMayPend(const Ty* t) {
+        if (!t) return false;
+        return eIsRefTy(t) || t->kind == TyKind::Optional;
+    }
+
+    bool exprMayPend(Expr* e) {
+        if (!e) return false;
+        if (tyMayPend(e->ty)) return true;  // 引用 / 可选类型一律保守
+        switch (e->kind) {
+            case ExprKind::Binary: {
+                auto* b = static_cast<BinaryExpr*>(e);
+                return exprMayPend(b->lhs) || exprMayPend(b->rhs);
+            }
+            case ExprKind::Unary:
+                return exprMayPend(static_cast<UnaryExpr*>(e)->operand);
+            case ExprKind::Index: {
+                auto* i = static_cast<IndexExpr*>(e);
+                return exprMayPend(i->base) || exprMayPend(i->index);
+            }
+            case ExprKind::Slice: {
+                auto* s = static_cast<SliceExpr*>(e);
+                return exprMayPend(s->base) || exprMayPend(s->start) ||
+                       exprMayPend(s->end);
+            }
+            case ExprKind::Member:
+                return exprMayPend(static_cast<MemberExpr*>(e)->base);
+            case ExprKind::ArrayLit: {
+                for (Expr* el : static_cast<ArrayLitExpr*>(e)->elems)
+                    if (exprMayPend(el)) return true;
+                return false;
+            }
+            case ExprKind::StructLit: {
+                for (auto& kv : static_cast<StructLitExpr*>(e)->inits)
+                    if (exprMayPend(kv.second)) return true;
+                return false;
+            }
+            case ExprKind::If: {
+                auto* ie = static_cast<IfExpr*>(e);
+                return exprMayPend(ie->cond) || exprMayPend(ie->thenVal) ||
+                       exprMayPend(ie->elseVal);
+            }
+            case ExprKind::Call: {
+                auto* c = static_cast<CallExpr*>(e);
+                for (Expr* a : c->args)
+                    if (exprMayPend(a)) return true;
+                if (c->builtin != Builtin::None) {
+                    // 特权内建的 __call* 会间接调用未知函数；其余不创建 Lux 对象
+                    return c->builtin == Builtin::IntrCall1 ||
+                           c->builtin == Builtin::IntrCall2;
+                }
+                if (c->viaValue) return true;  // 间接调用：目标未知
+                if (c->target) return fnMayPend(c->target);
+                return true;  // 未知调用
+            }
+            case ExprKind::Try:
+                return exprMayPend(static_cast<TryExpr*>(e)->operand);
+            default:
+                return false;
+        }
+    }
+
+    bool stmtMayPend(Stmt* s) {
+        if (!s) return false;
+        switch (s->kind) {
+            case StmtKind::Let: {
+                auto* l = static_cast<LetStmt*>(s);
+                if (tyMayPend(l->resolved)) return true;
+                return exprMayPend(l->init);
+            }
+            case StmtKind::Expr:
+                return exprMayPend(static_cast<ExprStmt*>(s)->expr);
+            case StmtKind::Assign: {
+                auto* a = static_cast<AssignStmt*>(s);
+                if (tyMayPend(a->elemTy)) return true;
+                return exprMayPend(a->value) || exprMayPend(a->target);
+            }
+            case StmtKind::If: {
+                auto* i = static_cast<IfStmt*>(s);
+                return exprMayPend(i->cond) || stmtMayPend(i->thenBranch) ||
+                       stmtMayPend(i->elseBranch);
+            }
+            case StmtKind::While: {
+                auto* w = static_cast<WhileStmt*>(s);
+                return exprMayPend(w->cond) || stmtMayPend(w->body);
+            }
+            case StmtKind::Loop:
+                return stmtMayPend(static_cast<LoopStmt*>(s)->body);
+            case StmtKind::For: {
+                auto* f = static_cast<ForStmt*>(s);
+                return exprMayPend(f->start) || exprMayPend(f->end) ||
+                       exprMayPend(f->iterable) || stmtMayPend(f->body);
+            }
+            case StmtKind::Return:
+                return exprMayPend(static_cast<ReturnStmt*>(s)->value);
+            case StmtKind::Block: {
+                for (Stmt* st : static_cast<BlockStmt*>(s)->stmts)
+                    if (stmtMayPend(st)) return true;
+                return false;
+            }
+            default:
+                return false;
+        }
+    }
+
+    // 函数是否可能需要 pending flush。返回值类型是引用 / 可选时必须保留
+    // ARC（返回值要 retain + 登记给调用方）。递归调用保守视为需要。
+    bool fnMayPend(FuncDecl* fn) {
+        auto it = pendCache_.find(fn);
+        if (it != pendCache_.end()) return it->second;
+        if (!pendBusy_.insert(fn).second) return true;  // 递归：保守
+        bool r = tyMayPend(fn->retTy);
+        if (!r) r = stmtMayPend(fn->body);
+        pendBusy_.erase(fn);
+        pendCache_[fn] = r;
+        return r;
+    }
+
     void genFunc(FuncDecl* fn) {
         curFile = fn->file.empty() ? curSourceName : fn->file;
         curFnKey = keyOf(*fn);
@@ -2933,7 +3171,7 @@ struct NativeGen {
         // 不插桩 —— 它分配的对象由 luxrt_alloc 在运行时自动登记进 pending，
         // 由**调用方**的语句级 flush 回收；运行时自身插桩反而会与
         // luxrt_pend_mark 等底层函数递归打架。
-        arcOn = !inRuntime && g_nativeArc;
+        arcOn = !inRuntime && g_nativeArc && fnMayPend(fn);
         pushScope();
         pushArcScope();
         int n = (int)fn->params.size();

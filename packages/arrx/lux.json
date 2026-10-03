@@ -1,6 +1,6 @@
 {
   "name": "arrx",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "summary": "数组小工具：反转 / 求和 / 最值 / 查找 / 连接",
   "description": "纯 Lux 实现的数组辅助函数，覆盖 int / float / string 数组：arr_reverse_int、arr_reverse_str、arr_sum_int、arr_sum_float、arr_min_int、arr_max_int、arr_contains_int、arr_index_of_int、arr_contains_str、arr_index_of_str、arr_join。不修改传入数组。",
   "main": "lib.lux",
@@ -15,6 +15,6 @@
   "authors": [
     "Lux 社区"
   ],
-  "lux": ">=1.1.0",
+  "lux": ">=1.2.0",
   "deps": {}
 }

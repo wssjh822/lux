@@ -401,6 +401,14 @@ enum class Builtin {
     Map,           // map(a, f)           : R[]（f: fn(T)->R）
     Filter,        // filter(a, f)        : T[]（f: fn(T)->bool）
     MapOpt,        // map_opt(a, f)       : R[]?（f: fn(T)->R?，任一失败整体 none）
+    // ---- net 模块（1.2，双后端；socket fd 是裸 int，不参与 ARC） ----
+    NetDial,       // dial(host, port)    : int?（含 DNS-lite + connect）
+    NetSend,       // send(fd, data)      : int?（发送字节数；失败 none）
+    NetRecv,       // recv(fd, max)       : string?（最多 max 字节；""=EOF）
+    NetClose,      // close(fd)           : bool
+    NetListen,     // listen(port)        : int?（bind 0.0.0.0 + listen）
+    NetAccept,     // accept(lfd)         : int?
+    NetSetTimeout, // set_timeout(fd, s)  : bool（SO_RCVTIMEO/SO_SNDTIMEO）
     // ---- 原生后端特权内建（__ 前缀，0.6；仅 native 后端支持，运行时库专用，
     //      Sema 不检查参数个数与类型，返回类型除注明外均为 int） ----
     IntrSyscall,   // __syscall(nr, a1..a6)          : 系统调用
@@ -427,6 +435,17 @@ enum class Builtin {
     IntrSValA,     // __sval_a(p) -> int[]           : int 指针透传为数组
     IntrCall1,     // __call1(p, a) -> int           : 间接调用 1 参函数（1.1）
     IntrCall2,     // __call2(p, a, b) -> int        : 间接调用 2 参函数（1.1）
+    // ---- 网络系统调用（1.2）：x86-64 与 aarch64 的编号 / accept4 差异由后端吸收 ----
+    IntrSysSocket,     // __sys_socket(domain, type, proto)          : socket fd
+    IntrSysConnect,    // __sys_connect(fd, addr, len)               : 0 / -errno
+    IntrSysSendto,     // __sys_sendto(fd, buf, len, flags, addr, l) : 发送（addr=0 即 send）
+    IntrSysRecvfrom,   // __sys_recvfrom(fd, buf, len, flags, a, l)  : 接收
+    IntrSysBind,       // __sys_bind(fd, addr, len)                  : 0 / -errno
+    IntrSysListen,     // __sys_listen(fd, backlog)                  : 0 / -errno
+    IntrSysAccept,     // __sys_accept(fd, addr, len)                : 连接 fd
+    IntrSysSetsockopt, // __sys_setsockopt(fd, lvl, opt, val, len)   : 0 / -errno
+    IntrPoke16,        // __poke16(addr, off, v)                     : 写 2 字节（sockaddr_in）
+    IntrPoke32,        // __poke32(addr, off, v)                     : 写 4 字节（sockaddr_in）
 };
 
 struct Expr {

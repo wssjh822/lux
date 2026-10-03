@@ -38,6 +38,7 @@ mkdir -p "$STAGE/lux"
 tar -cf - -C "$ROOT" \
     --exclude='./build' --exclude='./.git' --exclude='./dist' \
     --exclude='./server/data' --exclude='./examples/*.c' \
+    --exclude='./建议.txt' \
     --exclude='./bench/primes_lux' --exclude='./bench/primes_lux_native' \
     --exclude='./bench/primes_c' --exclude='./bench/primes_nat_noarc' \
     Makefile README.md CHANGELOG.md LICENSE logo.svg index.html .gitignore \

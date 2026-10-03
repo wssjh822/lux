@@ -18,7 +18,8 @@
 | 错误通道 | `T?` / `?` 传播 / `or` 兜底（按左操作数类型分派）/ `name!` panic 变体；`int` / `float` / `read` 的失败返回 `none` |
 | 运行时错误 | 越界 / 除零 / 断言等 panic 的**文案格式**（见第 3 节） |
 | 诊断 | 错误码（`E0001`…/`W1001`…）与 `file:line:col` 定位格式 |
-| 标准库 | `math` / `time` / `system` / `file` / `string` 已列出的函数签名与行为；`find_opt(s, sub): int?`（0.9.4） |
+| 标准库 | `math` / `time` / `system` / `file` / `string` / `net` 已列出的函数签名与行为；`find_opt(s, sub): int?`（0.9.4） |
+| 网络 | `net` 七签名（`dial` / `send` / `recv` / `close` / `listen` / `accept` / `set_timeout`）与 `last_error()` 网络模板（见 `net.md`）——**不含 TLS/HTTPS** |
 | 错误消息 | `last_error(): string` —— 最近一次标准库失败的说明（0.9.4，无 import 即可用） |
 | 内存 | 引用计数（ARC）默认开启；`--no-arc` 退回只增不减语义（0.9.4） |
 | 命令行 | `luxc` 的既有选项（`-o` / `--run` / `--emit-c` / `--native` / `--arc` / `--no-arc` / `-O` …）与子命令 `build` / `repl` / 包管理 |
@@ -107,6 +108,15 @@ free list、`T?` 装箱回收、新增 `find_opt` 与 `last_error()` —— 均�
 | 1.1.0 | **纯新增**：`fn` 函数类型（具名函数引用）、`sort` / `map` / `filter` /
 `map_opt`、`byte_at` / `bytes` / `list_dir`，以及原生 ARC 提前离开块的释放 ——
 均为新增 API / 修复泄漏，不改变既有可观察行为；闭包 / lambda 仍不包含 |
+| 1.2.0 | **纯新增**：`import "net"` 与七个网络原语 + DNS-lite，`httpx` 包（包不属冻结面）；
+原生后端 ARC 插桩按需关闭（纯计算函数提速，不改变可观察行为）——
+不改既有签名 / 诊断 / 语义；**不含 TLS/HTTPS**（顺延 1.3 候选） |
+
+## 5.1 网络（1.2）的不包含清单
+
+TLS/HTTPS、IPv6/AAAA、`connect` 阶段超时、chunked 解码、keep-alive /
+连接池、gzip、重定向、异步 / epoll、UDP 收发对用户暴露、`net` 原语级函数外露。
+详见 [`net.md`](net.md) §5。
 
 ## 6. 0.9.2 拍板记录（不再骑墙）
 

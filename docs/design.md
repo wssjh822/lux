@@ -372,6 +372,57 @@ typedef struct lx_arr* lx_arr;
 **为什么不用 `named("Result")`**：可选类型是语言原语而非库类型，放进 TyKind
 后 intern 化 / 比较 / 诊断都自然延续，无需引入新的 struct 机制。
 
+### 2.9.1 函数值 `fn` 类型（1.1，补记）
+
+`TyKind::Fn` 的 `elem` 存返回类型、`members` 存参数类型，由
+`TyStore::fnOf` intern。函数值在**两个后端**都只是一个 8 字节代码地址：
+
+- **C 后端**：`cType(fn(T)->R)` 生成 `typedef R (*fn_i)(T);`（在
+  `fnTdAnchor` 处集中插入），具名函数取值就是函数名，间接调用直接
+  `f(a, b)`；不产生堆对象，不碰 ARC。
+- **原生后端**：取值即函数代码地址（`mov rax, <symLabel>`），间接调用经
+  特权内建 `__call1` / `__call2` 翻译为 `call r/m`（x86-64）/ `blr`（aarch64）。
+  参数仍按栈约定求值后调用，故 `__callN` 必须按 N 调整栈。
+- `extern fn` 不能作值（原生后端没有 C 符号）；无 lambda / 闭包。
+
+`sort` / `map` / `filter` / `map_opt` 均在**调用点展开**（C 后端直接生成
+循环，原生后端调 `luxrt_sort` / `luxrt_map` / `luxrt_filter` /
+`luxrt_map_opt`，函数以代码地址传入）。详见 `docs/fn.md`。
+
+### 2.10 net 模块（1.2）
+
+网络是 1.2 唯一的主题，取「stdlib `net` + 纯 Lux `httpx` 包」双轨。
+
+**编译期**：`Builtin` 加 7 个 `Net*`；`sema.cpp` 的 `builtinTable()` /
+`builtinModule()`（返回 `"net"`）/ `checkBuiltinCall()` 登记参数与返回类型；
+`loader.cpp` 的标准库名单加 `"net"`。**零新语法、零新 AST 节点**。
+
+**C 后端**：`kRuntime` 里补 `lx_net_*`（libc socket 家族）+ C 版 DNS-lite，
+`callExpr` 加 7 个发射分支。`T?` 返回值统一走 `lx_opt_alloc` 装箱。
+
+**原生后端**：
+
+- 特权内建 `__sys_socket` / `__sys_connect` / `__sys_sendto` /
+  `__sys_recvfrom` / `__sys_bind` / `__sys_listen` / `__sys_accept` /
+  `__sys_setsockopt`，以及 `__poke16` / `__poke32`（写 `sockaddr_in` 的
+  2/4 字节字段）。参数计数 / void 判定在 `sema.cpp` 的特权内建表登记。
+- 发射器新增 `sysSocket()` … `sysSetsockopt()` 与 `store16Reg` / `store32Reg`
+  （x86-64 `mov word/dword ptr`，aarch64 `strh` / `str`）。**架构差异在发射器
+  吸收**（与 `__sys_open → openat` 同款）：`accept` 在 aarch64 走
+  `accept4(fd, addr, len, 0)`（`__NR_accept4 = 202`），其余 syscall 号按架构给出。
+- `native_rt.lux` 补 `luxrt_sockaddr_in` / DNS-lite（`__peek8u` 解析 UDP 应答、
+  CNAME 最多 8 跳）与 7 个 `luxrt_net_*`；`native_rt_embed.h` 构建期重生成。
+
+**内存**：socket fd 是裸 int，不进 pending、不 retain / release。
+
+**行为对齐**：靠 `tests/run_tests.sh` 的网络差分 —— C/Native × client/server
+对角矩阵 + `set_timeout` 超时文案逐字节一致。详见 `docs/net.md`。
+
+**性能（1.2 顺带）**：原生后端新增 `fnMayPend` 分析，对**函数体不会创建堆对象、
+且只调用同类函数**的纯计算函数关闭 ARC 插桩（省掉每条语句的
+`luxrt_pend_flush_to`）。ARC 只影响内存回收，不影响可观察行为；素数基准因此
+从 4.10s 降到 1.09s（等同 `--no-arc`，约为手写 C 的 3.1×）。
+
 ---
 
 ## 3. 加一个新语法特性：清单
@@ -453,8 +504,8 @@ struct Ty {
 3. **错误通道**：✅ **0.8 已落地**（见 2.9）——类型走新增的 `TyKind::Optional`
    （复用 `elem` 字段）而非 `tupleOf` / `Result`，`T?` / `?` 传播 / `or` 兜底 /
    `name!` panic 均已双后端一致；`read()` / `int("abc")` 已迁移到统一失败语义。
-4. **高阶函数 / 泛型**：类型走 `fnOf(ret, params)`；`sort(arr, cmp)`、
-   `map/filter` 都靠它。**拍板不进 1.0**（见 `docs/stability.md` §6.2），留到 1.x。
+4. **高阶函数 / 泛型**：类型走 `fnOf(ret, params)`；`sort` / `map` / `filter`
+   都靠它。**1.1 已落地 `fn` 类型与三件套**（见 2.9.1）；泛型仍留 1.x。
 
 ## 7. 诊断信息
 
@@ -532,7 +583,7 @@ make test
    `T?` 装箱槽参与回收**。剩余仅有 `docs/arc.md` §2.4 列出的「只泄漏、
    不误释放」缺口。
 3. **高阶函数 / `fn` 类型**：`fn(T,...) -> R` 类型与 `sort` / `map` / `filter`；
-   类型表已有 `TyKind::Fn` 备用。**不进 1.0**，留到 1.x。
+   **1.1 已落地**（见 2.9.1），泛型留 1.x。
 4. **原生后端**：`codegen.cpp` 目前是唯一依赖 C 编译器的环节。
    抽象出一个 `Backend` 接口后，可以并列实现 x86-64 汇编或 LLVM IR 后端。
 5. **aarch64 数学末位对齐（C5）**：x86-64 侧 0.9.4 已把 `asin` / `acos`
@@ -540,3 +591,6 @@ make test
    aarch64 侧 `cos` / `tan` / `atan` / `atan2` 的末位对齐仍待有 aarch64
    机器的版本验证；
    大数浮点格式化（`bigE ≥ 0`）已在 0.8 修正。
+6. **网络**：`net` + `httpx` 已在 1.2 落地（见 2.10）；TLS/HTTPS、IPv6、
+   `connect` 阶段超时、chunked / keep-alive / gzip / 重定向均明确不做，
+   留 1.3 候选。

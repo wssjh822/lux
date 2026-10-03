@@ -1,0 +1,179 @@
+// =============================================================================
+//  httpx — Lux 极简 HTTP 客户端（包 v1，2026 / 1.2）
+//
+//  第一行写明：无 TLS，仅 HTTP。URL 必须以 http:// 开头，https:// 直接返回 none。
+//
+//  设计（1.2 冻结）：
+//    * 统一发 Connection: close，读到 EOF 为止 —— 绕开 chunked 解码与
+//      keep-alive 状态机；不做 gzip、不做重定向。
+//    * 只用 net 模块的 7 个原语与 string 模块；响应解析（parse_response）
+//      是纯字符串函数，可用构造输入做零网络单元测试。
+// =============================================================================
+import "net";
+import "string";
+
+struct HttpResponse {
+    status: int;
+    reason: string;
+    header_keys: string[];
+    header_vals: string[];
+    body: string;
+}
+
+// URL 解析：仅 http://，返回 [host, port, path]；解析失败 none
+fn parse_url(url: string) -> string[]? {
+    if !startswith(url, "http://") {
+        return none;
+    }
+    let rest = substr(url, 7, len(url) - 7);
+    if rest == "" {
+        return none;
+    }
+    let hostport = rest;
+    let path = "/";
+    let slash = find(rest, "/");
+    if slash >= 0 {
+        hostport = substr(rest, 0, slash);
+        path = substr(rest, slash, len(rest) - slash);
+    }
+    if hostport == "" {
+        return none;
+    }
+    let host = hostport;
+    let port = 80;
+    let colon = find(hostport, ":");
+    if colon >= 0 {
+        host = substr(hostport, 0, colon);
+        let p = int(substr(hostport, colon + 1, len(hostport) - colon - 1)) or 0;
+        if p <= 0 {
+            return none;
+        }
+        port = p;
+    }
+    if host == "" {
+        return none;
+    }
+    return [host, string(port), path];
+}
+
+// 响应解析（纯字符串，无网络）：状态行 + 并行数组头 + body
+fn parse_response(raw: string) -> HttpResponse? {
+    if raw == "" {
+        return none;
+    }
+    let hdrEnd = find(raw, "\r\n\r\n");
+    let sepLen = 4;
+    if hdrEnd < 0 {
+        // 容忍只用 LF 分隔的服务端
+        hdrEnd = find(raw, "\n\n");
+        sepLen = 2;
+    }
+    let head = raw;
+    let body = "";
+    if hdrEnd >= 0 {
+        head = substr(raw, 0, hdrEnd);
+        body = substr(raw, hdrEnd + sepLen, len(raw) - hdrEnd - sepLen);
+    }
+    let lines = split(head, "\r\n");
+    if len(lines) <= 1 {
+        lines = split(head, "\n");
+    }
+    if len(lines) == 0 || trim(lines[0]) == "" {
+        return none;
+    }
+    let sp1 = find(lines[0], " ");
+    if sp1 < 0 {
+        return none;
+    }
+    let rest = substr(lines[0], sp1 + 1, len(lines[0]) - sp1 - 1);
+    let sp2 = find(rest, " ");
+    let codeStr = rest;
+    let reason = "";
+    if sp2 >= 0 {
+        codeStr = substr(rest, 0, sp2);
+        reason = substr(rest, sp2 + 1, len(rest) - sp2 - 1);
+    }
+    let status = int(trim(codeStr)) or 0;
+    if status <= 0 {
+        return none;
+    }
+    let keys: string[] = [];
+    let vals: string[] = [];
+    let i = 1;
+    while i < len(lines) {
+        let line = lines[i];
+        if line != "" {
+            let c = find(line, ":");
+            if c >= 0 {
+                keys.push(trim(substr(line, 0, c)));
+                vals.push(trim(substr(line, c + 1, len(line) - c - 1)));
+            }
+        }
+        i = i + 1;
+    }
+    return HttpResponse {
+        status: status,
+        reason: reason,
+        header_keys: keys,
+        header_vals: vals,
+        body: body
+    };
+}
+
+// 取响应头（大小写不敏感）；不存在 none
+fn header(resp: HttpResponse, name: string) -> string? {
+    let want = lower(name);
+    let i = 0;
+    while i < len(resp.header_keys) {
+        if lower(resp.header_keys[i]) == want {
+            return resp.header_vals[i];
+        }
+        i = i + 1;
+    }
+    return none;
+}
+
+// 发一次请求并读到 EOF。失败（URL 非法 / 连接失败 / 收包失败）→ none
+fn request(url: string, method: string, body: string,
+           content_type: string) -> HttpResponse? {
+    let u = parse_url(url)?;
+    let host = u[0];
+    let port = int(u[1]) or 80;
+    let path = u[2];
+    let fd = dial(host, port)?;
+    let req = method + " " + path + " HTTP/1.0\r\n" +
+              "Host: " + host + "\r\n" +
+              "Connection: close\r\n" +
+              "User-Agent: lux-httpx/1.2\r\n";
+    if method == "POST" {
+        req += "Content-Type: " + content_type + "\r\n";
+        req += "Content-Length: " + string(len(body)) + "\r\n";
+    }
+    req += "\r\n";
+    if method == "POST" {
+        req += body;
+    }
+    let sent = send(fd, req) or 0 - 1;
+    if sent < 0 {
+        close(fd);
+        return none;
+    }
+    let raw = "";
+    loop {
+        let chunk = recv(fd, 65536)?;
+        if chunk == "" {
+            break;
+        }
+        raw += chunk;
+    }
+    close(fd);
+    return parse_response(raw);
+}
+
+fn get(url: string) -> HttpResponse? {
+    return request(url, "GET", "", "");
+}
+
+fn post(url: string, body: string, content_type: string) -> HttpResponse? {
+    return request(url, "POST", body, content_type);
+}

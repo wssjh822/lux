@@ -3,6 +3,76 @@
 本文件记录各版本的改动。0.1 → 0.2 → 0.3 的内容从 git 历史整理而来，
 0.4 起每个版本都会在这里登记。
 
+## 1.2.0
+
+**网络**。1.2 的主题是 `net`：标准库新增七个 TCP 原语（`dial` / `send` /
+`recv` / `close` / `listen` / `accept` / `set_timeout`）与内置 DNS-lite，
+并在其之上提供纯 Lux 的 `httpx` 包。**零新语法、零 ARC 侵入、双后端必达、
+外网零依赖**。顺手把原生后端生成的纯计算可执行文件提速约 3.8×。
+**全部 250 项回归测试通过**（新增网络差分与 httpx 解析）。
+
+### A. 标准库 `net`（双后端）
+
+```lux
+import "net";
+
+let fd = dial("example.com", 80)!;   // DNS-lite + connect
+send(fd, "GET / HTTP/1.0\r\n\r\n");
+let body = recv(fd, 65536) or "";
+close(fd);
+```
+
+- **七个函数**：`dial(host, port) -> int?`、`send(fd, data) -> int?`、
+  `recv(fd, max) -> string?`、`close(fd) -> bool`、`listen(port) -> int?`、
+  `accept(lfd) -> int?`、`set_timeout(fd, secs) -> bool`（`SO_RCVTIMEO` /
+  `SO_SNDTIMEO`）。原语级 `socket` / `bind` / 裸 `connect` 不暴露。
+- **DNS-lite（双实现）**：`/etc/hosts` → `/etc/resolv.conf` 第一个
+  `nameserver` → 53/udp A 记录查询，跟随 CNAME（上限 8 跳），只做 IPv4。
+  C 后端与原生后端各实现一遍同一算法，靠回环差分对齐。
+- **socket fd 是裸 int，完全不碰 ARC**；`recv` 内部缓冲上限 1 MiB。
+- **`last_error()` 新增模板**（两后端逐字一致）：
+  `net.dial 失败：无法解析主机 '<host>' / 连接被拒绝 / 网络不可达`、
+  `net.send 失败：连接已断开`、`net.recv 失败：超时`、
+  `net.listen 失败：端口已被占用`、`net.accept 失败：无法接受连接`。
+- 设计草案见 [`docs/net.md`](docs/net.md)。
+
+### B. `httpx` 包（纯 Lux，狗粮 bytes / net）
+
+- `get(url) -> HttpResponse?`、`post(url, body, content_type) -> HttpResponse?`、
+  `header(resp, name) -> string?`、`parse_response(raw) -> HttpResponse?`；
+  `struct HttpResponse { status; reason; header_keys; header_vals; body; }`。
+- v1 统一发 `Connection: close` 读到 EOF，绕开 chunked 与 keep-alive；
+  响应解析是纯字符串函数，可零网络单测。
+- **仅 HTTP，无 TLS/HTTPS**：URL 必须以 `http://` 开头。
+
+### C. 原生后端性能：ARC 插桩按需关闭
+
+- 新增 `fnMayPend` 分析：**函数体不会创建堆对象、且只调用同类函数**的
+  纯计算函数，关闭 ARC 插桩（省掉每条语句的 `luxrt_pend_flush_to`）。
+  ARC 只影响内存回收，不影响可观察行为；churn 内存回归仍保持常驻。
+- 素数基准（2..2,000,000，aarch64）：原生后端 **4.10s → 1.09s**（约 3.8×），
+  从手写 C 的 11.75× 降到约 3.1×。
+
+### D. 测试与版本
+
+- `tests/run_tests.sh` 新增「网络差分」：`tests/net/` 的 server / client 双后端
+  各编一份，跑出 **C/Native × client/server 对角矩阵**，并校验
+  `set_timeout` + `recv` 超时文案逐字节一致（全程回环、超时保护）。
+- 新增 `tests/cases/net_dial_refused` / `net_hosts_resolve` / `net_dns_lite`，
+  `tests/errors/net_bad_args` / `net_unknown_fn`，`tests/pkgs/httpx_test`。
+- 版本号链对齐 `1.2.0`：`Makefile`、五个既有包 + 新 `httpx`、
+  `server/lib.php`、`server/lux.php`、`server/index.php`、`site/index.php`、
+  `index.html`。
+
+### E. 文档与明确不做
+
+- 新增 [`docs/net.md`](docs/net.md)；同步 `stability.md`（§1 承诺加 net、
+  §5.1 不包含清单）、`language.md`（§11 / §13 / §15）、`design.md`（§2.9.1 / §2.10）、
+  `arc.md`（1.1 关账 + socket 不参与 ARC）、`fn.md`（笔误）。
+- **1.2 不做**：TLS/HTTPS、IPv6/AAAA、`connect` 阶段超时、chunked 解码、
+  keep-alive / 连接池、gzip、重定向、异步 / epoll、UDP 对用户暴露、
+  闭包、`map<K,V>`。
+
 ## 1.1.0
 
 **函数成为值**。1.1 的主题是 `fn` 类型：**具名函数可以作为值传递**

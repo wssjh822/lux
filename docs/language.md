@@ -1,6 +1,6 @@
 # Lux 语言教程（面向人与 AI）
 
-> 版本：Lux 1.1.0。目标读者是**第一次接触 Lux 的程序员**，以及**需要生成
+> 版本：Lux 1.2.0。目标读者是**第一次接触 Lux 的程序员**，以及**需要生成
 > Lux 代码的 AI**。读完本文你应当能独立写出正确的 Lux 程序。
 >
 > 配套文档：
@@ -654,6 +654,14 @@ fmod hypot trunc isnan isinf random seed min max`，以及常量
 **file**：`read(path)` → `string?`、`write(path, data)`、`append(path, data)`、
 `exists(path)`、`remove(path)`、`rename(from, to)`。
 
+**net**（`import "net";`，1.2）：`dial(host, port)` → `int?`（含 DNS-lite）、
+`send(fd, data)` → `int?`、`recv(fd, max)` → `string?`、`close(fd)` → `bool`、
+`listen(port)` → `int?`、`accept(lfd)` → `int?`、`set_timeout(fd, secs)` → `bool`。
+`socket` fd 是裸 `int`，不参与 ARC；失败原因读 `last_error()`。
+**没有 TLS/HTTPS**：官方 `httpx` 包（`luxc install httpx`）只支持 `http://`，
+提供 `get(url)` / `post(url, body, content_type)` / `header(resp, name)`，
+返回 `HttpResponse`（`status` / `reason` / `header_keys` / `header_vals` / `body`）。
+
 **string**：`contains startswith endswith find replace trim upper lower
 substr(s, start, len) split(s, sep) chars(s) join(arr, sep)`。
 注意 `find` 找不到返回 `-1`；`substr` / `chars` / `split` 都按**字节**处理。
@@ -676,8 +684,8 @@ substr(s, start, len) split(s, sep) chars(s) join(arr, sep)`。
 - 原生后端按 `docs/arc.md` §2.3 实现了**尺寸分级 free list**（2 的幂分级 +
   bss 桶 + 无锁），`--arc --native` 不再报错。
 - 仍存的最小缺口（只泄漏、不误释放）：`main(argv)` 的 argv 数组是一次性
-  泄漏；原生后端在 `break` / `continue` / `return` 提前离开块时不释放该块
-  已声明的引用型局部。详见 [arc.md](arc.md) §2.4。
+  泄漏。1.1 已修复原生后端 `break` / `continue` / `return` 提前离开块时
+  不释放该块引用型局部的问题。详见 [arc.md](arc.md) §2.4。
 - 无论 ARC 开还是关，**可观察行为完全一致**（输出、panic 文案逐字节相同）。
 
 写字符串拼接密集的代码时（如序列化器），优先用一个字符串变量累加：
@@ -689,8 +697,8 @@ for c in chars(s) {
 }
 ```
 
-> 目前没有 `StringBuilder`、没有 `map<K,V>`、没有泛型、没有 `fn` 类型 /
-> `map`/`filter`/`sort` 高阶函数——这些都是 1.x 的内容。别写它们。
+> 目前没有 `map<K,V>`、没有泛型、没有闭包 / lambda。`fn` 函数类型、
+> `sort` / `map` / `filter` / `map_opt` 已在 1.1 落地（见 §6.2），可以放心使用。
 
 ---
 
@@ -728,6 +736,12 @@ println(len("中文"));    // 6（UTF-8 每字 3 字节）
 
 // 拼接用 +，比较用 ==（字符串）
 let ok = lower(name) == "lux";
+
+// 发一个 HTTP 请求（1.2；文件顶部 import "httpx"; 并先 luxc install httpx）
+// 注意：无 TLS，URL 必须以 http:// 开头
+let r = get("http://example.com/")!;
+println(r.status);
+println(header(r, "Content-Type") or "?");
 ```
 
 ### 13.1 常见陷阱
@@ -767,7 +781,7 @@ lux: （如果是递归函数，也可能是调用层数过深导致栈溢出）
 
 ## 15. 给 AI 的约束清单（生成 Lux 代码前必读）
 
-1. 目标版本 **1.1.0**；只使用本文与 `docs/grammar.md` 里出现的语法。
+1. 目标版本 **1.2.0**；只使用本文与 `docs/grammar.md` 里出现的语法。
 2. **不要**使用：泛型、`map<K,V>`/`set`、闭包/lambda、`class`/继承、
    `interface`/trait、异常、`switch`/`match`、`for (;;)`、`do/while`、
    可变全局变量、无符号整数、`++x` 表达式、字符串插值、`null`（用 `none`）、
@@ -787,7 +801,9 @@ lux: （如果是递归函数，也可能是调用层数过深导致栈溢出）
 11. 数组方法只在数组**变量**上调用（`a.push(x)`），不能 `f().push(x)` 或
     `obj.arr.push(x)`（先 `let t = obj.arr; t.push(x); obj.arr = t;`）。
 12. 需要“可能缺失的结构体”用 `Point?`；不能声明未初始化的 struct 变量。
-13. 包名/版本：`lux.json` 里 `main` 指向入口 `.lux` 文件，`files` 列出要打包的文件。
+13. 包名 / 版本：`lux.json` 里 `main` 指向入口 `.lux` 文件，`files` 列出要打包的文件。
+   网络只有 `http://`：**没有 HTTPS/TLS**，URL 必须以 `http://` 开头；
+   `net` 只支持 IPv4，服务端顺序 accept，无并发。
 14. 输出用 `print`/`println`（不要 `printf`）；格式化用 `format("{}", x)`。
 15. 不确定行为时，优先选择更保守的写法，并保持类型完全一致，避免隐式转换
     （唯一允许的是 `int→float` 与 `T→T?`）。

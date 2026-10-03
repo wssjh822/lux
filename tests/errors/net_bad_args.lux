@@ -1,0 +1,7 @@
+// net_bad_args —— net.send 第一个参数必须是 int
+import "net";
+
+fn main() {
+    let n = send("x", 1);
+    println(n);
+}

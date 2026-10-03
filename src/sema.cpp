@@ -82,6 +82,11 @@ const std::unordered_map<std::string, Builtin>& builtinTable() {
         {"byte_at", Builtin::ByteAt},
         {"bytes", Builtin::Bytes},
         {"list_dir", Builtin::ListDir},
+        // net 模块（1.2）
+        {"dial", Builtin::NetDial},       {"send", Builtin::NetSend},
+        {"recv", Builtin::NetRecv},       {"close", Builtin::NetClose},
+        {"listen", Builtin::NetListen},   {"accept", Builtin::NetAccept},
+        {"set_timeout", Builtin::NetSetTimeout},
         {"map", Builtin::Map},
         {"filter", Builtin::Filter},
         {"map_opt", Builtin::MapOpt},
@@ -150,6 +155,14 @@ const char* builtinModule(Builtin b) {
         case Builtin::StrChars:
         case Builtin::StrJoin:
             return "string";
+        case Builtin::NetDial:
+        case Builtin::NetSend:
+        case Builtin::NetRecv:
+        case Builtin::NetClose:
+        case Builtin::NetListen:
+        case Builtin::NetAccept:
+        case Builtin::NetSetTimeout:
+            return "net";
         default:
             return nullptr;
     }
@@ -1289,6 +1302,17 @@ struct Analyzer {
                 {"__sval_a", Builtin::IntrSValA},
                 {"__call1", Builtin::IntrCall1},
                 {"__call2", Builtin::IntrCall2},
+                // 网络系统调用（1.2）
+                {"__sys_socket", Builtin::IntrSysSocket},
+                {"__sys_connect", Builtin::IntrSysConnect},
+                {"__sys_sendto", Builtin::IntrSysSendto},
+                {"__sys_recvfrom", Builtin::IntrSysRecvfrom},
+                {"__sys_bind", Builtin::IntrSysBind},
+                {"__sys_listen", Builtin::IntrSysListen},
+                {"__sys_accept", Builtin::IntrSysAccept},
+                {"__sys_setsockopt", Builtin::IntrSysSetsockopt},
+                {"__poke16", Builtin::IntrPoke16},
+                {"__poke32", Builtin::IntrPoke32},
             };
             auto iit = intrinsics.find(c->callee);
             if (iit != intrinsics.end()) {
@@ -1312,6 +1336,11 @@ struct Analyzer {
                         {"__seed_set", {1, 1}},   {"__sptr", {1, 1}},
                         {"__sval", {1, 1}},       {"__sval_a", {1, 1}},
                         {"__call1", {2, 2}},      {"__call2", {3, 3}},
+                        {"__sys_socket", {3, 3}},     {"__sys_connect", {3, 3}},
+                        {"__sys_sendto", {6, 6}},     {"__sys_recvfrom", {6, 6}},
+                        {"__sys_bind", {3, 3}},       {"__sys_listen", {2, 2}},
+                        {"__sys_accept", {3, 3}},     {"__sys_setsockopt", {5, 5}},
+                        {"__poke16", {3, 3}},         {"__poke32", {3, 3}},
                     };
                 auto ait = arity.find(c->callee);
                 if (ait != arity.end()) {
@@ -1344,6 +1373,8 @@ struct Analyzer {
                 // 按"+1 结果槽"约定多清 8 字节，破坏栈平衡）
                 bool isVoidIntr = (c->builtin == Builtin::IntrPoke64 ||
                                    c->builtin == Builtin::IntrPoke8 ||
+                                   c->builtin == Builtin::IntrPoke16 ||
+                                   c->builtin == Builtin::IntrPoke32 ||
                                    c->builtin == Builtin::IntrMemCopy ||
                                    c->builtin == Builtin::IntrSeedSet);
                 c->ty = isVoidIntr
@@ -1977,6 +2008,76 @@ struct Analyzer {
                     typeError(c->args[0]->loc, argTys[0], tString,
                               "list_dir() 的参数必须是 string");
                 return c->ty;
+            }
+
+            // ---- net 模块（1.2）：全部检查参数类型与个数 ----
+            case Builtin::NetDial: {
+                c->ty = TyStore::optionalOf(tInt);
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tString)
+                    typeError(c->args[0]->loc, argTys[0], tString,
+                              "dial() 的第一个参数（主机名）必须是 string");
+                if (argTys[1] != tInvalid && argTys[1] != tInt)
+                    typeError(c->args[1]->loc, argTys[1], tInt,
+                              "dial() 的第二个参数（端口）必须是 int");
+                return c->ty;
+            }
+            case Builtin::NetSend: {
+                c->ty = TyStore::optionalOf(tInt);
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tInt)
+                    typeError(c->args[0]->loc, argTys[0], tInt,
+                              "send() 的第一个参数（fd）必须是 int");
+                if (argTys[1] != tInvalid && argTys[1] != tString)
+                    typeError(c->args[1]->loc, argTys[1], tString,
+                              "send() 的第二个参数必须是 string");
+                return c->ty;
+            }
+            case Builtin::NetRecv: {
+                c->ty = TyStore::optionalOf(tString);
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tInt)
+                    typeError(c->args[0]->loc, argTys[0], tInt,
+                              "recv() 的第一个参数（fd）必须是 int");
+                if (argTys[1] != tInvalid && argTys[1] != tInt)
+                    typeError(c->args[1]->loc, argTys[1], tInt,
+                              "recv() 的第二个参数（最大字节数）必须是 int");
+                return c->ty;
+            }
+            case Builtin::NetClose: {
+                c->ty = tBool;
+                if (!arity(1)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tInt)
+                    typeError(c->args[0]->loc, argTys[0], tInt,
+                              "close() 的参数（fd）必须是 int");
+                return tBool;
+            }
+            case Builtin::NetListen: {
+                c->ty = TyStore::optionalOf(tInt);
+                if (!arity(1)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tInt)
+                    typeError(c->args[0]->loc, argTys[0], tInt,
+                              "listen() 的参数（端口）必须是 int");
+                return c->ty;
+            }
+            case Builtin::NetAccept: {
+                c->ty = TyStore::optionalOf(tInt);
+                if (!arity(1)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tInt)
+                    typeError(c->args[0]->loc, argTys[0], tInt,
+                              "accept() 的参数（监听 fd）必须是 int");
+                return c->ty;
+            }
+            case Builtin::NetSetTimeout: {
+                c->ty = tBool;
+                if (!arity(2)) return tInvalid;
+                if (argTys[0] != tInvalid && argTys[0] != tInt)
+                    typeError(c->args[0]->loc, argTys[0], tInt,
+                              "set_timeout() 的第一个参数（fd）必须是 int");
+                if (argTys[1] != tInvalid && !isNumeric(argTys[1]))
+                    typeError(c->args[1]->loc, argTys[1], tFloat,
+                              "set_timeout() 的第二个参数（秒）必须是 int 或 float");
+                return tBool;
             }
 
             case Builtin::Map: {

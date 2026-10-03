@@ -1,0 +1,20 @@
+// tests/net/client_timeout.lux —— set_timeout + recv 超时返回 none
+// 用法: client_timeout <端口>
+import "net";
+
+fn main(argv: string[]) {
+    let port = int(argv[1]) or 0;
+    let fd = dial("127.0.0.1", port) or 0;
+    if fd == 0 {
+        println("dial failed: " + last_error());
+        exit(1);
+    }
+    set_timeout(fd, 1.0);
+    let r = recv(fd, 64) or "__NONE__";
+    if r == "__NONE__" {
+        println("timeout: " + last_error());
+    } else {
+        println("unexpected: " + r);
+    }
+    close(fd);
+}

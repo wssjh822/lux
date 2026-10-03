@@ -51,7 +51,7 @@ fnType := 'fn' '(' [ type (',' type)* ] ')' '->' type
 | `sort` | **方法** `a.sort(cmp)` | 原地排序；按 D1「改接收者就用方法」。运行时按元素类型泛化（memcpy 交换 + 比较器） |
 | `map` | 裸函数 `map(a, f)` | 调用点展开循环，输出数组的元素类型由 `f` 的返回类型在编译期确定 |
 | `filter` | 裸函数 `filter(a, f)` | 条件 `f` 返回 `bool`，保留为真的元素 |
-| `map_opt` | `map_opt(arr: T[], f: fn(T) -> R?) -> R[]?` | **任一无素失败整体返回 `none`**（Rust collect 风格）；`R[]?` 是合法类型，与 `?` 传播自然组合，绕开「`T?` 不能作数组元素」 |
+| `map_opt` | `map_opt(arr: T[], f: fn(T) -> R?) -> R[]?` | **任一元素失败整体返回 `none`**（Rust collect 风格）；`R[]?` 是合法类型，与 `?` 传播自然组合，绕开「`T?` 不能作数组元素」 |
 
 命名遵循 D1：`map` / `filter` 不改接收者 → 裸函数；`sort` 改接收者 → 方法。
 

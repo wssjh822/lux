@@ -64,6 +64,12 @@ fn main(argv: string[]) {
 **字节视角原语 `byte_at` / `bytes`**、**`list_dir`**、原生 ARC 提前离开块
 的引用释放修复，以及 **REPL 彩色 / 补全** 与 **下载器进度条 / 依赖升级**。
 见 [docs/fn.md](docs/fn.md)。
+**1.2.0 是「网络」版**：标准库新增 [`net`](docs/net.md) —— `dial` / `send` /
+`recv` / `close` / `listen` / `accept` / `set_timeout` 七个 TCP 原语 + 内置
+DNS-lite（`/etc/hosts` → UDP A 查询），并在其上提供纯 Lux 的 **`httpx`** 包；
+**零新语法、零 ARC 侵入、双后端逐字节一致**。顺手把原生后端**纯计算函数**的
+ARC 插桩按需关闭（素数基准 **4.10s → 1.09s**，约 3.8×）。
+**无 TLS/HTTPS**（顺延 1.3）。
 
 ```lux
 // scores.lux —— 0.5 的数组与 for-in
@@ -827,7 +833,7 @@ fn main() {
 
 ## 标准库
 
-Lux 自带五个标准库模块，用 `import` 引入后才能使用其中的函数：
+Lux 自带六个标准库模块，用 `import` 引入后才能使用其中的函数：
 
 ```lux
 import "math";
@@ -835,6 +841,7 @@ import "time";
 import "system";
 import "file";
 import "string";
+import "net";     // 1.2
 ```
 
 ### math
@@ -900,6 +907,25 @@ import "string";
 | `split(s, sep)` | `(string, string) → string[]` | **0.5 新增**：按分隔符切分成数组（空分隔符会 panic） |
 | `chars(s)` | `string → string[]` | **0.5 新增**：拆成单字节字符数组 |
 | `join(arr, sep)` | `(string[], string) → string` | **0.5 新增**：用分隔符把字符串数组拼接成一个字符串 |
+
+### net（1.2）
+
+| 函数 | 签名 | 说明 |
+| --- | --- | --- |
+| `dial(host, port)` | `(string, int) → int?` | 解析主机（DNS-lite）+ `connect`，返回 socket fd |
+| `send(fd, data)` | `(int, string) → int?` | 发送全部字节，返回发送字节数 |
+| `recv(fd, max)` | `(int, int) → string?` | 最多读 `max` 字节；`""` = EOF；失败 `none` |
+| `close(fd)` | `int → bool` | 关闭 fd |
+| `listen(port)` | `int → int?` | `bind 0.0.0.0` + `listen`，返回监听 fd |
+| `accept(lfd)` | `int → int?` | 等待并返回连接 fd（**顺序处理，无并发**） |
+| `set_timeout(fd, secs)` | `(int, float) → bool` | 设置 `SO_RCVTIMEO` / `SO_SNDTIMEO` |
+
+- **DNS-lite**：IP 字面量 → `/etc/hosts` → `/etc/resolv.conf` 第一个 nameserver →
+  53/udp A 记录查询（跟随 CNAME，上限 8 跳）。**只做 IPv4**。
+- **socket fd 是裸 `int`，不参与 ARC**；`recv` 缓冲上限 1 MiB；失败原因读 `last_error()`
+  （如 `net.dial 失败：连接被拒绝` / `net.recv 失败：超时`）。
+- **`httpx` 包**（`luxc install httpx`）：`get` / `post` / `header` /
+  `parse_response`，`struct HttpResponse`；仅 `http://`，发 `Connection: close` 读到 EOF。
 
 ---
 
@@ -1028,7 +1054,13 @@ lux/
    常规范围与 libm 一致，但 `cos` / `tan` / `asin` / `atan` / `atan2` 在
    **末位** 仍可能不同（C5，待校准）；`format()` 在原生后端要求第一个参数
    是字符串字面量，`-O` 对 `--native` 无效。
-8. 只支持 POSIX 平台（Linux / macOS），Windows 请用 WSL / MSYS2。
+   1.2 起原生后端对不创建堆对象的纯计算函数关闭 ARC 插桩，素数基准从
+   手写 C 的 ~11.8× 降到 ~3.1×（仍慢于 C 后端，因为它是无寄存器分配的
+   栈式代码生成）。
+8. **网络没有 TLS/HTTPS**：`net` 与 `httpx` 只支持明文 `http://`；也没有
+   IPv6、`connect` 阶段超时、chunked / keep-alive / gzip / 重定向。服务端
+   顺序 `accept`，无并发（需要时可自行 fork）。
+9. 只支持 POSIX 平台（Linux / macOS），Windows 请用 WSL / MSYS2。
 
 ---
 
@@ -1084,9 +1116,12 @@ lux/
 - [x] **高阶三件套 `sort` / `map` / `filter` / `map_opt`**（1.1）
 - [x] **字节原语 `byte_at` / `bytes` 与 `list_dir`**（1.1）
 - [x] **原生 ARC 提前离开块释放修复 + REPL 彩色 / 下载器进度条**（1.1）
-- [ ] 闭包 / lambda（1.2+）
+- [x] **`net` 标准库（七个 TCP 原语 + DNS-lite）与 `httpx` 包**（1.2）
+- [x] **原生后端纯计算函数关闭 ARC 插桩（素数基准 4.10s → 1.09s）**（1.2）
+- [ ] TLS / HTTPS（1.3 候选）
+- [ ] 闭包 / lambda（1.3 候选）
 - [ ] aarch64 原生数学末位对齐（C5）
-- [ ] 标准库扩展：`net` 模块、文件 IO 增强
+- [ ] 文件 IO 增强（目录遍历 / 文件元数据）
 - [x] 原生代码生成后端：`--native` 直出 Linux ELF（x86-64 与 aarch64），运行时
   由 Lux 自身实现（约 100 个 `luxrt_*` 函数），不依赖 C 编译器与 libc（0.6）
 - [ ] 枚举与模式匹配
@@ -1095,8 +1130,8 @@ lux/
 ### 1.0 不包含（提前声明，管理预期）
 
 泛型、`map<K,V>`、无符号整数、并发、Windows、LLVM 后端。ARC 双后端默认
-开启已在 0.9.4 兑现；`fn` 类型 / 高阶函数已在 1.1 落地；**闭包 / lambda**
-确定不进 1.1（1.2+）。POSIX-only 是刻意选择。
+开启已在 0.9.4 兑现；`fn` 类型 / 高阶函数已在 1.1 落地；`net` / `httpx` 已在
+1.2 落地；**TLS / HTTPS 与闭包 / lambda** 留 1.3 候选。POSIX-only 是刻意选择。
 
 ---
 

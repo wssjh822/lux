@@ -1,0 +1,29 @@
+// tests/cases/net_dns_lite.lux —— DNS-lite 解析路径的确定性断言
+//   1) IP 字面量：解析成功（回环 echo）
+//   2) 单标签 > 63 字节：名字编码立刻失败，不碰真实网络
+import "net";
+
+fn main() {
+    let lfd = listen(39241) or 0;
+    if lfd != 0 {
+        let fd = dial("127.0.0.1", 39241) or 0;
+        if fd != 0 {
+            let cfd = accept(lfd) or 0;
+            send(fd, "literal");
+            println(recv(cfd, 64) or "");
+            close(cfd);
+            close(fd);
+        } else {
+            println("literal dial failed: " + last_error());
+        }
+        close(lfd);
+    }
+    let bad = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let v = dial(bad, 80) or 0;
+    if v == 0 {
+        println(last_error());
+    } else {
+        println("unexpected");
+        close(v);
+    }
+}

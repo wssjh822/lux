@@ -45,6 +45,11 @@ const char* kRuntime = R"CLUX_RUNTIME(
 #include <time.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/time.h>
 
 static inline void lx_panic(const char* msg) {
     /* 先冲刷 stdout：panic 前已打印的内容不因块缓冲丢失，
@@ -969,6 +974,317 @@ static lx_arr* lx_list_dir(const char* path) {
     *p = a;
     return p;
 }
+/* ---- net 模块（1.2）----
+ * socket fd 是裸 int，完全不碰 ARC（见 docs/net.md）。
+ * DNS-lite：/etc/hosts → /etc/resolv.conf 第一个 nameserver → UDP A 查询，
+ * 跟随 CNAME（上限 8 跳），只做 IPv4；TLS/HTTPS、IPv6、connect 超时不在 1.2。 */
+static inline bool lx_net_parse_ipv4(const char* s, uint32_t* out) {
+    uint32_t v = 0;
+    int cur = 0, digits = 0, dots = 0;
+    for (const char* p = s;; p++) {
+        if (*p >= '0' && *p <= '9') {
+            cur = cur * 10 + (*p - '0');
+            if (++digits > 3 || cur > 255) return false;
+        } else if (*p == '.') {
+            if (digits == 0 || ++dots > 3) return false;
+            v = (v << 8) | (uint32_t)cur;
+            cur = 0; digits = 0;
+        } else if (*p == '\0') {
+            if (digits == 0 || dots != 3) return false;
+            v = (v << 8) | (uint32_t)cur;
+            *out = v;   /* 主机序打包：127.0.0.1 -> 0x7f000001 */
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+static inline bool lx_net_hosts_lookup(const char* host, uint32_t* out) {
+    FILE* f = fopen("/etc/hosts", "r");
+    if (!f) return false;
+    char line[1024];
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+        char* ip = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+        char save = *p; *p = '\0';
+        uint32_t addr;
+        bool ok = lx_net_parse_ipv4(ip, &addr);
+        *p = save;
+        if (!ok) continue;
+        while (*p) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '\0' || *p == '\n' || *p == '#') break;
+            char* name = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+            char s2 = *p; *p = '\0';
+            if (strcmp(name, host) == 0) { *out = addr; found = true; }
+            *p = s2;
+            if (found) break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static inline bool lx_net_resolv_ns(uint32_t* out) {
+    FILE* f = fopen("/etc/resolv.conf", "r");
+    if (!f) return false;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "nameserver", 10) != 0) continue;
+        p += 10;
+        while (*p == ' ' || *p == '\t') p++;
+        char* e = p;
+        while (*e && *e != ' ' && *e != '\t' && *e != '\n') e++;
+        *e = '\0';
+        uint32_t a;
+        if (lx_net_parse_ipv4(p, &a)) { *out = a; fclose(f); return true; }
+    }
+    fclose(f);
+    return false;
+}
+
+/* DNS 名字编码（不带压缩）：返回新偏移，失败 -1 */
+static inline int lx_net_dns_encode(const char* name, unsigned char* buf,
+                                    int cap, int off) {
+    const char* p = name;
+    while (*p) {
+        const char* dot = strchr(p, '.');
+        int len = dot ? (int)(dot - p) : (int)strlen(p);
+        if (len <= 0 || len > 63) return -1;
+        if (off + 1 + len >= cap) return -1;
+        buf[off++] = (unsigned char)len;
+        memcpy(buf + off, p, (size_t)len);
+        off += len;
+        if (!dot) break;
+        p = dot + 1;
+    }
+    if (off >= cap) return -1;
+    buf[off++] = 0;
+    return off;
+}
+
+/* DNS 名字解码（支持压缩指针）：写入 NUL 结尾的 out，返回原始位置的下一个偏移 */
+static inline int lx_net_dns_decode(const unsigned char* msg, int msglen,
+                                    int off, char* out, int outcap) {
+    int outn = 0, jumps = 0, next = -1;
+    while (off >= 0 && off < msglen) {
+        unsigned char c = msg[off];
+        if ((c & 0xC0) == 0xC0) {
+            if (off + 1 >= msglen) return -1;
+            if (next < 0) next = off + 2;
+            off = ((c & 0x3F) << 8) | msg[off + 1];
+            if (++jumps > 64) return -1;
+            continue;
+        }
+        if (c == 0) { off++; break; }
+        if (c > 63 || off + 1 + c > msglen) return -1;
+        if (outn + c + 1 >= outcap) return -1;
+        if (outn) out[outn++] = '.';
+        memcpy(out + outn, msg + off + 1, (size_t)c);
+        outn += c;
+        off += 1 + c;
+    }
+    out[outn] = '\0';
+    return next >= 0 ? next : off;
+}
+
+/* 递归解析：A 记录 → 主机序地址（>=0）；CNAME → 跟随重查（深度上限 8）；失败 -1 */
+static inline int64_t lx_net_dns_lookup(uint32_t ns, const char* name,
+                                        int depth) {
+    if (depth >= 8) return -1;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct timeval tv;
+    tv.tv_sec = 5; tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(53);
+    sa.sin_addr.s_addr = htonl(ns);
+    unsigned char q[512];
+    memset(q, 0, 12);
+    q[0] = (unsigned char)(rand() & 0xFF);
+    q[1] = (unsigned char)(rand() & 0xFF);
+    q[2] = 0x01; q[5] = 0x01;   /* flags=RD, qdcount=1 */
+    int off = lx_net_dns_encode(name, q, (int)sizeof(q), 12);
+    if (off < 0) { close(fd); return -1; }
+    q[off++] = 0; q[off++] = 1;  /* qtype A */
+    q[off++] = 0; q[off++] = 1;  /* qclass IN */
+    if (sendto(fd, q, (size_t)off, 0, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return -1;
+    }
+    unsigned char resp[1024];
+    ssize_t n = recvfrom(fd, resp, sizeof(resp), 0, NULL, NULL);
+    close(fd);
+    if (n < 12) return -1;
+    int qd = (resp[4] << 8) | resp[5];
+    int an = (resp[6] << 8) | resp[7];
+    int p = 12;
+    char nm[256];
+    for (int i = 0; i < qd; i++) {
+        p = lx_net_dns_decode(resp, (int)n, p, nm, (int)sizeof(nm));
+        if (p < 0 || p + 4 > (int)n) return -1;
+        p += 4;
+    }
+    int64_t result = -1;
+    char cname[256];
+    bool haveCname = false;
+    for (int i = 0; i < an; i++) {
+        p = lx_net_dns_decode(resp, (int)n, p, nm, (int)sizeof(nm));
+        if (p < 0 || p + 10 > (int)n) break;
+        int type = (resp[p] << 8) | resp[p + 1];
+        int rdlen = (resp[p + 8] << 8) | resp[p + 9];
+        p += 10;
+        if (p + rdlen > (int)n) break;
+        if (type == 1 && rdlen == 4) {
+            result = ((int64_t)resp[p] << 24) | ((int64_t)resp[p + 1] << 16) |
+                     ((int64_t)resp[p + 2] << 8) | (int64_t)resp[p + 3];
+            break;
+        }
+        if (type == 5 && !haveCname) {
+            if (lx_net_dns_decode(resp, (int)n, p, cname, (int)sizeof(cname)) >= 0)
+                haveCname = true;
+        }
+        p += rdlen;
+    }
+    if (result >= 0) return result;
+    if (haveCname) return lx_net_dns_lookup(ns, cname, depth + 1);
+    return -1;
+}
+
+static inline int64_t lx_net_resolve(const char* host) {
+    uint32_t addr;
+    if (lx_net_parse_ipv4(host, &addr)) return (int64_t)addr;
+    if (lx_net_hosts_lookup(host, &addr)) return (int64_t)addr;
+    uint32_t ns;
+    if (!lx_net_resolv_ns(&ns)) return -1;
+    return lx_net_dns_lookup(ns, host, 0);
+}
+
+/* ---- net 公共 API ---- */
+static inline int64_t* lx_net_dial(const char* host, int64_t port) {
+    int64_t addr = lx_net_resolve(host);
+    if (addr < 0) {
+        static char msg[512];
+        snprintf(msg, sizeof(msg), "net.dial 失败：无法解析主机 '%s'", host);
+        lx_set_error(msg);
+        return NULL;
+    }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { lx_set_error("net.dial 失败：网络不可达"); return NULL; }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = htonl((uint32_t)addr);
+    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) != 0) {
+        int e = errno;
+        close(fd);
+        if (e == ECONNREFUSED) lx_set_error("net.dial 失败：连接被拒绝");
+        else if (e == ENETUNREACH || e == EHOSTUNREACH)
+            lx_set_error("net.dial 失败：网络不可达");
+        else lx_set_error("net.dial 失败：连接被拒绝");
+        return NULL;
+    }
+    int64_t* p = (int64_t*)lx_opt_alloc(sizeof(int64_t), 0);
+    *p = (int64_t)fd;
+    return p;
+}
+
+static inline int64_t* lx_net_send(int64_t fd, const char* data) {
+    size_t n = strlen(data), sent = 0;
+    while (sent < n) {
+        ssize_t k = send((int)fd, data + sent, n - sent, 0);
+        if (k < 0) {
+            if (errno == EINTR) continue;
+            lx_set_error("net.send 失败：连接已断开");
+            return NULL;
+        }
+        if (k == 0) { lx_set_error("net.send 失败：连接已断开"); return NULL; }
+        sent += (size_t)k;
+    }
+    int64_t* p = (int64_t*)lx_opt_alloc(sizeof(int64_t), 0);
+    *p = (int64_t)sent;
+    return p;
+}
+
+static inline const char** lx_net_recv(int64_t fd, int64_t max) {
+    if (max < 0) max = 0;
+    if (max > (int64_t)LX_MAX_LINE) max = LX_MAX_LINE;  /* 1 MiB 上限 */
+    char* buf = lx_alloc((size_t)max + 1);
+    ssize_t k = recv((int)fd, buf, (size_t)max, 0);
+    if (k < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            lx_set_error("net.recv 失败：超时");
+        else
+            lx_set_error("net.recv 失败：连接已断开");
+        lx_gc_release(buf);
+        return NULL;
+    }
+    buf[k] = '\0';
+    const char** p = (const char**)lx_opt_alloc(sizeof(char*), lx_gc_releasep);
+    *p = buf;
+    return p;
+}
+
+static inline bool lx_net_close(int64_t fd) { return close((int)fd) == 0; }
+
+static inline int64_t* lx_net_listen(int64_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { lx_set_error("net.listen 失败：无法监听端口"); return NULL; }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) != 0) {
+        int e = errno;
+        close(fd);
+        if (e == EADDRINUSE) lx_set_error("net.listen 失败：端口已被占用");
+        else lx_set_error("net.listen 失败：无法监听端口");
+        return NULL;
+    }
+    if (listen(fd, 16) != 0) {
+        close(fd);
+        lx_set_error("net.listen 失败：无法监听端口");
+        return NULL;
+    }
+    int64_t* p = (int64_t*)lx_opt_alloc(sizeof(int64_t), 0);
+    *p = (int64_t)fd;
+    return p;
+}
+
+static inline int64_t* lx_net_accept(int64_t lfd) {
+    int fd = accept((int)lfd, NULL, NULL);
+    if (fd < 0) { lx_set_error("net.accept 失败：无法接受连接"); return NULL; }
+    int64_t* p = (int64_t*)lx_opt_alloc(sizeof(int64_t), 0);
+    *p = (int64_t)fd;
+    return p;
+}
+
+static inline bool lx_net_set_timeout(int64_t fd, double secs) {
+    if (secs < 0) secs = 0;
+    struct timeval tv;
+    tv.tv_sec = (time_t)secs;
+    tv.tv_usec = (suseconds_t)((secs - (double)tv.tv_sec) * 1e6);
+    if (tv.tv_usec < 0) tv.tv_usec = 0;
+    bool ok = setsockopt((int)fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+    if (setsockopt((int)fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+        ok = false;
+    return ok;
+}
 /* ----------------------- Lux 运行时结束 ----------------------- */
 )CLUX_RUNTIME";
 
@@ -1370,7 +1686,13 @@ struct CGen {
                     case Builtin::ToInt:
                     case Builtin::ToFloat:
                     case Builtin::FileRead:
-                    case Builtin::StrFindOpt: return true;
+                    case Builtin::StrFindOpt:
+                    case Builtin::NetDial:
+                    case Builtin::NetSend:
+                    case Builtin::NetRecv:
+                    case Builtin::NetListen:
+                    case Builtin::NetAccept:
+                        return true;
                     default: return false;
                 }
             }
@@ -2014,6 +2336,25 @@ struct CGen {
                 return "lx_str_bytes(" + expr(c->args[0]) + ")";
             case Builtin::ListDir:
                 return "lx_list_dir(" + expr(c->args[0]) + ")";
+            // ---- net 模块（1.2）----
+            case Builtin::NetDial:
+                return "lx_net_dial(" + expr(c->args[0]) + ", " +
+                       expr(c->args[1]) + ")";
+            case Builtin::NetSend:
+                return "lx_net_send(" + expr(c->args[0]) + ", " +
+                       expr(c->args[1]) + ")";
+            case Builtin::NetRecv:
+                return "lx_net_recv(" + expr(c->args[0]) + ", " +
+                       expr(c->args[1]) + ")";
+            case Builtin::NetClose:
+                return "lx_net_close(" + expr(c->args[0]) + ")";
+            case Builtin::NetListen:
+                return "lx_net_listen(" + expr(c->args[0]) + ")";
+            case Builtin::NetAccept:
+                return "lx_net_accept(" + expr(c->args[0]) + ")";
+            case Builtin::NetSetTimeout:
+                return "lx_net_set_timeout(" + expr(c->args[0]) + ", " +
+                       expr(c->args[1]) + ")";
             case Builtin::StrReplace:
                 return "lx_str_replace(" + expr(c->args[0]) + ", " +
                        expr(c->args[1]) + ", " + expr(c->args[2]) + ")";

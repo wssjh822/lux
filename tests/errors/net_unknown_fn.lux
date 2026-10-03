@@ -1,0 +1,5 @@
+// net_unknown_fn —— 未 import "net" 就使用 dial
+fn main() {
+    let fd = dial("127.0.0.1", 80);
+    println(fd);
+}
