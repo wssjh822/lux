@@ -6,7 +6,7 @@ import "httpx";
 import "string";
 
 fn main() {
-    let r = get("http://example.com/")!;
+    let r = get!("http://example.com/");
     println("状态：" + string(r.status) + " " + r.reason);
     println("Content-Type：" + (header(r, "Content-Type") or "?"));
     println("正文长度：" + string(len(r.body)));

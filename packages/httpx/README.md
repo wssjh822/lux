@@ -12,16 +12,8 @@ luxc install httpx
 import "httpx";
 
 fn main() {
-    let r = get("http://example.com/");
-    if r == none {
-        println("请求失败");
-        return;
-    }
-    let resp = r!;
-    println(resp.status);
-    println(resp.reason);
-    println(header(resp, "Content-Type") or "?");
-    println(len(resp.body));
+    let r = get!("http://example.com/");
+    println(r.status);
 }
 ```
 

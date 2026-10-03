@@ -739,7 +739,7 @@ let ok = lower(name) == "lux";
 
 // 发一个 HTTP 请求（1.2；文件顶部 import "httpx"; 并先 luxc install httpx）
 // 注意：无 TLS，URL 必须以 http:// 开头
-let r = get("http://example.com/")!;
+let r = get!("http://example.com/");
 println(r.status);
 println(header(r, "Content-Type") or "?");
 ```
